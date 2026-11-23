@@ -66,7 +66,7 @@ core、regex、cli の `src/` で基盤レベルのキーワードを書ける�
 - 版は `mise.toml` の `"github:emela-lang/emela"` で固定している。
 - 仕様は `../emela`（emela-lang/emela の checkout）の `spec/` にある。`python3 scripts/spec.py show <name>` で節を引ける。`emela-spec` skill も使える。checkout の版は固定した版とずれることがあるので、違いが効くときは `git -C ../emela show v<mise.toml の版>:<path>` で読む。
 - 前提（`[intro.premises]`）: 継続は 1 回しか再開できない、変数は不変、ループ構文は無い、高カインド型も演算子オーバーロードも無い。これに反する要望は記録だけして捨てる。
-- emela に issue、proposal、PR を出す前に user に確認する。出すときは emela の `AGENTS.md` と `emela-proposal` skill の手順に従う。
+- emela（emela-lang の repo）には、issue、PR、コメント、review を一切出さない。出したいものは friction のメモの「行き先」に下書きとして書き、出すのは user が自分で行う。この端末の gh は、kisepichu の repo にしか書けない fine-grained token で認証する（手順は `docs/github-token.md`）。そのため、emela への書き込みは GitHub 側でも拒まれる。
 - Koka は、苦しい箇所に概念の名前を付けるためだけに小さく書く。Koka で書いて写すことはしない。
 
 ## commit

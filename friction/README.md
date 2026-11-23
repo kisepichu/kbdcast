@@ -46,7 +46,7 @@ Emela で回り道をした記録。1 つのファイルに 1 つの論点だけ
 | 前提の範囲内で spec に足りない | proposal の下書き（emela の `emela-proposal` skill で詰める） |
 | 前提に反する | 捨てる。コストだけ残す |
 
-emela に issue や proposal を出す前に、user に確認する。
+emela には agent から issue、proposal、PR、コメントを出さない。行き先が決まったら、出す文面をメモに下書きし、user が自分で出す。
 
 ## 見直し
 
