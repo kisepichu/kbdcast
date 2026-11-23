@@ -69,7 +69,7 @@ agg demo.keys.cast demo.gif
 
 | 順 | サブプロジェクト | 中身 | 単体で得られるもの | 主に出る見込みの friction |
 |---|---|---|---|---|
-| 0 | 仕組み | AGENTS.md、`friction/`、`wish/`、`tools/check`、hook、prek、レビュー用の skill、版の固定 | 以降の記録の土台 | 兄弟の Pome を `[replace]` で参照したときの lock |
+| 0 | 仕組み | AGENTS.md、`friction/`、`wish/`、`tools/check.ts`、hook、prek、レビュー用の skill、版の固定 | 以降の記録の土台 | 公式の Linux バイナリの glibc（friction 001） |
 | R | regex | 汎用の正規表現の Pome | ecosystem への貢献 | 文字の扱い、Array と Map の性能 |
 | 2 | key codec | Key、表記、encode、decode | tape のキー表記と overlay の表記 | enum の設計 |
 | 3 | VT | parser、screen、幅の表、端末への返事 | `wait` と overlay の前提 | `Array.set` のコピー、幅の表、UTF-8 のストリーム |
@@ -309,8 +309,8 @@ effect Driver {
 
 ```mermaid
 flowchart LR
-  w[wish を書く<br/>wish/unit.emel] --> wc[tools/wish check] --> c1[wish だけを commit]
-  c1 --> impl[src に実装] --> chk[tools/check]
+  w[wish を書く<br/>wish/unit.emel] --> wc[bun tools/wish.ts check] --> c1[wish だけを commit]
+  c1 --> impl[src に実装] --> chk[bun tools/check.ts]
   chk -->|編集のたび| hook[agent の hook]
   chk -->|commit 時| prek[prek]
   impl --> pr[PR] --> rev[別セッションでレビュー<br/>wish と実装の差 + 臭いの一覧]
@@ -319,7 +319,7 @@ flowchart LR
 
 ### AGENTS.md に書く規則
 
-1. wish-first: 単位ごとに、spec を調べる前に推測の文法で理想のコードを `wish/` に書き、`tools/wish check` の診断を貼ってから、wish だけを commit する。
+1. wish-first: 単位ごとに、spec を調べる前に推測の文法で理想のコードを `wish/` に書き、`bun tools/wish.ts check` の診断を貼ってから、wish だけを commit する。
 2. 黙って回避しない: 回避したら、コードに `# FRICTION(NNN)` の印を付け、`friction/NNN-slug.md` を作る。
 3. 基盤レベルのキーワードは `foundation.allow` に登録したモジュールでだけ使う。
 4. 1 件 1 決定: 1 つのメモには 1 つの論点だけを書く（proposal の「1 draft に 1 決定」に揃える）。
@@ -357,10 +357,10 @@ flowchart LR
 | 部品 | 中身 |
 |---|---|
 | `AGENTS.md` | 上の規則、メモの雛形、分類の表。`CLAUDE.md` からは AGENTS.md を参照するだけにする |
-| `wish/` | 理想のコードを src の外に置く。この repo の中で src の外のファイルを `emela check` に渡すと E0208 になるので、`tools/wish check` が一時ディレクトリに使い捨てのプロジェクトを作り、core を `[replace]` で参照させて検査し、診断をファイルの先頭に貼る |
-| `tools/check` | 全部の検査の入口: Emela の版の確認、各 Pome の `emela check`、lint（対象の `src/` にある、allowlist の外の基盤キーワードと `@external`）、`FRICTION` の印とメモの双方向の対応、メモの必須欄 |
-| agent の hook | Claude Code の `.claude/settings.json`。編集後（PostToolUse、`*.emel`）に `tools/check` を走らせて結果を返す。ターン終了時（Stop）に fail なら止める |
-| prek | `.pre-commit-config.yaml` の local hook から `tools/check` を呼ぶ。agent に依存しない最後の砦 |
+| `wish/` | 理想のコードを src の外に置く。この repo の中で src の外のファイルを `emela check` に渡すと E0208 になるので、`bun tools/wish.ts check` が repo を一時ディレクトリに写し、wish を置く予定の場所に書いてから検査し、診断をファイルの末尾に貼る |
+| `tools/check.ts` | 全部の検査の入口: Emela の版の確認、各 Pome の `emela fmt --check` と `emela check`、lint（対象の `src/` にある、allowlist の外の基盤キーワードと `@external`）、`FRICTION` の印に対応するメモがあるか、メモの必須欄 |
+| agent の hook | Claude Code は `.claude/settings.json`。編集後（PostToolUse）に `tools/check.ts` を走らせて結果を返し、ターン終了時（Stop）に fail なら続けさせる。omp は `.omp/hooks/post/` の factory で、`tool_result` と `session_stop` を使って同じことをする |
+| prek | `.pre-commit-config.yaml` の local hook から `tools/check.ts` を呼ぶ。agent に依存しない最後の砦 |
 | レビュー | `.agents/skills/friction-review/` に置き、`.claude/skills` からリンクする（emela の流儀）。PR ごとに別のセッションで動かし、wish と実装の差と、臭いの一覧（回避のためだけの補助関数、String を経由した base64、自前の UTF-8 処理、まわりくどい再帰、Option の握りつぶし）を走査する |
 | 版の固定 | mise の `github:emela-lang/emela` で v0.28.2 を固定する |
 
@@ -376,16 +376,17 @@ flowchart LR
 | `Array.set` が in place になるかを確かめられない | WASM と C では「最後の参照なら in place」と約束されている（`[api.std.array]`）。in place になるかをコンパイラが教える仕組みは無く、JS は常にコピーする | VT の画面バッファで測った数字を添えて、前提の範囲内の proposal の候補にする | 3 |
 | native に `String.chars` が無い | Known limitations に記載（grapheme の表が無い） | 使い道を添える | 3 を native で動かすとき |
 | ストリーム用の UTF-8 デコーダが無い | `Bytes.decode_utf8` は入力全体が正しくないと `None` を返す | 実装してから、std か Pome かを判断する | 3 |
-| 複数の Pome をまとめる workspace | spec が「後の版で考える」としている（Bushel） | 兄弟の Pome を `[replace]` で扱った実例を添える | 0 |
+| 複数の Pome をまとめる workspace | spec が「後の版で考える」としている（Bushel）。`[replace]` だけでもネットワーク無しで動くことは確かめた | 兄弟の Pome を `[replace]` で扱った実例を添える | 0 以降 |
+| 公式の Linux バイナリが glibc 2.39 の weak シンボル（`pidfd_spawnp`、`pidfd_getpid`）を要求する | README は「Linux (x86_64)」とだけ書いている。release は `ubuntu-latest` で build している。issue は無い | friction 001。issue にする | 0 |
 | FileSystem でバイナリを扱えない | Known limitations に記載 | kbdcast では当たらない（GIF は agg が書き、kbdcast が書くのは cast だけ） | なし |
 | #687 Implement: A built-in trait for capability types | 担当者が 0 人（2026-11-23 時点） | 実装で貢献する | kbdcast とは別 |
 
 ## 14. 確かめていないリスク
 
-- 公開していない兄弟の Pome を `[replace]` で参照したときの lock の振る舞い。workspace はまだ無い。0 で確かめる。
+- 公開していない兄弟の Pome を `[replace]` で参照したときの lock の振る舞い。0 で確かめ、ネットワーク無しで動くことを確認した（replace した依存は lock に載らない）。
 - `Bun.Terminal` の API の細部（データの渡し方、resize、終了コード）。pty-bun の handler の中で、pull 型の `read` に合わせる。1 で確かめる。
-- omp が Claude Code の hook を読むか。読まない場合は AGENTS.md と prek で補う。0 で確かめる。
-- mise の `github:` backend で emela のリリースが取れるか。0 で確かめる。
+- omp が Claude Code の hook を読むか。0 で確かめ、読まないことを確認した。omp には `.omp/hooks/post/` の factory を別に置く。
+- mise の `github:` backend で emela のリリースが取れるか。0 で確かめ、取れることを確認した。ただし公式の Linux バイナリは glibc 2.39 の weak シンボルを要求し、Ubuntu 22.04 では呼ぶたびに警告が出る（friction 001）。
 - Emela 0.29 で capture checking が既定になる予定（#666）。版を固定し、上げるときにメモを見直す。
 - JS ターゲットでは `Array.set` が常にコピーするので、VT の画面の更新が遅い可能性がある。3 で測る。
 - overlay が画面を描き直す出力は cast を大きくする。差分だけを出すかどうかは 4 で決める。
