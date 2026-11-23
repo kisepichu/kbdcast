@@ -10,7 +10,7 @@
 
 ## 検査
 
-`bun tools/wish.ts check wish/<name>.emel`
+`mise exec -- bun tools/wish.ts check wish/<name>.emel`
 
 repo を一時ディレクトリに写し、wish-target の場所に wish を置いて、その Pome で `emela pome install` と `emela check` を走らせる。出力はファイル末尾の `# --- wish check` から `# --- end wish check ---` までのブロックに書かれる。もう一度走らせると、このブロックは置き換わる。元の repo の `src/` は変わらない。
 

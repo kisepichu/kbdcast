@@ -27,7 +27,7 @@ kbdcast は、端末アプリのデモ GIF を、操作を書いた tape から�
 新しい単位（モジュール、effect、主要な関数）を書くときは:
 
 1. spec を調べる前に、推測の文法で「こう書きたい」コードを `wish/<name>.emel` に書く。先頭に `# wish-target: <置く予定の repo からの相対パス>` を書く。
-2. `bun tools/wish.ts check wish/<name>.emel` を走らせる。診断がファイルの末尾に貼られる。
+2. `mise exec -- bun tools/wish.ts check wish/<name>.emel` を走らせる。診断がファイルの末尾に貼られる。
 3. wish だけを commit する。
 4. それから spec を調べ、`src/` に実装する。wish と実装が違ったら、その差が回り道かどうかを判断する。
 
@@ -62,8 +62,8 @@ core、regex、cli の `src/` で基盤レベルのキーワードを書ける�
 
 ## Emela について
 
-- 版は `mise.toml` で固定している（今は 0.28.2）。
-- 仕様は `../emela`（emela-lang/emela の checkout）の `spec/` にある。`python3 scripts/spec.py show <name>` で節を引ける。`emela-spec` skill も使える。checkout の版は固定した版とずれることがあるので、違いが効くときは `git -C ../emela show v0.28.2:<path>` で読む。
+- 版は `mise.toml` の `"github:emela-lang/emela"` で固定している。
+- 仕様は `../emela`（emela-lang/emela の checkout）の `spec/` にある。`python3 scripts/spec.py show <name>` で節を引ける。`emela-spec` skill も使える。checkout の版は固定した版とずれることがあるので、違いが効くときは `git -C ../emela show v<mise.toml の版>:<path>` で読む。
 - 前提（`[intro.premises]`）: 継続は 1 回しか再開できない、変数は不変、ループ構文は無い、高カインド型も演算子オーバーロードも無い。これに反する要望は記録だけして捨てる。
 - emela に issue、proposal、PR を出す前に user に確認する。出すときは emela の `AGENTS.md` と `emela-proposal` skill の手順に従う。
 - Koka は、苦しい箇所に概念の名前を付けるためだけに小さく書く。Koka で書いて写すことはしない。
