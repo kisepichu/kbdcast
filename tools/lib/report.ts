@@ -1,5 +1,5 @@
 export type Problem = {
-  kind: "version" | "emela" | "lint" | "allowlist" | "friction";
+  kind: "version" | "emela" | "lint" | "allowlist" | "friction" | "untracked";
   path: string;
   line?: number;
   message: string;

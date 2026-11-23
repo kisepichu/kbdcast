@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// `bun tools/wish.ts check wish/<name>.emel`: checks a wish in place of the module it describes, in a copy of the repo,
+// `mise exec -- bun tools/wish.ts check wish/<name>.emel`: checks a wish in place of the module it describes, in a copy of the repo,
 // and writes the diagnostics into a block at the end of the wish.
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -62,7 +62,7 @@ export function checkWish(root: string, wishPath: string): string {
 if (import.meta.main) {
   const [command, wishPath] = process.argv.slice(2);
   if (command !== "check" || !wishPath) {
-    console.error("usage: bun tools/wish.ts check wish/<name>.emel");
+    console.error("使い方: mise exec -- bun tools/wish.ts check wish/<name>.emel");
     process.exit(1);
   }
   try {

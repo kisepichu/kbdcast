@@ -56,8 +56,9 @@ core、regex、cli の `src/` で基盤レベルのキーワードを書ける�
 
 ### 4. 検査
 
+- clone したら一度 `mise install` と `mise exec -- prek install` を走らせる。
 - ターンを終える前と commit の前に `mise exec -- bun tools/check.ts` を通す。
-- Claude Code と omp の hook が編集のたびとターンの終わりに、prek が commit のたびに、同じ検査を走らせる。hook や prek を止めたり飛ばしたりして通さない。
+- Claude Code と omp の hook は、対象のファイル（`.emel`、`Pome.toml`、`friction/`、`wish/`、`tools/lint/foundation.allow`）を編集したときとターンの終わりに検査を走らせる。prek は commit のたびに `--commit` を付けて走らせ、検査するファイルが commit に入っていないときも止める。hook や prek を止めたり飛ばしたりして通さない。
 - `tools/` を変えたら `mise exec -- bun test tools/test` も通す。
 
 ## Emela について

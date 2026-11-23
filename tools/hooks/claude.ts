@@ -16,7 +16,7 @@ async function main(): Promise<number> {
   } else if (mode === "stop") {
     if (input?.stop_hook_active === true) return 0;
   } else {
-    console.error("usage: bun tools/hooks/claude.ts post|stop");
+    console.error("使い方: mise exec -- bun tools/hooks/claude.ts post|stop");
     return 1;
   }
   const problems = runCheck(ROOT);
