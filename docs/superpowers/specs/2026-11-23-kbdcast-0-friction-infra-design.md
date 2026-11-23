@@ -2,7 +2,7 @@
 
 - 日付: 2026-11-23
 - 全体設計: `docs/superpowers/specs/2026-11-23-kbdcast-design.md` の §12
-- 状態: spec
+- 状態: 実装済み（PR #1）
 
 ## 1. 目的と範囲
 
@@ -92,7 +92,7 @@ EMELA_JS_HOST = "bun"
    - ターンを終える前と commit の前に、`bun tools/check.ts` を通す
 4. Emela の仕様の調べ方（`../emela` の `scripts/spec.py`、`emela-spec` skill）。固定している版と checkout の版がずれうることも書く
 5. Koka は概念の名前を得るためだけに使う
-6. commit: 当面は main に直接積む。メッセージは `type: 日本語の説明`
+6. commit: サブプロジェクトごとに branch を切り、PR を作って merge commit で main に入れる（wish の commit を履歴に残すため squash しない）。メッセージは `type: 日本語の説明`。clone したら一度 `mise install` と `mise exec -- prek install` を走らせる
 
 ### 4.4 friction/
 
@@ -110,12 +110,12 @@ wish ファイルの先頭に、置く予定の場所を書く。
 # wish-target: src/recorder.emel
 ```
 
-`bun tools/wish.ts check wish/<name>.emel` は次の手順で動く。
+`mise exec -- bun tools/wish.ts check wish/<name>.emel` は次の手順で動く。
 
-1. 先頭の `# wish-target: <repo からの相対パス>` を読む。無ければエラー。
+1. 先頭の `# wish-target: <repo からの相対パス>` を読む。無ければエラー。repo の外を指すパス（空、`..` で始まる、絶対パス）もエラー。
 2. repo を一時ディレクトリに写す（`.git`、`target`、`tmp`、`node_modules` は除く）。兄弟の Pome への `[replace]` の相対パスが保たれる。
 3. wish の本文（下の診断ブロックを除いたもの）を、写した repo の wish-target の位置に書く。
-4. wish-target から上にたどって最初の `Pome.toml` を探し、そのディレクトリで `emela pome install`、`emela check` を順に走らせる。Pome が見つからなければエラー。
+4. wish-target から上にたどって最初の `Pome.toml` を探し、そのディレクトリで `emela pome install`、`emela check` を順に走らせる。一時コピーの根か `/` まで上がっても Pome が見つからなければエラー。
 5. 出力（001 の filter をかけたもの）を、wish ファイルの末尾の診断ブロックに書く。既にあれば置き換える。
 
 ```emela
@@ -166,6 +166,8 @@ Emela のソースを読み、コード部分の識別子（`@` 付きの注釈�
 
 出力は、問題ごとに `<種類> <path>:<line>: <内容>` の 1 行と、emela の出力のブロック。成功したときは `tools/check: ok` の 1 行だけを出す。
 
+`--commit` を付けると、上の検査に加えて、検査が読んだファイルのうち git が追跡していないもの（`git ls-files --others --exclude-standard`）を「commit に入っていない」と報告する。prek は追跡していないファイルを stash しないので、これが無いと「メモを書いたが `git add` を忘れた」commit が通ってしまう。
+
 ### 4.11 hook
 
 Claude Code（`.claude/settings.json`）:
@@ -182,8 +184,8 @@ omp（`.omp/hooks/post/kbdcast-check.ts`）:
 
 `.pre-commit-config.yaml` の local hook を 2 つ置く。
 
-- `tools-check`: `bun tools/check.ts`。`always_run: true`、`pass_filenames: false`。
-- `tools-test`: `bun test tools/test`。`files: ^tools/`、`pass_filenames: false`。
+- `tools-check`: `mise exec -- bun tools/check.ts --commit`。`always_run: true`、`pass_filenames: false`。
+- `tools-test`: `mise exec -- bun test tools/test`。`files: ^tools/`、`pass_filenames: false`。tools を変えない commit では Skipped になる。
 
 ### 4.13 レビューの skill
 

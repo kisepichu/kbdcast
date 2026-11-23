@@ -1,0 +1,3 @@
+tmp/
+target/
+.claude/settings.local.json
