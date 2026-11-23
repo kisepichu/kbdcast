@@ -3,7 +3,7 @@
 // and writes the diagnostics into a block at the end of the wish.
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { parseEmelaVersion, runEmela } from "./lib/emela";
 
 const ROOT = resolve(import.meta.dir, "..");
@@ -37,11 +37,15 @@ export function checkWish(root: string, wishPath: string): string {
   try {
     cpSync(root, copy, { recursive: true, filter: (src) => src === root || SKIP[basename(src)] !== true });
     const placed = join(copy, target);
+    // `join` normalizes `..`, so a target like `../x.emel` would land outside the copy.
+    const rel = relative(copy, placed);
+    if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) throw new Error(`${target} が repo の外を指している`);
     mkdirSync(dirname(placed), { recursive: true });
     writeFileSync(placed, body);
     let pome = dirname(placed);
     while (!existsSync(join(pome, "Pome.toml"))) {
-      if (pome === copy) throw new Error(`${target} を含む Pome（Pome.toml）が無い`);
+      // Stop at the filesystem root as well, in case the walk never meets `copy`.
+      if (pome === copy || dirname(pome) === pome) throw new Error(`${target} を含む Pome（Pome.toml）が無い`);
       pome = dirname(pome);
     }
     const install = runEmela(["pome", "install"], pome);
