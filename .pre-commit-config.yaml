@@ -1,0 +1,15 @@
+repos:
+  - repo: local
+    hooks:
+      - id: tools-check
+        name: tools/check.ts
+        entry: mise exec -- bun tools/check.ts
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: tools-test
+        name: bun test tools/test
+        entry: mise exec -- bun test tools/test
+        language: system
+        pass_filenames: false
+        files: ^tools/
