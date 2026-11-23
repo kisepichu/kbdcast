@@ -1,0 +1,7 @@
+[tools]
+bun = "1.4.3"
+prek = "0.4.1"
+"github:emela-lang/emela" = "0.28.2"
+
+[env]
+EMELA_JS_HOST = "bun"
