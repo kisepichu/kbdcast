@@ -17,8 +17,8 @@
 - `tools/` は Bun 上の TypeScript で、npm の依存を足さない。
 - コードのコメントは英語、利用者に出すメッセージと文書は日本語。
 - hook と prek からは `mise exec -- bun ...` で呼ぶ（PATH に固定した版の emela と bun が来るようにするため）。
-- commit は main に直接積む。message は `type: 日本語の説明`。`git commit --no-gpg-sign` を使う。
-- 外向きの操作（emela への issue や PR）はしない。
+- commit は branch `sp0/friction-infra` に積み、最後に PR を作って merge commit で main に入れる（wish の commit を履歴に残すため squash しない）。message は `type: 日本語の説明`。`git commit --no-gpg-sign` を使う。
+- emela への issue や PR は出さない（kbdcast の PR は作ってよい）。
 
 ## File Structure
 
@@ -1423,7 +1423,7 @@ core、regex、cli の `src/` で基盤レベルのキーワードを書ける�
 
 ## commit
 
-- 当面は main に直接積む。
+- サブプロジェクトごとに branch を切り、PR を作って merge commit で main に入れる。wish の commit を履歴に残すため squash しない。
 - message は `type: 日本語の説明`。type は `feat`、`fix`、`docs`、`chore`、`test`、`refactor`、`wish`。
 ```
 
