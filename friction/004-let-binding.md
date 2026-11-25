@@ -23,7 +23,9 @@
   regex の class の wish（`wish/class.emel`、計画の Task 5）でも、11 行に `let` を書いた（`:40`、`:68-70`、`:104-105`、`:115`、`:118`、`:121-123`）。診断が届いたのは `:40` と `:68-70` の 4 行で、1 行ごとに E0118 と E0122 が 1 つずつ（8 つ）と、束縛されなかった名前の E0211 が 4（`ascii` が 2、`kept`、`folded`）。残りの 7 行は、`=` で書いた関数の本体（020）の中にあり、本体ごと読まれなかった
 
   regex の vm と公開 API の wish（`wish/vm.emel`、`wish/lib.emel`、計画の Task 6）でも `let` を書いた。vm は 9 行（`:75`、`:79`、`:105-108`、`:131`、`:155`、`:161`）で、診断が届いた 5 行に E0118 と E0122 が 1 つずつ（10）。残りの 4 行（`:105-108`）は `=>` の腕（E0110）の中で読まれなかった。lib は 2 行（`:24`、`:38`）に 4 つ。束縛されなかった名前の E0211 が 4 続いた（`next`、`groups`、`ast`、`input`）
-- 回避策: `let` を消して `start = Int.max(from, 0)` と書いた（`text/src/lib.emel` の `slice`）。regex の `regex/src/syntax.emel`、`regex/src/class.emel`、`regex/src/vm.emel`、`regex/src/lib.emel` も同じく `let` を消した。正しい構文に直しただけなので、コードに印は付けない
+
+  regex の差分テストの生成器の wish（`wish/pattern_gen.emel`、計画の Task 8）でも、10 行に `let` を書いた（`:69`、`:104`、`:108-109`、`:113-114`、`:118`、`:122`、`:126` と、`wish/differential.emel:29`）。届いた行ごとに E0118 と E0122 が 1 つずつ。束縛されなかった名前の E0211 が続いた（`sub` が 6、`atom`、`a`）。`:114` の行では、or-pattern（015）の診断が `let` の 2 つに埋もれた（字句の誤りの `;` の E0105 だけは出た、016）
+- 回避策: `let` を消して `start = Int.max(from, 0)` と書いた（`text/src/lib.emel` の `slice`）。regex の `regex/src/syntax.emel`、`regex/src/class.emel`、`regex/src/vm.emel`、`regex/src/lib.emel`、テストの `regex/test/pattern_gen.emel` も同じく `let` を消した。正しい構文に直しただけなので、コードに印は付けない
 - コスト:
   コードのコストは無い。直すには spec を引く必要があった。診断から分かるのは `let` が式として読めないことだけで、wish-first（AGENTS.md 規則 1）では spec を読む前に wish を書くので、そのときの手がかりは診断しかない。後に続く 4 つの E0211 は束縛の失敗の後追いで、wish の本当の診断（`String.from_scalars` の E0212、003）を埋もれさせる
 - spec:
