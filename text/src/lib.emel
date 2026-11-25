@@ -1,0 +1,49 @@
+# String functions that std does not have yet, in the shape they would take in `[api.string]`.
+# Positions count code points, as the matching of `String.contains` and `String.split` and the
+# `offset` of `Std.Json` do, not grapheme clusters as `String.length` and `String.chars` do.
+#
+# ```emela
+# import Text
+#
+# Text.from_code_points([0x61, 0x1F600]) # Some("a😀")
+# Text.slice("a😀b", 1, 2) # "😀"
+# ```
+#
+# Against `[lib.api-rules]`: the string comes first, so a call reads as `s |> Text.slice(1, 2)`.
+# `from_code_points` is a `from_*` creation and, like `String.from_code_point`, returns an Option
+# for a value out of range instead of failing. `slice` takes `from` and `to` and clamps them as
+# `Bytes.slice` and `Array.slice` do, so a position out of range is not an error either. Both are
+# O(n) in the code points of their input: `slice` goes through the whole `String.code_points(s)`.
+#
+# FRICTION(002): std has no API that takes a position in a String as a number
+# (`[target.string]`), so these live here. Delete this Pome when std has them.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment, and `emela doc` does not show it.
+
+## The string of the code points `cps`, in order. `None` if one of them is not a Unicode scalar
+## value (0 to 10FFFF, excluding surrogates).
+pub fn from_code_points(cps: List[Int]) -> Option[String] {
+  # FRICTION(006): there is no function that turns a List of Options into an Option of a List, so
+  # `from_code_point` checks each one, and the count tells whether any was dropped.
+  parts = cps.filter_map(String.from_code_point)
+  if parts.length() == cps.length() { Some(parts.join("")) } else { None }
+}
+
+## The code points of `s` from `from` inclusive to `to` exclusive. Both are clamped to 0 to the
+## number of code points in `s`; empty if `from` is not less than `to`.
+pub fn slice(s: String, from: Int, to: Int) -> String {
+  # FRICTION(005): there is no `Int.clamp`. `drop` and `take` clamp the upper end, so only the
+  # lower one is clamped here, and `to <= start` keeps `to - start` from wrapping.
+  start = Int.max(from, 0)
+  if to <= start {
+    ""
+  } else {
+    # FRICTION(003): the code points come from `s`, so they are scalar values and `None` cannot
+    # happen.
+    from_code_points(s.code_points().drop(start).take(to - start)) match {
+      Some(part) -> part
+      None       -> panic("Text.slice: a code point of a String is not a scalar value")
+    }
+  }
+}

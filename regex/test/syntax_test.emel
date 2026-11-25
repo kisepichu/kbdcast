@@ -1,0 +1,278 @@
+import Syntax.{
+  RegexSyntax,
+  Literal,
+  Dot,
+  Class,
+  Assert,
+  Concat,
+  Alternate,
+  Group,
+  Repeat,
+  Single,
+  Range,
+  Escape,
+  Digit,
+  NotWord,
+  LineStart,
+  LineEnd,
+  WordBoundary,
+}
+
+# The message and the offset of the RegexSyntax that `parse` fails with, or `("", -1)` if it does
+# not fail.
+fn failure(pattern: String) -> (String, Int) {
+  {
+    Syntax.parse(pattern)
+    ("", -1)
+  } escape {
+    RegexSyntax(message:, offset:) -> (message, offset)
+  }
+}
+
+# The number of capture groups, and the index of each named group in the order of the names.
+fn captures(pattern: String) -> (Int, List[(String, Int)]) fails RegexSyntax {
+  ast = Syntax.parse(pattern)
+  (ast.group_count, ast.names.to_list())
+}
+
+@test
+fn parse_rejects_backreferences() {
+  assert failure("(a)\\1") == ("backreferences are not supported", 3)
+  assert failure("\\k<a>(?<a>x)") == ("backreferences are not supported", 0)
+  # Every `\k` is a backreference in `u` mode, even without a name after it.
+  assert failure("a\\k") == ("backreferences are not supported", 1)
+}
+
+@test
+fn parse_rejects_lookaround() {
+  assert failure("a(?=b)") == ("lookahead is not supported", 1)
+  assert failure("a(?!b)") == ("lookahead is not supported", 1)
+  assert failure("(?<=a)b") == ("lookbehind is not supported", 0)
+  assert failure("(?<!a)b") == ("lookbehind is not supported", 0)
+}
+
+@test
+fn parse_rejects_unicode_property_escapes() {
+  assert failure("\\p{L}") == ("Unicode property escapes are not supported", 0)
+  assert failure("[a\\P{L}]") == ("Unicode property escapes are not supported", 2)
+}
+
+@test
+fn parse_rejects_modifiers() {
+  assert failure("(?i:a)") == ("modifiers are not supported", 0)
+  assert failure("a(?-s:.)") == ("modifiers are not supported", 1)
+  assert failure("(?m)") == ("modifiers are not supported", 0)
+}
+
+@test
+fn parse_rejects_other_groups_that_start_with_a_question_mark() {
+  assert failure("(?P<a>x)") == ("invalid group", 0)
+  assert failure("(?") == ("invalid group", 0)
+}
+
+@test
+fn parse_limits_repetition_counts_to_1000() {
+  assert failure("a{1001}") == ("repetition count above 1000", 1)
+  assert failure("a{0,1001}") == ("repetition count above 1000", 1)
+  assert failure("a{1001,}") == ("repetition count above 1000", 1)
+  # A count too large for an Int is still above 1000.
+  assert failure("a{99999999999}") == ("repetition count above 1000", 1)
+  assert captures("a{1000}") == (0, [])
+  assert captures("a{1000,}") == (0, [])
+}
+
+@test
+fn parse_rejects_counts_out_of_order() {
+  assert failure("a{2,1}") == ("numbers out of order in {} quantifier", 1)
+  # The order is checked before the limit.
+  assert failure("a{1001,5}") == ("numbers out of order in {} quantifier", 1)
+}
+
+@test
+fn parse_rejects_unbalanced_parentheses() {
+  assert failure("a)") == ("unmatched ')'", 1)
+  assert failure("(a") == ("unterminated group", 0)
+  # The innermost group that is not closed.
+  assert failure("(a(b") == ("unterminated group", 2)
+  assert failure("(?<n>a") == ("unterminated group", 0)
+}
+
+@test
+fn parse_rejects_an_unterminated_class() {
+  assert failure("[a") == ("unterminated character class", 0)
+  assert failure("x[^a-") == ("unterminated character class", 1)
+}
+
+@test
+fn parse_rejects_a_quantifier_with_nothing_to_repeat() {
+  assert failure("*a") == ("nothing to repeat", 0)
+  assert failure("a**") == ("nothing to repeat", 2)
+  assert failure("x{2}{3}") == ("nothing to repeat", 4)
+  assert failure("a|+") == ("nothing to repeat", 2)
+  assert failure("a??*") == ("nothing to repeat", 3)
+  # Assertions cannot be repeated in `u` mode.
+  assert failure("^*") == ("nothing to repeat", 1)
+  assert failure("a$+") == ("nothing to repeat", 2)
+  assert failure("\\b?") == ("nothing to repeat", 2)
+  assert failure("\\B{2}") == ("nothing to repeat", 2)
+}
+
+@test
+fn parse_rejects_braces_that_are_not_a_quantifier() {
+  assert failure("{") == ("lone quantifier brackets", 0)
+  assert failure("}") == ("lone quantifier brackets", 0)
+  assert failure("]") == ("lone quantifier brackets", 0)
+  assert failure("a{") == ("incomplete quantifier", 1)
+  assert failure("a{,5}") == ("incomplete quantifier", 1)
+  assert failure("a{2,b}") == ("incomplete quantifier", 1)
+}
+
+@test
+fn parse_rejects_invalid_escapes() {
+  assert failure("\\q") == ("invalid escape", 0)
+  assert failure("\\-") == ("invalid escape", 0)
+  assert failure("\\c") == ("invalid escape", 0)
+  assert failure("\\c1") == ("invalid escape", 0)
+  assert failure("a\\") == ("invalid escape", 1)
+  assert failure("\\00") == ("invalid escape", 0)
+  assert failure("\\x4") == ("invalid escape", 0)
+  assert failure("[\\") == ("invalid escape", 1)
+  assert failure("[\\B]") == ("invalid escape", 1)
+  assert failure("[\\1]") == ("invalid escape", 1)
+  assert failure("[\\k]") == ("invalid escape", 1)
+  assert failure("[\\c_]") == ("invalid escape", 1)
+}
+
+@test
+fn parse_rejects_invalid_unicode_escapes() {
+  assert failure("\\u{110000}") == ("invalid Unicode escape", 0)
+  assert failure("\\u{}") == ("invalid Unicode escape", 0)
+  assert failure("\\u{41") == ("invalid Unicode escape", 0)
+  assert failure("a\\u12") == ("invalid Unicode escape", 1)
+  assert failure("[\\u{110000}]") == ("invalid Unicode escape", 1)
+}
+
+@test
+fn parse_rejects_ranges_that_are_not_in_order_or_not_characters() {
+  assert failure("[b-a]") == ("range out of order in character class", 1)
+  assert failure("[\\d-z]") == ("invalid character class", 1)
+  assert failure("[a-\\w]") == ("invalid character class", 1)
+}
+
+@test
+fn parse_rejects_duplicate_capture_group_names() {
+  assert failure("(?<a>x)(?<a>y)") == ("duplicate capture group name", 7)
+  # Separate alternatives do not make them different groups here.
+  assert failure("(?<a>x)|(?<a>y)") == ("duplicate capture group name", 8)
+}
+
+@test
+fn parse_accepts_only_ascii_identifiers_as_capture_group_names() {
+  assert failure("(?<名前>x)") == ("capture group names must be ASCII identifiers", 3)
+  assert failure("(?<1a>x)") == ("capture group names must be ASCII identifiers", 3)
+  assert failure("(?<a-b>x)") == ("capture group names must be ASCII identifiers", 3)
+  assert failure("(?<>x)") == ("capture group names must be ASCII identifiers", 3)
+  assert failure("(?<a") == ("capture group names must be ASCII identifiers", 3)
+  assert failure("(?<\\u{1F600}>x)") == ("capture group names must be ASCII identifiers", 3)
+  assert failure("(?<a\\u12>x)") == ("capture group names must be ASCII identifiers", 3)
+  assert captures("(?<$_a1>x)") == (1, [("$_a1", 1)])
+  # A `\u` escape in a name stands for its character.
+  assert captures("(?<\\u0061\\u{62}>x)") == (1, [("ab", 1)])
+}
+
+@test
+fn parse_accepts_the_patterns_of_the_accepted_table() {
+  assert captures("") == (0, [])
+  assert captures("(?:)") == (0, [])
+  assert captures("[]") == (0, [])
+  assert captures("[^]") == (0, [])
+  assert captures("[\\-]") == (0, [])
+  assert captures("\\/") == (0, [])
+  assert captures("(a)(?:b)(?<c>d)") == (2, [("c", 2)])
+  assert captures("a{1000}") == (0, [])
+  assert captures("\\u{1F600}\\u0041\\x41\\cA\\0") == (0, [])
+}
+
+@test
+fn parse_reads_characters_and_escapes_as_code_points() {
+  assert Syntax.parse("\\u{1F600}\\u0041\\x41\\cA\\0").root
+    == Concat([Literal(0x1F600), Literal(0x41), Literal(0x41), Literal(0x01), Literal(0x00)])
+  assert Syntax.parse("\\/\\.\\n").root == Concat([Literal(0x2F), Literal(0x2E), Literal(0x0A)])
+}
+
+@test
+fn parse_joins_an_escaped_surrogate_pair_into_one_code_point() {
+  assert Syntax.parse("\\uD83D\\uDE00").root == Literal(0x1F600)
+  assert Syntax.parse("[\\uD83D\\uDE00]").root == Class(items: [Single(0x1F600)], negated: False)
+  # A lead surrogate without a trail one stays as it is.
+  assert Syntax.parse("\\uD83D").root == Literal(0xD83D)
+  assert Syntax.parse("\\uD83D\\u{DE00}").root == Concat([Literal(0xD83D), Literal(0xDE00)])
+}
+
+@test
+fn parse_numbers_groups_in_the_order_of_their_open_parentheses() {
+  assert Syntax.parse("((a)(?<n>b))").root
+    == Group(
+      index: 1,
+      name: None,
+      body: Concat(
+        [
+          Group(index: 2, name: None, body: Literal(0x61)),
+          Group(index: 3, name: Some("n"), body: Literal(0x62)),
+        ],
+      ),
+    )
+}
+
+@test
+fn parse_keeps_what_the_flags_change_as_symbols() {
+  assert Syntax.parse("^.\\d[^\\Wz-]\\b$").root
+    == Concat(
+      [
+        Assert(LineStart),
+        Dot,
+        Class(items: [Escape(Digit)], negated: False),
+        Class(items: [Escape(NotWord), Single(0x7A), Single(0x2D)], negated: True),
+        Assert(WordBoundary),
+        Assert(LineEnd),
+      ],
+    )
+}
+
+@test
+fn parse_reads_ranges_and_dashes_in_a_class() {
+  assert Syntax.parse("[a-c-e\\b]").root
+    == Class(items: [Range(0x61, 0x63), Single(0x2D), Single(0x65), Single(0x08)], negated: False)
+  assert Syntax.parse("[--a]").root == Class(items: [Range(0x2D, 0x61)], negated: False)
+}
+
+@test
+fn parse_keeps_the_bounds_and_the_greed_of_quantifiers() {
+  assert Syntax.parse("a*b+?c?d{2}e{3,}?f{4,5}").root
+    == Concat(
+      [
+        Repeat(body: Literal(0x61), min: 0, max: None, greedy: True),
+        Repeat(body: Literal(0x62), min: 1, max: None, greedy: False),
+        Repeat(body: Literal(0x63), min: 0, max: Some(1), greedy: True),
+        Repeat(body: Literal(0x64), min: 2, max: Some(2), greedy: True),
+        Repeat(body: Literal(0x65), min: 3, max: None, greedy: False),
+        Repeat(body: Literal(0x66), min: 4, max: Some(5), greedy: True),
+      ],
+    )
+}
+
+@test
+fn parse_reads_alternatives_with_the_lowest_precedence() {
+  assert Syntax.parse("ab|(?:c|)d*").root
+    == Alternate(
+      [
+        Concat([Literal(0x61), Literal(0x62)]),
+        Concat(
+          [
+            Alternate([Literal(0x63), Concat([])]),
+            Repeat(body: Literal(0x64), min: 0, max: None, greedy: True),
+          ],
+        ),
+      ],
+    )
+}

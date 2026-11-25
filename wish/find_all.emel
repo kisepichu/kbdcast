@@ -1,0 +1,347 @@
+# wish-target: regex/src/lib.emel
+# Regular expressions: the regular subset of ECMAScript's syntax with the `u` flag, matched in
+# time linear in the input by a Pike VM, with the results of JavaScript's RegExp. Positions count
+# code points.
+#
+# ```emela
+# import Regex
+# import Regex.{NO_FLAGS}
+#
+# re = Regex.compile("(?<y>\\d{4})-(?<m>\\d\\d)", NO_FLAGS)
+# Regex.find(re, "on 2026-11") # Some(m): m.start() is 3, m.text() is "2026-11", m.named("m") is Some("11")
+# Regex.find_all(re, "2026-11, 2027-01").map(|m| m.text()) # ["2026-11", "2027-01"]
+# ```
+#
+# FRICTION(010): a const of another module cannot be written `Regex.NO_FLAGS`, so it is imported
+# by name.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment, and `emela doc` does not show it.
+
+import Program
+import Std.Map.{Map}
+import Std.Array.{Array}
+import Syntax
+import Text
+import Vm.{Found}
+
+## ECMAScript's `i`, `m` and `s` flags. `ignore_case` compares characters by simple case folding,
+## `multiline` lets `^` and `$` match at line terminators, and `dot_all` lets `.` match them.
+pub type Flags(ignore_case: Bool, multiline: Bool, dot_all: Bool)
+
+## No flag set. Set some with `Flags(ignore_case: True, ..NO_FLAGS)`.
+pub const NO_FLAGS: Flags = Flags(ignore_case: False, multiline: False, dot_all: False)
+
+## Why a pattern was rejected, at `offset`: where the construct it rejected starts (the `[` or `(`
+## of a class or group that is not closed). Offsets count code points from the start of the
+## pattern. A pattern whose unrolled program would be too large (`pattern too large`) has offset
+## 0: no single construct is at fault.
+# FRICTION(012): Emela has no re-export, so this is a second declaration of the error that
+# `Syntax.parse` fails with, for `import Regex.{RegexSyntax}`.
+pub error RegexSyntax(message: String, offset: Int)
+
+## A compiled pattern.
+pub opaque type Regex(program: Vm.Program, names: Map[String, Int])
+
+## A match of a Regex in a string.
+pub opaque type Match(input: String, found: Found, names: Map[String, Int])
+
+## Compiles `pattern`, written in ECMAScript's syntax with the `u` flag. Fails with RegexSyntax
+## for what the syntax or this engine rejects, including a pattern whose counted repetitions
+## unroll to more than `Program.MAX_SIZE` instructions.
+pub fn compile(pattern: String, flags: Flags) -> Regex fails RegexSyntax {
+  # FRICTION(012): `parse` fails with the RegexSyntax of Syntax, which is another type.
+  ast = Syntax.parse(pattern) escape {
+    Syntax.RegexSyntax(message:, offset:) -> fail RegexSyntax(message:, offset:)
+  }
+  Program.build(
+    ast,
+    ignore_case: flags.ignore_case,
+    multiline: flags.multiline,
+    dot_all: flags.dot_all,
+  ) match {
+    Some(program) -> Regex(program:, names: ast.names)
+    None          -> fail RegexSyntax(message: "pattern too large", offset: 0)
+  }
+}
+
+## Whether `re` matches somewhere in `s`.
+pub fn is_match(re: Regex, s: String) -> Bool {
+  find(re, s).is_some()
+}
+
+## The first match of `re` in `s`, as JavaScript's `re.exec(s)` finds it.
+pub fn find(re: Regex, s: String) -> Option[Match] {
+  input = Array.from_list(s.code_points())
+  Vm.search(re.program, input, 0).found.map(|found| Match(input: s, found:, names: re.names))
+}
+
+## Every match of `re` in `s`, in order, as JavaScript's `s.matchAll(re)` finds them with the `g`
+## flag: the next search starts where a match ends, one code point later after an empty match.
+pub fn find_all(re: Regex, s: String) -> List[Match] {
+  input = Array.from_list(s.code_points())
+  List.unfold(0, |from| {
+    if from > input.length() {
+      None
+    } else {
+      Vm.search(re.program, input, from).found.map(|found| {
+        next = if found.end == found.start { found.end + 1 } else { found.end }
+        (Match(input: s, found:, names: re.names), next)
+      })
+    }
+  })
+}
+
+## `s` with each match `m` of `re` replaced by `f(m)`, as JavaScript's `s.replace(re, f)` with the
+## `g` flag.
+pub fn replace(re: Regex, s: String, f: fn(Match) -> String) -> String {
+  (pieces, rest) = find_all(re, s).fold(([], 0), |(pieces, at), m| {
+    (pieces ++ [Text.slice(s, at, m.start()), f(m)], m.end())
+  })
+  (pieces ++ [Text.slice(s, rest, s.code_points().length())]).join("")
+}
+
+## `s` cut at the matches of `re`, as JavaScript's `s.split(re)`, without the captures that it puts
+## between the pieces. A match that is empty and ends where the previous cut ends does not cut.
+pub fn split(re: Regex, s: String) -> List[String] {
+  input = Array.from_list(s.code_points())
+  if input.length() == 0 {
+    if Vm.search(re.program, input, 0).found.is_some() { [] } else { [""] }
+  } else {
+    split_from(re, s, input, 0, 0)
+  }
+}
+
+# The pieces of `s` after `last`, the end of the previous cut, with the next cut at `at` or later.
+fn split_from(re: Regex, s: String, input: Array[Int], last: Int, at: Int) -> List[String] {
+  Vm.search(re.program, input, at).found.filter(|found| found.start < input.length()) match {
+    None -> [Text.slice(s, last, input.length())]
+    Some(found) if found.end == last -> split_from(re, s, input, last, found.start + 1)
+    Some(found) -> [Text.slice(s, last, found.start), ..split_from(re, s, input, found.end, found.end)]
+  }
+}
+
+## Where `m` starts, in code points.
+pub fn start(m: Match) -> Int {
+  m.found.start
+}
+
+## Where `m` ends, in code points.
+pub fn end(m: Match) -> Int {
+  m.found.end
+}
+
+## The matched text.
+pub fn text(m: Match) -> String {
+  Text.slice(m.input, m.found.start, m.found.end)
+}
+
+## The text of group `index`: 0 is the whole match. `None` for a group that did not take part in
+## the match, and for an index out of range.
+pub fn group(m: Match, index: Int) -> Option[String] {
+  if index == 0 {
+    Some(m.text())
+  } else {
+    m.found.groups.get(index - 1) match {
+      Some(Some((from, to))) -> Some(Text.slice(m.input, from, to))
+      _                      -> None
+    }
+  }
+}
+
+## The text of the group named `name`. `None` for a name the pattern does not have, and for a group
+## that did not take part in the match.
+pub fn named(m: Match, name: String) -> Option[String] {
+  m.names.get(name).and_then(|index| m.group(index))
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0118]: expected expression
+#     ╭─[ src/lib.emel:99:14 ]
+#     │
+#  99 │     (pieces ++ [Text.slice(s, at, m.start()), f(m)], m.end())
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/lib.emel:99:16 ]
+#     │
+#  99 │     (pieces ++ [Text.slice(s, at, m.start()), f(m)], m.end())
+#     │                ┬  
+#     │                ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/lib.emel:99:16 ]
+#     │
+#  99 │     (pieces ++ [Text.slice(s, at, m.start()), f(m)], m.end())
+#     │                ┬  
+#     │                ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/lib.emel:101:12 ]
+#      │
+#  101 │   (pieces ++ [Text.slice(s, rest, s.code_points().length())]).join("")
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/lib.emel:101:14 ]
+#      │
+#  101 │   (pieces ++ [Text.slice(s, rest, s.code_points().length())]).join("")
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/lib.emel:101:14 ]
+#      │
+#  101 │   (pieces ++ [Text.slice(s, rest, s.code_points().length())]).join("")
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0212]: module `List` has no `unfold`
+#     ╭─[ src/lib.emel:83:8 ]
+#     │
+#  83 │   List.unfold(0, |from| {
+#     │        ───┬──  
+#     │           ╰──── 
+# ────╯
+#    = help: did you mean `fold`?
+#
+# error[E0313]: type `Array[Int]` has no field or function `length`
+#     ╭─[ src/lib.emel:84:21 ]
+#     │
+#  84 │     if from > input.length() {
+#     │                     ───┬──  
+#     │                        ╰──── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(List[?4], Int)`, found `List[?4]`
+#     ╭─[ src/lib.emel:99:6 ]
+#     │
+#  99 │     (pieces ++ [Text.slice(s, at, m.start()), f(m)], m.end())
+#     │      ────┬────  
+#     │          ╰────── 
+# ────╯
+#
+# error[E0310]: expected a number (`Int`, `Int64` or `Float`), found `List[?4]`
+#     ╭─[ src/lib.emel:99:6 ]
+#     │
+#  99 │     (pieces ++ [Text.slice(s, at, m.start()), f(m)], m.end())
+#     │      ────┬────  
+#     │          ╰────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `String`, found `List[?4]`
+#      ╭─[ src/lib.emel:101:4 ]
+#      │
+#  101 │   (pieces ++ [Text.slice(s, rest, s.code_points().length())]).join("")
+#      │    ────┬────  
+#      │        ╰────── 
+# ─────╯
+#
+# error[E0310]: expected a number (`Int`, `Int64` or `Float`), found `List[?4]`
+#      ╭─[ src/lib.emel:101:4 ]
+#      │
+#  101 │   (pieces ++ [Text.slice(s, rest, s.code_points().length())]).join("")
+#      │    ────┬────  
+#      │        ╰────── 
+# ─────╯
+#
+# error[E0313]: type `Array[Int]` has no field or function `length`
+#      ╭─[ src/lib.emel:108:12 ]
+#      │
+#  108 │   if input.length() == 0 {
+#      │            ───┬──  
+#      │               ╰──── 
+# ─────╯
+#
+# error[E0313]: type `Option[Found]` has no field or function `filter`
+#      ╭─[ src/lib.emel:117:42 ]
+#      │
+#  117 │   Vm.search(re.program, input, at).found.filter(|found| found.start < input.length()) match {
+#      │                                          ───┬──  
+#      │                                             ╰──── 
+# ─────╯
+#
+# error[E0314]: the type of this value must be known to access field `start`
+#      ╭─[ src/lib.emel:117:63 ]
+#      │
+#  117 │   Vm.search(re.program, input, at).found.filter(|found| found.start < input.length()) match {
+#      │                                                               ──┬──  
+#      │                                                                 ╰──── 
+# ─────╯
+#    = help: add a type annotation
+#
+# error[E0313]: type `Array[Int]` has no field or function `length`
+#      ╭─[ src/lib.emel:117:77 ]
+#      │
+#  117 │   Vm.search(re.program, input, at).found.filter(|found| found.start < input.length()) match {
+#      │                                                                             ───┬──  
+#      │                                                                                ╰──── 
+# ─────╯
+#
+# error[E0313]: type `Array[Int]` has no field or function `length`
+#      ╭─[ src/lib.emel:118:40 ]
+#      │
+#  118 │     None -> [Text.slice(s, last, input.length())]
+#      │                                        ───┬──  
+#      │                                           ╰──── 
+# ─────╯
+#
+# error[E0314]: the type of this value must be known to access field `end`
+#      ╭─[ src/lib.emel:119:26 ]
+#      │
+#  119 │     Some(found) if found.end == last -> split_from(re, s, input, last, found.start + 1)
+#      │                          ─┬─  
+#      │                           ╰─── 
+# ─────╯
+#    = help: add a type annotation
+#
+# error[E0314]: the type of this value must be known to access field `start`
+#      ╭─[ src/lib.emel:119:78 ]
+#      │
+#  119 │     Some(found) if found.end == last -> split_from(re, s, input, last, found.start + 1)
+#      │                                                                              ──┬──  
+#      │                                                                                ╰──── 
+# ─────╯
+#    = help: add a type annotation
+#
+# error[E0314]: the type of this value must be known to access field `start`
+#      ╭─[ src/lib.emel:120:47 ]
+#      │
+#  120 │     Some(found) -> [Text.slice(s, last, found.start), ..split_from(re, s, input, found.end, found.end)]
+#      │                                               ──┬──  
+#      │                                                 ╰──── 
+# ─────╯
+#    = help: add a type annotation
+#
+# error[E0314]: the type of this value must be known to access field `end`
+#      ╭─[ src/lib.emel:120:88 ]
+#      │
+#  120 │     Some(found) -> [Text.slice(s, last, found.start), ..split_from(re, s, input, found.end, found.end)]
+#      │                                                                                        ─┬─  
+#      │                                                                                         ╰─── 
+# ─────╯
+#    = help: add a type annotation
+#
+# error[E0314]: the type of this value must be known to access field `end`
+#      ╭─[ src/lib.emel:120:99 ]
+#      │
+#  120 │     Some(found) -> [Text.slice(s, last, found.start), ..split_from(re, s, input, found.end, found.end)]
+#      │                                                                                                   ─┬─  
+#      │                                                                                                    ╰─── 
+# ─────╯
+#    = help: add a type annotation
+#
+# 22 errors, 1 warning
+# --- end wish check ---

@@ -44,6 +44,7 @@ Emela で回り道をした記録。1 つのファイルに 1 つの論点だけ
 | spec と実装がずれている、またはバグ | issue |
 | 既に知られている制限（`open-questions.md`、Known limitations） | 実際の使い道を添えて issue にするか、既存のものに足す |
 | 前提の範囲内で spec に足りない | proposal の下書き（emela の `emela-proposal` skill で詰める） |
+| ecosystem の Pome（brix、x）に足りない、または版が遅れている | その repo への issue の下書き |
 | 前提に反する | 捨てる。コストだけ残す |
 
 emela には agent から issue、proposal、PR、コメントを出さない。行き先が決まったら、出す文面をメモに下書きし、user が自分で出す。

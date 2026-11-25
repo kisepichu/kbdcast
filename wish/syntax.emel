@@ -1,0 +1,6678 @@
+# wish-target: regex/src/syntax.emel
+
+## pattern（ECMAScript の `u` モードの正規な部分集合）の code point を AST に変換する。
+## flag で意味が変わるもの（`.`、`\d` などの class escape、`^` `$` `\b` `\B`、文字そのもの）は
+## flag を見ずにそのまま残す。case folding は class と vm が扱う。
+
+import Text
+
+## 使う側は `import Regex.{RegexSyntax}` と書きたい。lib.emel で
+## `pub import Syntax.{RegexSyntax}` と書いて、もう一度公開したい。
+pub error RegexSyntax(message: String, offset: Int)
+
+## `\d` `\D` `\w` `\W` `\s` `\S`。class の中でも外でも使う。
+pub enum ClassEscape {
+  Digit
+  NotDigit
+  Word
+  NotWord
+  Space
+  NotSpace
+}
+
+## 文字クラスの中の 1 つ。
+pub enum ClassItem {
+  Single(Int)
+  Range(Int, Int)
+  Escape(ClassEscape)
+}
+
+pub enum Assertion {
+  LineStart        # ^
+  LineEnd          # $
+  WordBoundary     # \b
+  NotWordBoundary  # \B
+}
+
+pub enum Node {
+  Literal(Int)                                            # 文字そのもの（code point）
+  Dot                                                     # .
+  Escape(ClassEscape)                                     # class の外の \d など
+  Class(items: List[ClassItem], negated: Bool)            # [...] と [^...]
+  Assert(Assertion)
+  Concat(List[Node])                                      # 空の List は空の pattern
+  Alternate(List[Node])                                   # 2 つ以上
+  Group(index: Int, name: Option[String], body: Node)     # capture。index は 1 から
+  Repeat(body: Node, min: Int, max: Option[Int], greedy: Bool)  # max が None なら上限なし
+}
+
+## names は名前から group の番号へ。
+pub type Ast(root: Node, group_count: Int, names: Map[String, Int])
+
+type State(cps: Array[Int], pos: Int, groups: Int, names: Map[String, Int])
+
+const MAX_REPEAT: Int = 1000
+
+pub fn parse(pattern: String) -> Ast fails RegexSyntax {
+  let start = State(cps: Array.from_list(pattern.code_points()), pos: 0, groups: 0, names: Map.empty())
+  let (root, s) = disjunction(start)
+  match peek(s) {
+    Some(')') -> raise RegexSyntax(message: "unmatched ')'", offset: s.pos)
+    _ -> Ast(root: root, group_count: s.groups, names: s.names)
+  }
+}
+
+fn peek(s: State) -> Option[Int] {
+  s.cps.get(s.pos)
+}
+
+fn peek_at(s: State, k: Int) -> Option[Int] {
+  s.cps.get(s.pos + k)
+}
+
+fn advance(s: State, n: Int) -> State {
+  State(..s, pos: s.pos + n)
+}
+
+fn disjunction(s: State) -> (Node, State) fails RegexSyntax {
+  let (first, s1) = alternative(s, [])
+  alternatives(s1, [first])
+}
+
+fn alternatives(s: State, acc: List[Node]) -> (Node, State) fails RegexSyntax {
+  match peek(s) {
+    Some('|') -> {
+      let (next, s1) = alternative(advance(s, 1), [])
+      alternatives(s1, [next, ..acc])
+    }
+    _ -> match acc {
+      [one] -> (one, s)
+      _ -> (Alternate(acc.reverse()), s)
+    }
+  }
+}
+
+fn alternative(s: State, acc: List[Node]) -> (Node, State) fails RegexSyntax {
+  match peek(s) {
+    None | Some('|') | Some(')') -> match acc {
+      [one] -> (one, s)
+      _ -> (Concat(acc.reverse()), s)
+    }
+    _ -> {
+      let (t, s1) = term(s)
+      alternative(s1, [t, ..acc])
+    }
+  }
+}
+
+fn term(s: State) -> (Node, State) fails RegexSyntax {
+  match (peek(s), peek_at(s, 1)) {
+    (Some('^'), _) -> (Assert(LineStart), advance(s, 1))
+    (Some('$'), _) -> (Assert(LineEnd), advance(s, 1))
+    (Some('\\'), Some('b')) -> (Assert(WordBoundary), advance(s, 2))
+    (Some('\\'), Some('B')) -> (Assert(NotWordBoundary), advance(s, 2))
+    (Some('*'), _) | (Some('+'), _) | (Some('?'), _) ->
+      raise RegexSyntax(message: "nothing to repeat", offset: s.pos)
+    (Some('{'), _) -> match braces(s) {
+      Some(_) -> raise RegexSyntax(message: "nothing to repeat", offset: s.pos)
+      None -> raise RegexSyntax(message: "lone quantifier brackets", offset: s.pos)
+    }
+    (Some('}'), _) | (Some(']'), _) ->
+      raise RegexSyntax(message: "lone quantifier brackets", offset: s.pos)
+    _ -> {
+      let (a, s1) = atom(s)
+      quantified(a, s1)
+    }
+  }
+}
+
+fn atom(s: State) -> (Node, State) fails RegexSyntax {
+  match peek(s) {
+    Some('.') -> (Dot, advance(s, 1))
+    Some('(') -> group(s)
+    Some('[') -> class(s)
+    Some('\\') -> atom_escape(s)
+    Some(c) -> (Literal(c), advance(s, 1))
+    None -> panic("atom at end of pattern")
+  }
+}
+
+fn quantified(body: Node, s: State) -> (Node, State) fails RegexSyntax {
+  let at = s.pos
+  let bounds = match peek(s) {
+    Some('*') -> Some((0, None, advance(s, 1)))
+    Some('+') -> Some((1, None, advance(s, 1)))
+    Some('?') -> Some((0, Some(1), advance(s, 1)))
+    Some('{') -> match braces(s) {
+      Some(b) -> Some(b)
+      None -> raise RegexSyntax(message: "incomplete quantifier", offset: at)
+    }
+    _ -> None
+  }
+  match bounds {
+    None -> (body, s)
+    Some((min, max, s1)) -> {
+      if max.map(fn(m) { m < min }).unwrap_or(false) {
+        raise RegexSyntax(message: "numbers out of order in {} quantifier", offset: at)
+      }
+      if min > MAX_REPEAT || max.map(fn(m) { m > MAX_REPEAT }).unwrap_or(false) {
+        raise RegexSyntax(message: "repetition count above 1000", offset: at)
+      }
+      match peek(s1) {
+        Some('?') -> (Repeat(body: body, min: min, max: max, greedy: false), advance(s1, 1))
+        _ -> (Repeat(body: body, min: min, max: max, greedy: true), s1)
+      }
+    }
+  }
+}
+
+## `{n}` `{n,}` `{n,m}` を読む。形になっていなければ None。
+fn braces(s: State) -> Option[(Int, Option[Int], State)] {
+  let (min, s1) = digits(advance(s, 1), None)?
+  match peek(s1) {
+    Some('}') -> Some((min, Some(min), advance(s1, 1)))
+    Some(',') -> match peek_at(s1, 1) {
+      Some('}') -> Some((min, None, advance(s1, 2)))
+      _ -> {
+        let (max, s2) = digits(advance(s1, 1), None)?
+        match peek(s2) {
+          Some('}') -> Some((min, Some(max), advance(s2, 1)))
+          _ -> None
+        }
+      }
+    }
+    _ -> None
+  }
+}
+
+## 10 進の数字を 1 つ以上読む。大きすぎる数は MAX_REPEAT + 1 で止める。
+fn digits(s: State, acc: Option[Int]) -> Option[(Int, State)] {
+  match peek(s) {
+    Some(c) if c >= '0' && c <= '9' -> {
+      let n = acc.unwrap_or(0) * 10 + (c - '0')
+      digits(advance(s, 1), Some(n.min(MAX_REPEAT + 1)))
+    }
+    _ -> acc.map(fn(n) { (n, s) })
+  }
+}
+
+fn group(s: State) -> (Node, State) fails RegexSyntax {
+  let open = s.pos
+  match (peek_at(s, 1), peek_at(s, 2), peek_at(s, 3)) {
+    (Some('?'), Some(':'), _) -> {
+      let (body, s1) = disjunction(advance(s, 3))
+      (body, close(s1, open))
+    }
+    (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+      raise RegexSyntax(message: "lookahead is not supported", offset: open)
+    (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+      raise RegexSyntax(message: "lookbehind is not supported", offset: open)
+    (Some('?'), Some('<'), _) -> {
+      let (name, s1) = group_name(advance(s, 3), open, [])
+      if s1.names.contains(name) {
+        raise RegexSyntax(message: "duplicate capture group name", offset: open)
+      }
+      let index = s1.groups + 1
+      let s2 = State(..s1, groups: index, names: s1.names.insert(name, index))
+      let (body, s3) = disjunction(s2)
+      (Group(index: index, name: Some(name), body: body), close(s3, open))
+    }
+    (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+      raise RegexSyntax(message: "modifiers are not supported", offset: open)
+    (Some('?'), _, _) -> raise RegexSyntax(message: "invalid group", offset: open)
+    _ -> {
+      let index = s.groups + 1
+      let (body, s1) = disjunction(State(..advance(s, 1), groups: index))
+      (Group(index: index, name: None, body: body), close(s1, open))
+    }
+  }
+}
+
+fn close(s: State, open: Int) -> State fails RegexSyntax {
+  match peek(s) {
+    Some(')') -> advance(s, 1)
+    _ -> raise RegexSyntax(message: "unterminated group", offset: open)
+  }
+}
+
+## `<` の次から `>` までを読む。名前は ECMAScript の RegExpIdentifierName。
+fn group_name(s: State, open: Int, acc: List[Int]) -> (String, State) fails RegexSyntax {
+  match peek(s) {
+    Some('>') if acc != [] -> match Text.from_code_points(acc.reverse()) {
+      Some(name) -> (name, advance(s, 1))
+      None -> raise RegexSyntax(message: "invalid capture group name", offset: open)
+    }
+    Some(c) if (acc == [] && Char.is_id_start(c)) || (acc != [] && Char.is_id_continue(c)) ->
+      group_name(advance(s, 1), open, [c, ..acc])
+    _ -> raise RegexSyntax(message: "invalid capture group name", offset: open)
+  }
+}
+
+fn atom_escape(s: State) -> (Node, State) fails RegexSyntax {
+  let at = s.pos
+  match peek_at(s, 1) {
+    Some(c) if c >= '1' && c <= '9' ->
+      raise RegexSyntax(message: "backreferences are not supported", offset: at)
+    Some('k') -> raise RegexSyntax(message: "backreferences are not supported", offset: at)
+    _ -> match class_escape(s) {
+      (Escape(e), s1) -> (Escape(e), s1)
+      (Single(c), s1) -> (Literal(c), s1)
+      (Range(_, _), _) -> panic("class_escape returns no range")
+    }
+  }
+}
+
+## class の中と外で共通の escape。`\` の位置の State を受け取る。
+fn class_escape(s: State) -> (ClassItem, State) fails RegexSyntax {
+  let at = s.pos
+  let invalid = RegexSyntax(message: "invalid escape", offset: at)
+  match peek_at(s, 1) {
+    Some('d') -> (Escape(Digit), advance(s, 2))
+    Some('D') -> (Escape(NotDigit), advance(s, 2))
+    Some('w') -> (Escape(Word), advance(s, 2))
+    Some('W') -> (Escape(NotWord), advance(s, 2))
+    Some('s') -> (Escape(Space), advance(s, 2))
+    Some('S') -> (Escape(NotSpace), advance(s, 2))
+    Some('p') | Some('P') ->
+      raise RegexSyntax(message: "Unicode property escapes are not supported", offset: at)
+    Some('f') -> (Single(0x0C), advance(s, 2))
+    Some('n') -> (Single(0x0A), advance(s, 2))
+    Some('r') -> (Single(0x0D), advance(s, 2))
+    Some('t') -> (Single(0x09), advance(s, 2))
+    Some('v') -> (Single(0x0B), advance(s, 2))
+    Some('c') -> match peek_at(s, 2) {
+      Some(l) if (l >= 'a' && l <= 'z') || (l >= 'A' && l <= 'Z') -> (Single(l % 32), advance(s, 3))
+      _ -> raise invalid
+    }
+    Some('0') -> match peek_at(s, 2) {
+      Some(d) if d >= '0' && d <= '9' -> raise invalid
+      _ -> (Single(0), advance(s, 2))
+    }
+    Some('x') -> match hex(advance(s, 2), 2, 0) {
+      Some((c, s1)) -> (Single(c), s1)
+      None -> raise invalid
+    }
+    Some('u') -> unicode_escape(s)
+    Some(c) if "^$\\.*+?()[]{}|/".code_points().contains(c) -> (Single(c), advance(s, 2))
+    _ -> raise invalid
+  }
+}
+
+## `\uXXXX`（surrogate の対は 1 つにまとめる）と `\u{...}`。
+fn unicode_escape(s: State) -> (ClassItem, State) fails RegexSyntax {
+  let invalid = RegexSyntax(message: "invalid Unicode escape", offset: s.pos)
+  match peek_at(s, 2) {
+    Some('{') -> match hex_until_brace(advance(s, 3), None) {
+      Some((c, s1)) if c <= 0x10FFFF -> (Single(c), s1)
+      _ -> raise invalid
+    }
+    _ -> match hex(advance(s, 2), 4, 0) {
+      Some((lead, s1)) if lead >= 0xD800 && lead <= 0xDBFF -> match (peek(s1), peek_at(s1, 1), hex(advance(s1, 2), 4, 0)) {
+        (Some('\\'), Some('u'), Some((trail, s2))) if trail >= 0xDC00 && trail <= 0xDFFF ->
+          (Single(0x10000 + (lead - 0xD800) * 0x400 + (trail - 0xDC00)), s2)
+        _ -> (Single(lead), s1)
+      }
+      Some((c, s1)) -> (Single(c), s1)
+      None -> raise invalid
+    }
+  }
+}
+
+fn hex(s: State, n: Int, acc: Int) -> Option[(Int, State)] {
+  if n == 0 {
+    Some((acc, s))
+  } else {
+    let d = hex_digit(peek(s))?
+    hex(advance(s, 1), n - 1, acc * 16 + d)
+  }
+}
+
+## `}` までの 16 進。大きすぎる数は 0x110000 で止める。
+fn hex_until_brace(s: State, acc: Option[Int]) -> Option[(Int, State)] {
+  match (peek(s), acc) {
+    (Some('}'), Some(n)) -> Some((n, advance(s, 1)))
+    _ -> {
+      let d = hex_digit(peek(s))?
+      hex_until_brace(advance(s, 1), Some((acc.unwrap_or(0) * 16 + d).min(0x110000)))
+    }
+  }
+}
+
+fn hex_digit(c: Option[Int]) -> Option[Int] {
+  match c {
+    Some(d) if d >= '0' && d <= '9' -> Some(d - '0')
+    Some(d) if d >= 'a' && d <= 'f' -> Some(d - 'a' + 10)
+    Some(d) if d >= 'A' && d <= 'F' -> Some(d - 'A' + 10)
+    _ -> None
+  }
+}
+
+fn class(s: State) -> (Node, State) fails RegexSyntax {
+  let open = s.pos
+  match peek_at(s, 1) {
+    Some('^') -> {
+      let (items, s1) = class_items(advance(s, 2), open, [])
+      (Class(items: items, negated: true), s1)
+    }
+    _ -> {
+      let (items, s1) = class_items(advance(s, 1), open, [])
+      (Class(items: items, negated: false), s1)
+    }
+  }
+}
+
+fn class_items(s: State, open: Int, acc: List[ClassItem]) -> (List[ClassItem], State) fails RegexSyntax {
+  match peek(s) {
+    None -> raise RegexSyntax(message: "unterminated character class", offset: open)
+    Some(']') -> (acc.reverse(), advance(s, 1))
+    _ -> {
+      let at = s.pos
+      let (first, s1) = class_atom(s, open)
+      match (peek(s1), peek_at(s1, 1)) {
+        (Some('-'), Some(next)) if next != ']' -> {
+          let (last, s2) = class_atom(advance(s1, 1), open)
+          match (first, last) {
+            (Single(a), Single(b)) if a <= b -> class_items(s2, open, [Range(a, b), ..acc])
+            (Single(_), Single(_)) ->
+              raise RegexSyntax(message: "range out of order in character class", offset: at)
+            _ -> raise RegexSyntax(message: "invalid character class", offset: at)
+          }
+        }
+        _ -> class_items(s1, open, [first, ..acc])
+      }
+    }
+  }
+}
+
+fn class_atom(s: State, open: Int) -> (ClassItem, State) fails RegexSyntax {
+  match (peek(s), peek_at(s, 1)) {
+    (None, _) -> raise RegexSyntax(message: "unterminated character class", offset: open)
+    (Some('\\'), Some('b')) -> (Single(0x08), advance(s, 2))
+    (Some('\\'), Some('-')) -> (Single('-'), advance(s, 2))
+    (Some('\\'), _) -> class_escape(s)
+    (Some(c), _) -> (Single(c), advance(s, 1))
+  }
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/syntax.emel:60:10 ]
+#     │
+#  60 │     Some(')') -> raise RegexSyntax(message: "unmatched ')'", offset: s.pos)
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/syntax.emel:60:12 ]
+#     │
+#  60 │     Some(')') -> raise RegexSyntax(message: "unmatched ')'", offset: s.pos)
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/syntax.emel:84:10 ]
+#     │
+#  84 │     Some('|') -> {
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/syntax.emel:84:12 ]
+#     │
+#  84 │     Some('|') -> {
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/syntax.emel:97:17 ]
+#     │
+#  97 │     None | Some('|') | Some(')') -> match acc {
+#     │                 ┬  
+#     │                 ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/syntax.emel:97:19 ]
+#     │
+#  97 │     None | Some('|') | Some(')') -> match acc {
+#     │                   ┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/syntax.emel:97:29 ]
+#     │
+#  97 │     None | Some('|') | Some(')') -> match acc {
+#     │                             ┬  
+#     │                             ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/syntax.emel:97:31 ]
+#     │
+#  97 │     None | Some('|') | Some(')') -> match acc {
+#     │                               ┬  
+#     │                               ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:110:11 ]
+#      │
+#  110 │     (Some('^'), _) -> (Assert(LineStart), advance(s, 1))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `^`
+#      ╭─[ src/syntax.emel:110:12 ]
+#      │
+#  110 │     (Some('^'), _) -> (Assert(LineStart), advance(s, 1))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:110:13 ]
+#      │
+#  110 │     (Some('^'), _) -> (Assert(LineStart), advance(s, 1))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:111:11 ]
+#      │
+#  111 │     (Some('$'), _) -> (Assert(LineEnd), advance(s, 1))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `$`
+#      ╭─[ src/syntax.emel:111:12 ]
+#      │
+#  111 │     (Some('$'), _) -> (Assert(LineEnd), advance(s, 1))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:111:13 ]
+#      │
+#  111 │     (Some('$'), _) -> (Assert(LineEnd), advance(s, 1))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:112:11 ]
+#      │
+#  112 │     (Some('\\'), Some('b')) -> (Assert(WordBoundary), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/syntax.emel:112:12 ]
+#      │
+#  112 │     (Some('\\'), Some('b')) -> (Assert(WordBoundary), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/syntax.emel:112:13 ]
+#      │
+#  112 │     (Some('\\'), Some('b')) -> (Assert(WordBoundary), advance(s, 2))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:112:14 ]
+#      │
+#  112 │     (Some('\\'), Some('b')) -> (Assert(WordBoundary), advance(s, 2))
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:112:23 ]
+#      │
+#  112 │     (Some('\\'), Some('b')) -> (Assert(WordBoundary), advance(s, 2))
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:112:25 ]
+#      │
+#  112 │     (Some('\\'), Some('b')) -> (Assert(WordBoundary), advance(s, 2))
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:113:11 ]
+#      │
+#  113 │     (Some('\\'), Some('B')) -> (Assert(NotWordBoundary), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/syntax.emel:113:12 ]
+#      │
+#  113 │     (Some('\\'), Some('B')) -> (Assert(NotWordBoundary), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/syntax.emel:113:13 ]
+#      │
+#  113 │     (Some('\\'), Some('B')) -> (Assert(NotWordBoundary), advance(s, 2))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:113:14 ]
+#      │
+#  113 │     (Some('\\'), Some('B')) -> (Assert(NotWordBoundary), advance(s, 2))
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:113:23 ]
+#      │
+#  113 │     (Some('\\'), Some('B')) -> (Assert(NotWordBoundary), advance(s, 2))
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:113:25 ]
+#      │
+#  113 │     (Some('\\'), Some('B')) -> (Assert(NotWordBoundary), advance(s, 2))
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:114:11 ]
+#      │
+#  114 │     (Some('*'), _) | (Some('+'), _) | (Some('?'), _) ->
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:114:13 ]
+#      │
+#  114 │     (Some('*'), _) | (Some('+'), _) | (Some('?'), _) ->
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:114:28 ]
+#      │
+#  114 │     (Some('*'), _) | (Some('+'), _) | (Some('?'), _) ->
+#      │                            ┬  
+#      │                            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:114:30 ]
+#      │
+#  114 │     (Some('*'), _) | (Some('+'), _) | (Some('?'), _) ->
+#      │                              ┬  
+#      │                              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:114:45 ]
+#      │
+#  114 │     (Some('*'), _) | (Some('+'), _) | (Some('?'), _) ->
+#      │                                             ┬  
+#      │                                             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/syntax.emel:114:46 ]
+#      │
+#  114 │     (Some('*'), _) | (Some('+'), _) | (Some('?'), _) ->
+#      │                                              ┬  
+#      │                                              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:114:47 ]
+#      │
+#  114 │     (Some('*'), _) | (Some('+'), _) | (Some('?'), _) ->
+#      │                                               ┬  
+#      │                                               ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:116:11 ]
+#      │
+#  116 │     (Some('{'), _) -> match braces(s) {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:116:13 ]
+#      │
+#  116 │     (Some('{'), _) -> match braces(s) {
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:120:11 ]
+#      │
+#  120 │     (Some('}'), _) | (Some(']'), _) ->
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:120:13 ]
+#      │
+#  120 │     (Some('}'), _) | (Some(']'), _) ->
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:120:28 ]
+#      │
+#  120 │     (Some('}'), _) | (Some(']'), _) ->
+#      │                            ┬  
+#      │                            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:120:30 ]
+#      │
+#  120 │     (Some('}'), _) | (Some(']'), _) ->
+#      │                              ┬  
+#      │                              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:131:10 ]
+#      │
+#  131 │     Some('.') -> (Dot, advance(s, 1))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:131:12 ]
+#      │
+#  131 │     Some('.') -> (Dot, advance(s, 1))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:132:10 ]
+#      │
+#  132 │     Some('(') -> group(s)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:132:12 ]
+#      │
+#  132 │     Some('(') -> group(s)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:133:10 ]
+#      │
+#  133 │     Some('[') -> class(s)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:133:12 ]
+#      │
+#  133 │     Some('[') -> class(s)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:134:10 ]
+#      │
+#  134 │     Some('\\') -> atom_escape(s)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/syntax.emel:134:11 ]
+#      │
+#  134 │     Some('\\') -> atom_escape(s)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/syntax.emel:134:12 ]
+#      │
+#  134 │     Some('\\') -> atom_escape(s)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:134:13 ]
+#      │
+#  134 │     Some('\\') -> atom_escape(s)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:143:10 ]
+#      │
+#  143 │     Some('*') -> Some((0, None, advance(s, 1)))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:143:12 ]
+#      │
+#  143 │     Some('*') -> Some((0, None, advance(s, 1)))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:144:10 ]
+#      │
+#  144 │     Some('+') -> Some((1, None, advance(s, 1)))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:144:12 ]
+#      │
+#  144 │     Some('+') -> Some((1, None, advance(s, 1)))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:145:10 ]
+#      │
+#  145 │     Some('?') -> Some((0, Some(1), advance(s, 1)))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/syntax.emel:145:11 ]
+#      │
+#  145 │     Some('?') -> Some((0, Some(1), advance(s, 1)))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:145:12 ]
+#      │
+#  145 │     Some('?') -> Some((0, Some(1), advance(s, 1)))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:146:10 ]
+#      │
+#  146 │     Some('{') -> match braces(s) {
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:146:12 ]
+#      │
+#  146 │     Some('{') -> match braces(s) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:162:14 ]
+#      │
+#  162 │         Some('?') -> (Repeat(body: body, min: min, max: max, greedy: false), advance(s1, 1))
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/syntax.emel:162:15 ]
+#      │
+#  162 │         Some('?') -> (Repeat(body: body, min: min, max: max, greedy: false), advance(s1, 1))
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:162:16 ]
+#      │
+#  162 │         Some('?') -> (Repeat(body: body, min: min, max: max, greedy: false), advance(s1, 1))
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/syntax.emel:171:46 ]
+#      │
+#  171 │   let (min, s1) = digits(advance(s, 1), None)?
+#      │                                              ┬  
+#      │                                              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:173:10 ]
+#      │
+#  173 │     Some('}') -> Some((min, Some(min), advance(s1, 1)))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:173:12 ]
+#      │
+#  173 │     Some('}') -> Some((min, Some(min), advance(s1, 1)))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:174:10 ]
+#      │
+#  174 │     Some(',') -> match peek_at(s1, 1) {
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:174:12 ]
+#      │
+#  174 │     Some(',') -> match peek_at(s1, 1) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:175:12 ]
+#      │
+#  175 │       Some('}') -> Some((min, None, advance(s1, 2)))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:175:14 ]
+#      │
+#  175 │       Some('}') -> Some((min, None, advance(s1, 2)))
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/syntax.emel:177:53 ]
+#      │
+#  177 │         let (max, s2) = digits(advance(s1, 1), None)?
+#      │                                                     ┬  
+#      │                                                     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:179:16 ]
+#      │
+#  179 │           Some('}') -> Some((min, Some(max), advance(s2, 1)))
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:179:18 ]
+#      │
+#  179 │           Some('}') -> Some((min, Some(max), advance(s2, 1)))
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:191:21 ]
+#      │
+#  191 │     Some(c) if c >= '0' && c <= '9' -> {
+#      │                     ┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:191:23 ]
+#      │
+#  191 │     Some(c) if c >= '0' && c <= '9' -> {
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:191:33 ]
+#      │
+#  191 │     Some(c) if c >= '0' && c <= '9' -> {
+#      │                                 ┬  
+#      │                                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:191:35 ]
+#      │
+#  191 │     Some(c) if c >= '0' && c <= '9' -> {
+#      │                                   ┬  
+#      │                                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:192:44 ]
+#      │
+#  192 │       let n = acc.unwrap_or(0) * 10 + (c - '0')
+#      │                                            ┬  
+#      │                                            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:192:46 ]
+#      │
+#  192 │       let n = acc.unwrap_or(0) * 10 + (c - '0')
+#      │                                              ┬  
+#      │                                              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:202:11 ]
+#      │
+#  202 │     (Some('?'), Some(':'), _) -> {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/syntax.emel:202:12 ]
+#      │
+#  202 │     (Some('?'), Some(':'), _) -> {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:202:13 ]
+#      │
+#  202 │     (Some('?'), Some(':'), _) -> {
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:202:22 ]
+#      │
+#  202 │     (Some('?'), Some(':'), _) -> {
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:202:24 ]
+#      │
+#  202 │     (Some('?'), Some(':'), _) -> {
+#      │                        ┬  
+#      │                        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:206:11 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/syntax.emel:206:12 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:206:13 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:206:22 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:206:24 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │                        ┬  
+#      │                        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:206:39 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │                                       ┬  
+#      │                                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/syntax.emel:206:40 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │                                        ┬  
+#      │                                        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:206:41 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │                                         ┬  
+#      │                                         ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:206:50 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │                                                  ┬  
+#      │                                                  ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:206:52 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │                                                    ┬  
+#      │                                                    ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:208:11 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/syntax.emel:208:12 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:208:13 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:208:22 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:208:24 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │                        ┬  
+#      │                        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:208:33 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │                                 ┬  
+#      │                                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:208:35 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │                                   ┬  
+#      │                                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:208:47 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │                                               ┬  
+#      │                                               ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/syntax.emel:208:48 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │                                                ┬  
+#      │                                                ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:208:49 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │                                                 ┬  
+#      │                                                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:208:58 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │                                                          ┬  
+#      │                                                          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:208:60 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │                                                            ┬  
+#      │                                                            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:208:69 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │                                                                     ┬  
+#      │                                                                     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:208:71 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │                                                                       ┬  
+#      │                                                                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:210:11 ]
+#      │
+#  210 │     (Some('?'), Some('<'), _) -> {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/syntax.emel:210:12 ]
+#      │
+#  210 │     (Some('?'), Some('<'), _) -> {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:210:13 ]
+#      │
+#  210 │     (Some('?'), Some('<'), _) -> {
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:210:22 ]
+#      │
+#  210 │     (Some('?'), Some('<'), _) -> {
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:210:24 ]
+#      │
+#  210 │     (Some('?'), Some('<'), _) -> {
+#      │                        ┬  
+#      │                        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:220:11 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/syntax.emel:220:12 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:220:13 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:220:22 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:220:24 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │                        ┬  
+#      │                        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:220:39 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │                                       ┬  
+#      │                                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/syntax.emel:220:40 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │                                        ┬  
+#      │                                        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:220:41 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │                                         ┬  
+#      │                                         ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:220:50 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │                                                  ┬  
+#      │                                                  ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:220:52 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │                                                    ┬  
+#      │                                                    ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:220:67 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │                                                                   ┬  
+#      │                                                                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/syntax.emel:220:68 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │                                                                    ┬  
+#      │                                                                    ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:220:69 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │                                                                     ┬  
+#      │                                                                     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:220:78 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │                                                                              ┬  
+#      │                                                                              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:220:80 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │                                                                                ┬  
+#      │                                                                                ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:220:95 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │                                                                                               ┬  
+#      │                                                                                               ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/syntax.emel:220:96 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │                                                                                                ┬  
+#      │                                                                                                ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:220:97 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │                                                                                                 ┬  
+#      │                                                                                                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:220:106 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │                                                                                                          ┬  
+#      │                                                                                                          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:220:108 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │                                                                                                            ┬  
+#      │                                                                                                            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:222:11 ]
+#      │
+#  222 │     (Some('?'), _, _) -> raise RegexSyntax(message: "invalid group", offset: open)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/syntax.emel:222:12 ]
+#      │
+#  222 │     (Some('?'), _, _) -> raise RegexSyntax(message: "invalid group", offset: open)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:222:13 ]
+#      │
+#  222 │     (Some('?'), _, _) -> raise RegexSyntax(message: "invalid group", offset: open)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:233:10 ]
+#      │
+#  233 │     Some(')') -> advance(s, 1)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:233:12 ]
+#      │
+#  233 │     Some(')') -> advance(s, 1)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:241:10 ]
+#      │
+#  241 │     Some('>') if acc != [] -> match Text.from_code_points(acc.reverse()) {
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:241:12 ]
+#      │
+#  241 │     Some('>') if acc != [] -> match Text.from_code_points(acc.reverse()) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:254:21 ]
+#      │
+#  254 │     Some(c) if c >= '1' && c <= '9' ->
+#      │                     ┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:254:23 ]
+#      │
+#  254 │     Some(c) if c >= '1' && c <= '9' ->
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:254:33 ]
+#      │
+#  254 │     Some(c) if c >= '1' && c <= '9' ->
+#      │                                 ┬  
+#      │                                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:254:35 ]
+#      │
+#  254 │     Some(c) if c >= '1' && c <= '9' ->
+#      │                                   ┬  
+#      │                                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:256:10 ]
+#      │
+#  256 │     Some('k') -> raise RegexSyntax(message: "backreferences are not supported", offset: at)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:256:12 ]
+#      │
+#  256 │     Some('k') -> raise RegexSyntax(message: "backreferences are not supported", offset: at)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:270:10 ]
+#      │
+#  270 │     Some('d') -> (Escape(Digit), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:270:12 ]
+#      │
+#  270 │     Some('d') -> (Escape(Digit), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:271:10 ]
+#      │
+#  271 │     Some('D') -> (Escape(NotDigit), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:271:12 ]
+#      │
+#  271 │     Some('D') -> (Escape(NotDigit), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:272:10 ]
+#      │
+#  272 │     Some('w') -> (Escape(Word), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:272:12 ]
+#      │
+#  272 │     Some('w') -> (Escape(Word), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:273:10 ]
+#      │
+#  273 │     Some('W') -> (Escape(NotWord), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:273:12 ]
+#      │
+#  273 │     Some('W') -> (Escape(NotWord), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:274:10 ]
+#      │
+#  274 │     Some('s') -> (Escape(Space), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:274:12 ]
+#      │
+#  274 │     Some('s') -> (Escape(Space), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:275:10 ]
+#      │
+#  275 │     Some('S') -> (Escape(NotSpace), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:275:12 ]
+#      │
+#  275 │     Some('S') -> (Escape(NotSpace), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:276:10 ]
+#      │
+#  276 │     Some('p') | Some('P') ->
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:276:12 ]
+#      │
+#  276 │     Some('p') | Some('P') ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:276:22 ]
+#      │
+#  276 │     Some('p') | Some('P') ->
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:276:24 ]
+#      │
+#  276 │     Some('p') | Some('P') ->
+#      │                        ┬  
+#      │                        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:278:10 ]
+#      │
+#  278 │     Some('f') -> (Single(0x0C), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:278:12 ]
+#      │
+#  278 │     Some('f') -> (Single(0x0C), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:279:10 ]
+#      │
+#  279 │     Some('n') -> (Single(0x0A), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:279:12 ]
+#      │
+#  279 │     Some('n') -> (Single(0x0A), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:280:10 ]
+#      │
+#  280 │     Some('r') -> (Single(0x0D), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:280:12 ]
+#      │
+#  280 │     Some('r') -> (Single(0x0D), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:281:10 ]
+#      │
+#  281 │     Some('t') -> (Single(0x09), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:281:12 ]
+#      │
+#  281 │     Some('t') -> (Single(0x09), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:282:10 ]
+#      │
+#  282 │     Some('v') -> (Single(0x0B), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:282:12 ]
+#      │
+#  282 │     Some('v') -> (Single(0x0B), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:283:10 ]
+#      │
+#  283 │     Some('c') -> match peek_at(s, 2) {
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:283:12 ]
+#      │
+#  283 │     Some('c') -> match peek_at(s, 2) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:284:24 ]
+#      │
+#  284 │       Some(l) if (l >= 'a' && l <= 'z') || (l >= 'A' && l <= 'Z') -> (Single(l % 32), advance(s, 3))
+#      │                        ┬  
+#      │                        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:284:26 ]
+#      │
+#  284 │       Some(l) if (l >= 'a' && l <= 'z') || (l >= 'A' && l <= 'Z') -> (Single(l % 32), advance(s, 3))
+#      │                          ┬  
+#      │                          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:284:36 ]
+#      │
+#  284 │       Some(l) if (l >= 'a' && l <= 'z') || (l >= 'A' && l <= 'Z') -> (Single(l % 32), advance(s, 3))
+#      │                                    ┬  
+#      │                                    ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:284:38 ]
+#      │
+#  284 │       Some(l) if (l >= 'a' && l <= 'z') || (l >= 'A' && l <= 'Z') -> (Single(l % 32), advance(s, 3))
+#      │                                      ┬  
+#      │                                      ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:284:50 ]
+#      │
+#  284 │       Some(l) if (l >= 'a' && l <= 'z') || (l >= 'A' && l <= 'Z') -> (Single(l % 32), advance(s, 3))
+#      │                                                  ┬  
+#      │                                                  ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:284:52 ]
+#      │
+#  284 │       Some(l) if (l >= 'a' && l <= 'z') || (l >= 'A' && l <= 'Z') -> (Single(l % 32), advance(s, 3))
+#      │                                                    ┬  
+#      │                                                    ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:284:62 ]
+#      │
+#  284 │       Some(l) if (l >= 'a' && l <= 'z') || (l >= 'A' && l <= 'Z') -> (Single(l % 32), advance(s, 3))
+#      │                                                              ┬  
+#      │                                                              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:284:64 ]
+#      │
+#  284 │       Some(l) if (l >= 'a' && l <= 'z') || (l >= 'A' && l <= 'Z') -> (Single(l % 32), advance(s, 3))
+#      │                                                                ┬  
+#      │                                                                ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:287:10 ]
+#      │
+#  287 │     Some('0') -> match peek_at(s, 2) {
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:287:12 ]
+#      │
+#  287 │     Some('0') -> match peek_at(s, 2) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:288:23 ]
+#      │
+#  288 │       Some(d) if d >= '0' && d <= '9' -> raise invalid
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:288:25 ]
+#      │
+#  288 │       Some(d) if d >= '0' && d <= '9' -> raise invalid
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:288:35 ]
+#      │
+#  288 │       Some(d) if d >= '0' && d <= '9' -> raise invalid
+#      │                                   ┬  
+#      │                                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:288:37 ]
+#      │
+#  288 │       Some(d) if d >= '0' && d <= '9' -> raise invalid
+#      │                                     ┬  
+#      │                                     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:291:10 ]
+#      │
+#  291 │     Some('x') -> match hex(advance(s, 2), 2, 0) {
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:291:12 ]
+#      │
+#  291 │     Some('x') -> match hex(advance(s, 2), 2, 0) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:295:10 ]
+#      │
+#  295 │     Some('u') -> unicode_escape(s)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:295:12 ]
+#      │
+#  295 │     Some('u') -> unicode_escape(s)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:305:10 ]
+#      │
+#  305 │     Some('{') -> match hex_until_brace(advance(s, 3), None) {
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:305:12 ]
+#      │
+#  305 │     Some('{') -> match hex_until_brace(advance(s, 3), None) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:311:15 ]
+#      │
+#  311 │         (Some('\\'), Some('u'), Some((trail, s2))) if trail >= 0xDC00 && trail <= 0xDFFF ->
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/syntax.emel:311:16 ]
+#      │
+#  311 │         (Some('\\'), Some('u'), Some((trail, s2))) if trail >= 0xDC00 && trail <= 0xDFFF ->
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/syntax.emel:311:17 ]
+#      │
+#  311 │         (Some('\\'), Some('u'), Some((trail, s2))) if trail >= 0xDC00 && trail <= 0xDFFF ->
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:311:18 ]
+#      │
+#  311 │         (Some('\\'), Some('u'), Some((trail, s2))) if trail >= 0xDC00 && trail <= 0xDFFF ->
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:311:27 ]
+#      │
+#  311 │         (Some('\\'), Some('u'), Some((trail, s2))) if trail >= 0xDC00 && trail <= 0xDFFF ->
+#      │                           ┬  
+#      │                           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:311:29 ]
+#      │
+#  311 │         (Some('\\'), Some('u'), Some((trail, s2))) if trail >= 0xDC00 && trail <= 0xDFFF ->
+#      │                             ┬  
+#      │                             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/syntax.emel:325:31 ]
+#      │
+#  325 │     let d = hex_digit(peek(s))?
+#      │                               ┬  
+#      │                               ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:333:11 ]
+#      │
+#  333 │     (Some('}'), Some(n)) -> Some((n, advance(s, 1)))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:333:13 ]
+#      │
+#  333 │     (Some('}'), Some(n)) -> Some((n, advance(s, 1)))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/syntax.emel:335:33 ]
+#      │
+#  335 │       let d = hex_digit(peek(s))?
+#      │                                 ┬  
+#      │                                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:343:21 ]
+#      │
+#  343 │     Some(d) if d >= '0' && d <= '9' -> Some(d - '0')
+#      │                     ┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:343:23 ]
+#      │
+#  343 │     Some(d) if d >= '0' && d <= '9' -> Some(d - '0')
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:343:33 ]
+#      │
+#  343 │     Some(d) if d >= '0' && d <= '9' -> Some(d - '0')
+#      │                                 ┬  
+#      │                                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:343:35 ]
+#      │
+#  343 │     Some(d) if d >= '0' && d <= '9' -> Some(d - '0')
+#      │                                   ┬  
+#      │                                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:343:49 ]
+#      │
+#  343 │     Some(d) if d >= '0' && d <= '9' -> Some(d - '0')
+#      │                                                 ┬  
+#      │                                                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:343:51 ]
+#      │
+#  343 │     Some(d) if d >= '0' && d <= '9' -> Some(d - '0')
+#      │                                                   ┬  
+#      │                                                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:344:21 ]
+#      │
+#  344 │     Some(d) if d >= 'a' && d <= 'f' -> Some(d - 'a' + 10)
+#      │                     ┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:344:23 ]
+#      │
+#  344 │     Some(d) if d >= 'a' && d <= 'f' -> Some(d - 'a' + 10)
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:344:33 ]
+#      │
+#  344 │     Some(d) if d >= 'a' && d <= 'f' -> Some(d - 'a' + 10)
+#      │                                 ┬  
+#      │                                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:344:35 ]
+#      │
+#  344 │     Some(d) if d >= 'a' && d <= 'f' -> Some(d - 'a' + 10)
+#      │                                   ┬  
+#      │                                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:344:49 ]
+#      │
+#  344 │     Some(d) if d >= 'a' && d <= 'f' -> Some(d - 'a' + 10)
+#      │                                                 ┬  
+#      │                                                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:344:51 ]
+#      │
+#  344 │     Some(d) if d >= 'a' && d <= 'f' -> Some(d - 'a' + 10)
+#      │                                                   ┬  
+#      │                                                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:345:21 ]
+#      │
+#  345 │     Some(d) if d >= 'A' && d <= 'F' -> Some(d - 'A' + 10)
+#      │                     ┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:345:23 ]
+#      │
+#  345 │     Some(d) if d >= 'A' && d <= 'F' -> Some(d - 'A' + 10)
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:345:33 ]
+#      │
+#  345 │     Some(d) if d >= 'A' && d <= 'F' -> Some(d - 'A' + 10)
+#      │                                 ┬  
+#      │                                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:345:35 ]
+#      │
+#  345 │     Some(d) if d >= 'A' && d <= 'F' -> Some(d - 'A' + 10)
+#      │                                   ┬  
+#      │                                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:345:49 ]
+#      │
+#  345 │     Some(d) if d >= 'A' && d <= 'F' -> Some(d - 'A' + 10)
+#      │                                                 ┬  
+#      │                                                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:345:51 ]
+#      │
+#  345 │     Some(d) if d >= 'A' && d <= 'F' -> Some(d - 'A' + 10)
+#      │                                                   ┬  
+#      │                                                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:353:10 ]
+#      │
+#  353 │     Some('^') -> {
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `^`
+#      ╭─[ src/syntax.emel:353:11 ]
+#      │
+#  353 │     Some('^') -> {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:353:12 ]
+#      │
+#  353 │     Some('^') -> {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:367:10 ]
+#      │
+#  367 │     Some(']') -> (acc.reverse(), advance(s, 1))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:367:12 ]
+#      │
+#  367 │     Some(']') -> (acc.reverse(), advance(s, 1))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:372:15 ]
+#      │
+#  372 │         (Some('-'), Some(next)) if next != ']' -> {
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:372:17 ]
+#      │
+#  372 │         (Some('-'), Some(next)) if next != ']' -> {
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:372:44 ]
+#      │
+#  372 │         (Some('-'), Some(next)) if next != ']' -> {
+#      │                                            ┬  
+#      │                                            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:372:46 ]
+#      │
+#  372 │         (Some('-'), Some(next)) if next != ']' -> {
+#      │                                              ┬  
+#      │                                              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:390:11 ]
+#      │
+#  390 │     (Some('\\'), Some('b')) -> (Single(0x08), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/syntax.emel:390:12 ]
+#      │
+#  390 │     (Some('\\'), Some('b')) -> (Single(0x08), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/syntax.emel:390:13 ]
+#      │
+#  390 │     (Some('\\'), Some('b')) -> (Single(0x08), advance(s, 2))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:390:14 ]
+#      │
+#  390 │     (Some('\\'), Some('b')) -> (Single(0x08), advance(s, 2))
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:390:23 ]
+#      │
+#  390 │     (Some('\\'), Some('b')) -> (Single(0x08), advance(s, 2))
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:390:25 ]
+#      │
+#  390 │     (Some('\\'), Some('b')) -> (Single(0x08), advance(s, 2))
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:391:11 ]
+#      │
+#  391 │     (Some('\\'), Some('-')) -> (Single('-'), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/syntax.emel:391:12 ]
+#      │
+#  391 │     (Some('\\'), Some('-')) -> (Single('-'), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/syntax.emel:391:13 ]
+#      │
+#  391 │     (Some('\\'), Some('-')) -> (Single('-'), advance(s, 2))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:391:14 ]
+#      │
+#  391 │     (Some('\\'), Some('-')) -> (Single('-'), advance(s, 2))
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:391:23 ]
+#      │
+#  391 │     (Some('\\'), Some('-')) -> (Single('-'), advance(s, 2))
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:391:25 ]
+#      │
+#  391 │     (Some('\\'), Some('-')) -> (Single('-'), advance(s, 2))
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:391:40 ]
+#      │
+#  391 │     (Some('\\'), Some('-')) -> (Single('-'), advance(s, 2))
+#      │                                        ┬  
+#      │                                        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:391:42 ]
+#      │
+#  391 │     (Some('\\'), Some('-')) -> (Single('-'), advance(s, 2))
+#      │                                          ┬  
+#      │                                          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:392:11 ]
+#      │
+#  392 │     (Some('\\'), _) -> class_escape(s)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/syntax.emel:392:12 ]
+#      │
+#  392 │     (Some('\\'), _) -> class_escape(s)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/syntax.emel:392:13 ]
+#      │
+#  392 │     (Some('\\'), _) -> class_escape(s)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/syntax.emel:392:14 ]
+#      │
+#  392 │     (Some('\\'), _) -> class_escape(s)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/syntax.emel:57:3 ]
+#     │
+#  57 │   let start = State(cps: Array.from_list(pattern.code_points()), pos: 0, groups: 0, names: Map.empty())
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/syntax.emel:57:7 ]
+#     │
+#  57 │   let start = State(cps: Array.from_list(pattern.code_points()), pos: 0, groups: 0, names: Map.empty())
+#     │       ──┬──  
+#     │         ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/syntax.emel:58:3 ]
+#     │
+#  58 │   let (root, s) = disjunction(start)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/syntax.emel:58:7 ]
+#     │
+#  58 │   let (root, s) = disjunction(start)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/syntax.emel:59:3 ]
+#     │
+#  59 │   match peek(s) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/syntax.emel:60:10 ]
+#     │
+#  60 │     Some(')') -> raise RegexSyntax(message: "unmatched ')'", offset: s.pos)
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/syntax.emel:60:12 ]
+#     │
+#  60 │     Some(')') -> raise RegexSyntax(message: "unmatched ')'", offset: s.pos)
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/syntax.emel:60:12 ]
+#     │
+#  60 │     Some(')') -> raise RegexSyntax(message: "unmatched ')'", offset: s.pos)
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/syntax.emel:60:13 ]
+#     │
+#  60 │     Some(')') -> raise RegexSyntax(message: "unmatched ')'", offset: s.pos)
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0114]: `..` must come last
+#     ╭─[ src/syntax.emel:74:14 ]
+#     │
+#  74 │   State(..s, pos: s.pos + n)
+#     │              ─┬─  
+#     │               ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/syntax.emel:78:3 ]
+#     │
+#  78 │   let (first, s1) = alternative(s, [])
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/syntax.emel:78:7 ]
+#     │
+#  78 │   let (first, s1) = alternative(s, [])
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/syntax.emel:83:3 ]
+#     │
+#  83 │   match peek(s) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/syntax.emel:84:10 ]
+#     │
+#  84 │     Some('|') -> {
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/syntax.emel:84:11 ]
+#     │
+#  84 │     Some('|') -> {
+#     │           ┬  
+#     │           ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/syntax.emel:84:11 ]
+#     │
+#  84 │     Some('|') -> {
+#     │           ┬  
+#     │           ╰── 
+# ────╯
+#
+# error[E0110]: expected parameter name or pattern
+#     ╭─[ src/syntax.emel:84:12 ]
+#     │
+#  84 │     Some('|') -> {
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0110]: expected `|`
+#     ╭─[ src/syntax.emel:84:13 ]
+#     │
+#  84 │     Some('|') -> {
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/syntax.emel:84:13 ]
+#     │
+#  84 │     Some('|') -> {
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/syntax.emel:84:13 ]
+#     │
+#  84 │     Some('|') -> {
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/syntax.emel:88:10 ]
+#     │
+#  88 │     _ -> match acc {
+#     │          ──┬──  
+#     │            ╰──── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/syntax.emel:96:3 ]
+#     │
+#  96 │   match peek(s) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/syntax.emel:97:10 ]
+#     │
+#  97 │     None | Some('|') | Some(')') -> match acc {
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/syntax.emel:97:17 ]
+#     │
+#  97 │     None | Some('|') | Some(')') -> match acc {
+#     │                 ┬  
+#     │                 ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/syntax.emel:97:18 ]
+#     │
+#  97 │     None | Some('|') | Some(')') -> match acc {
+#     │                  ┬  
+#     │                  ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/syntax.emel:97:19 ]
+#     │
+#  97 │     None | Some('|') | Some(')') -> match acc {
+#     │                   ┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/syntax.emel:97:20 ]
+#     │
+#  97 │     None | Some('|') | Some(')') -> match acc {
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:102:7 ]
+#      │
+#  102 │       let (t, s1) = term(s)
+#      │       ─┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:102:11 ]
+#      │
+#  102 │       let (t, s1) = term(s)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/syntax.emel:109:3 ]
+#      │
+#  109 │   match (peek(s), peek_at(s, 1)) {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:110:11 ]
+#      │
+#  110 │     (Some('^'), _) -> (Assert(LineStart), advance(s, 1))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:110:12 ]
+#      │
+#  110 │     (Some('^'), _) -> (Assert(LineStart), advance(s, 1))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/syntax.emel:110:12 ]
+#      │
+#  110 │     (Some('^'), _) -> (Assert(LineStart), advance(s, 1))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:110:12 ]
+#      │
+#  110 │     (Some('^'), _) -> (Assert(LineStart), advance(s, 1))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:110:12 ]
+#      │
+#  110 │     (Some('^'), _) -> (Assert(LineStart), advance(s, 1))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:110:12 ]
+#      │
+#  110 │     (Some('^'), _) -> (Assert(LineStart), advance(s, 1))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:110:13 ]
+#      │
+#  110 │     (Some('^'), _) -> (Assert(LineStart), advance(s, 1))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:111:11 ]
+#      │
+#  111 │     (Some('$'), _) -> (Assert(LineEnd), advance(s, 1))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:111:12 ]
+#      │
+#  111 │     (Some('$'), _) -> (Assert(LineEnd), advance(s, 1))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/syntax.emel:111:12 ]
+#      │
+#  111 │     (Some('$'), _) -> (Assert(LineEnd), advance(s, 1))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:111:12 ]
+#      │
+#  111 │     (Some('$'), _) -> (Assert(LineEnd), advance(s, 1))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:111:12 ]
+#      │
+#  111 │     (Some('$'), _) -> (Assert(LineEnd), advance(s, 1))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:111:12 ]
+#      │
+#  111 │     (Some('$'), _) -> (Assert(LineEnd), advance(s, 1))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:111:13 ]
+#      │
+#  111 │     (Some('$'), _) -> (Assert(LineEnd), advance(s, 1))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:112:11 ]
+#      │
+#  112 │     (Some('\\'), Some('b')) -> (Assert(WordBoundary), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:112:12 ]
+#      │
+#  112 │     (Some('\\'), Some('b')) -> (Assert(WordBoundary), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/syntax.emel:112:12 ]
+#      │
+#  112 │     (Some('\\'), Some('b')) -> (Assert(WordBoundary), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:112:12 ]
+#      │
+#  112 │     (Some('\\'), Some('b')) -> (Assert(WordBoundary), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:112:12 ]
+#      │
+#  112 │     (Some('\\'), Some('b')) -> (Assert(WordBoundary), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:112:12 ]
+#      │
+#  112 │     (Some('\\'), Some('b')) -> (Assert(WordBoundary), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:112:13 ]
+#      │
+#  112 │     (Some('\\'), Some('b')) -> (Assert(WordBoundary), advance(s, 2))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:113:11 ]
+#      │
+#  113 │     (Some('\\'), Some('B')) -> (Assert(NotWordBoundary), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:113:12 ]
+#      │
+#  113 │     (Some('\\'), Some('B')) -> (Assert(NotWordBoundary), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/syntax.emel:113:12 ]
+#      │
+#  113 │     (Some('\\'), Some('B')) -> (Assert(NotWordBoundary), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:113:12 ]
+#      │
+#  113 │     (Some('\\'), Some('B')) -> (Assert(NotWordBoundary), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:113:12 ]
+#      │
+#  113 │     (Some('\\'), Some('B')) -> (Assert(NotWordBoundary), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:113:12 ]
+#      │
+#  113 │     (Some('\\'), Some('B')) -> (Assert(NotWordBoundary), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:113:13 ]
+#      │
+#  113 │     (Some('\\'), Some('B')) -> (Assert(NotWordBoundary), advance(s, 2))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:114:11 ]
+#      │
+#  114 │     (Some('*'), _) | (Some('+'), _) | (Some('?'), _) ->
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:114:12 ]
+#      │
+#  114 │     (Some('*'), _) | (Some('+'), _) | (Some('?'), _) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/syntax.emel:114:12 ]
+#      │
+#  114 │     (Some('*'), _) | (Some('+'), _) | (Some('?'), _) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:114:12 ]
+#      │
+#  114 │     (Some('*'), _) | (Some('+'), _) | (Some('?'), _) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:114:12 ]
+#      │
+#  114 │     (Some('*'), _) | (Some('+'), _) | (Some('?'), _) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:114:12 ]
+#      │
+#  114 │     (Some('*'), _) | (Some('+'), _) | (Some('?'), _) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:114:13 ]
+#      │
+#  114 │     (Some('*'), _) | (Some('+'), _) | (Some('?'), _) ->
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:115:13 ]
+#      │
+#  115 │       raise RegexSyntax(message: "nothing to repeat", offset: s.pos)
+#      │             ─────┬─────  
+#      │                  ╰─────── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:116:11 ]
+#      │
+#  116 │     (Some('{'), _) -> match braces(s) {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:116:12 ]
+#      │
+#  116 │     (Some('{'), _) -> match braces(s) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/syntax.emel:116:12 ]
+#      │
+#  116 │     (Some('{'), _) -> match braces(s) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:116:12 ]
+#      │
+#  116 │     (Some('{'), _) -> match braces(s) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:116:12 ]
+#      │
+#  116 │     (Some('{'), _) -> match braces(s) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:116:13 ]
+#      │
+#  116 │     (Some('{'), _) -> match braces(s) {
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:116:14 ]
+#      │
+#  116 │     (Some('{'), _) -> match braces(s) {
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:120:13 ]
+#      │
+#  120 │     (Some('}'), _) | (Some(']'), _) ->
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:121:13 ]
+#      │
+#  121 │       raise RegexSyntax(message: "lone quantifier brackets", offset: s.pos)
+#      │             ─────┬─────  
+#      │                  ╰─────── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:123:7 ]
+#      │
+#  123 │       let (a, s1) = atom(s)
+#      │       ─┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:123:11 ]
+#      │
+#  123 │       let (a, s1) = atom(s)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/syntax.emel:130:3 ]
+#      │
+#  130 │   match peek(s) {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:131:10 ]
+#      │
+#  131 │     Some('.') -> (Dot, advance(s, 1))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:131:11 ]
+#      │
+#  131 │     Some('.') -> (Dot, advance(s, 1))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:131:11 ]
+#      │
+#  131 │     Some('.') -> (Dot, advance(s, 1))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:131:11 ]
+#      │
+#  131 │     Some('.') -> (Dot, advance(s, 1))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:131:12 ]
+#      │
+#  131 │     Some('.') -> (Dot, advance(s, 1))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:132:10 ]
+#      │
+#  132 │     Some('(') -> group(s)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:132:11 ]
+#      │
+#  132 │     Some('(') -> group(s)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:132:11 ]
+#      │
+#  132 │     Some('(') -> group(s)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:132:12 ]
+#      │
+#  132 │     Some('(') -> group(s)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:132:15 ]
+#      │
+#  132 │     Some('(') -> group(s)
+#      │               ─┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:141:3 ]
+#      │
+#  141 │   let at = s.pos
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:141:7 ]
+#      │
+#  141 │   let at = s.pos
+#      │       ─┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:142:3 ]
+#      │
+#  142 │   let bounds = match peek(s) {
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:142:7 ]
+#      │
+#  142 │   let bounds = match peek(s) {
+#      │       ───┬──  
+#      │          ╰──── 
+# ─────╯
+#
+# error[E0110]: expected `}`
+#      ╭─[ src/syntax.emel:170:1 ]
+#      │
+#  170 │ fn braces(s: State) -> Option[(Int, Option[Int], State)] {
+#      │ ─┬  
+#      │  ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:171:3 ]
+#      │
+#  171 │   let (min, s1) = digits(advance(s, 1), None)?
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:171:7 ]
+#      │
+#  171 │   let (min, s1) = digits(advance(s, 1), None)?
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/syntax.emel:172:3 ]
+#      │
+#  172 │   match peek(s1) {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:173:10 ]
+#      │
+#  173 │     Some('}') -> Some((min, Some(min), advance(s1, 1)))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:173:11 ]
+#      │
+#  173 │     Some('}') -> Some((min, Some(min), advance(s1, 1)))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:173:11 ]
+#      │
+#  173 │     Some('}') -> Some((min, Some(min), advance(s1, 1)))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:173:12 ]
+#      │
+#  173 │     Some('}') -> Some((min, Some(min), advance(s1, 1)))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:174:10 ]
+#      │
+#  174 │     Some(',') -> match peek_at(s1, 1) {
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:174:12 ]
+#      │
+#  174 │     Some(',') -> match peek_at(s1, 1) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:174:15 ]
+#      │
+#  174 │     Some(',') -> match peek_at(s1, 1) {
+#      │               ─┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0123]: `_` can only be used in patterns
+#      ╭─[ src/syntax.emel:176:7 ]
+#      │
+#  176 │       _ -> {
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:176:9 ]
+#      │
+#  176 │       _ -> {
+#      │         ─┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0126]: expected declaration
+#      ╭─[ src/syntax.emel:183:5 ]
+#      │
+#  183 │     }
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/syntax.emel:190:3 ]
+#      │
+#  190 │   match peek(s) {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:191:21 ]
+#      │
+#  191 │     Some(c) if c >= '0' && c <= '9' -> {
+#      │                     ┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:191:22 ]
+#      │
+#  191 │     Some(c) if c >= '0' && c <= '9' -> {
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:191:23 ]
+#      │
+#  191 │     Some(c) if c >= '0' && c <= '9' -> {
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#      ╭─[ src/syntax.emel:195:18 ]
+#      │
+#  195 │     _ -> acc.map(fn(n) { (n, s) })
+#      │                  ──┬──  
+#      │                    ╰──── 
+# ─────╯
+#    = help: write `|n| (n, s)`
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:200:3 ]
+#      │
+#  200 │   let open = s.pos
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:200:7 ]
+#      │
+#  200 │   let open = s.pos
+#      │       ──┬─  
+#      │         ╰─── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/syntax.emel:201:3 ]
+#      │
+#  201 │   match (peek_at(s, 1), peek_at(s, 2), peek_at(s, 3)) {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:202:11 ]
+#      │
+#  202 │     (Some('?'), Some(':'), _) -> {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:202:12 ]
+#      │
+#  202 │     (Some('?'), Some(':'), _) -> {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/syntax.emel:202:12 ]
+#      │
+#  202 │     (Some('?'), Some(':'), _) -> {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:202:12 ]
+#      │
+#  202 │     (Some('?'), Some(':'), _) -> {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:202:12 ]
+#      │
+#  202 │     (Some('?'), Some(':'), _) -> {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:202:12 ]
+#      │
+#  202 │     (Some('?'), Some(':'), _) -> {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:202:13 ]
+#      │
+#  202 │     (Some('?'), Some(':'), _) -> {
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:206:11 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:206:12 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/syntax.emel:206:12 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:206:12 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:206:12 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:206:12 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:206:13 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:207:13 ]
+#      │
+#  207 │       raise RegexSyntax(message: "lookahead is not supported", offset: open)
+#      │             ─────┬─────  
+#      │                  ╰─────── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:208:11 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:208:12 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/syntax.emel:208:12 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:208:12 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:208:12 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:208:12 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:208:13 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:209:13 ]
+#      │
+#  209 │       raise RegexSyntax(message: "lookbehind is not supported", offset: open)
+#      │             ─────┬─────  
+#      │                  ╰─────── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:210:11 ]
+#      │
+#  210 │     (Some('?'), Some('<'), _) -> {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:210:12 ]
+#      │
+#  210 │     (Some('?'), Some('<'), _) -> {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/syntax.emel:210:12 ]
+#      │
+#  210 │     (Some('?'), Some('<'), _) -> {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:210:12 ]
+#      │
+#  210 │     (Some('?'), Some('<'), _) -> {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:210:12 ]
+#      │
+#  210 │     (Some('?'), Some('<'), _) -> {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:210:12 ]
+#      │
+#  210 │     (Some('?'), Some('<'), _) -> {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:210:13 ]
+#      │
+#  210 │     (Some('?'), Some('<'), _) -> {
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:220:11 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:220:12 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/syntax.emel:220:12 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:220:12 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:220:12 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:220:12 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:220:13 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:221:13 ]
+#      │
+#  221 │       raise RegexSyntax(message: "modifiers are not supported", offset: open)
+#      │             ─────┬─────  
+#      │                  ╰─────── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:222:11 ]
+#      │
+#  222 │     (Some('?'), _, _) -> raise RegexSyntax(message: "invalid group", offset: open)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:222:12 ]
+#      │
+#  222 │     (Some('?'), _, _) -> raise RegexSyntax(message: "invalid group", offset: open)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/syntax.emel:222:12 ]
+#      │
+#  222 │     (Some('?'), _, _) -> raise RegexSyntax(message: "invalid group", offset: open)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:222:12 ]
+#      │
+#  222 │     (Some('?'), _, _) -> raise RegexSyntax(message: "invalid group", offset: open)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:222:12 ]
+#      │
+#  222 │     (Some('?'), _, _) -> raise RegexSyntax(message: "invalid group", offset: open)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:222:12 ]
+#      │
+#  222 │     (Some('?'), _, _) -> raise RegexSyntax(message: "invalid group", offset: open)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:222:13 ]
+#      │
+#  222 │     (Some('?'), _, _) -> raise RegexSyntax(message: "invalid group", offset: open)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:224:7 ]
+#      │
+#  224 │       let index = s.groups + 1
+#      │       ─┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:224:11 ]
+#      │
+#  224 │       let index = s.groups + 1
+#      │           ──┬──  
+#      │             ╰──── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:225:7 ]
+#      │
+#  225 │       let (body, s1) = disjunction(State(..advance(s, 1), groups: index))
+#      │       ─┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:225:11 ]
+#      │
+#  225 │       let (body, s1) = disjunction(State(..advance(s, 1), groups: index))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/syntax.emel:232:3 ]
+#      │
+#  232 │   match peek(s) {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:233:10 ]
+#      │
+#  233 │     Some(')') -> advance(s, 1)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:233:12 ]
+#      │
+#  233 │     Some(')') -> advance(s, 1)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:233:12 ]
+#      │
+#  233 │     Some(')') -> advance(s, 1)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:233:13 ]
+#      │
+#  233 │     Some(')') -> advance(s, 1)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:234:16 ]
+#      │
+#  234 │     _ -> raise RegexSyntax(message: "unterminated group", offset: open)
+#      │                ─────┬─────  
+#      │                     ╰─────── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/syntax.emel:240:3 ]
+#      │
+#  240 │   match peek(s) {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:241:10 ]
+#      │
+#  241 │     Some('>') if acc != [] -> match Text.from_code_points(acc.reverse()) {
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:241:11 ]
+#      │
+#  241 │     Some('>') if acc != [] -> match Text.from_code_points(acc.reverse()) {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:241:11 ]
+#      │
+#  241 │     Some('>') if acc != [] -> match Text.from_code_points(acc.reverse()) {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:241:11 ]
+#      │
+#  241 │     Some('>') if acc != [] -> match Text.from_code_points(acc.reverse()) {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:241:12 ]
+#      │
+#  241 │     Some('>') if acc != [] -> match Text.from_code_points(acc.reverse()) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:245:94 ]
+#      │
+#  245 │     Some(c) if (acc == [] && Char.is_id_start(c)) || (acc != [] && Char.is_id_continue(c)) ->
+#      │                                                                                              ┬  
+#      │                                                                                              ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:246:17 ]
+#      │
+#  246 │       group_name(advance(s, 1), open, [c, ..acc])
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:247:16 ]
+#      │
+#  247 │     _ -> raise RegexSyntax(message: "invalid capture group name", offset: open)
+#      │                ─────┬─────  
+#      │                     ╰─────── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:252:3 ]
+#      │
+#  252 │   let at = s.pos
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:252:7 ]
+#      │
+#  252 │   let at = s.pos
+#      │       ─┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/syntax.emel:253:3 ]
+#      │
+#  253 │   match peek_at(s, 1) {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:254:21 ]
+#      │
+#  254 │     Some(c) if c >= '1' && c <= '9' ->
+#      │                     ┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:254:22 ]
+#      │
+#  254 │     Some(c) if c >= '1' && c <= '9' ->
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:254:23 ]
+#      │
+#  254 │     Some(c) if c >= '1' && c <= '9' ->
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:255:13 ]
+#      │
+#  255 │       raise RegexSyntax(message: "backreferences are not supported", offset: at)
+#      │             ─────┬─────  
+#      │                  ╰─────── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:256:10 ]
+#      │
+#  256 │     Some('k') -> raise RegexSyntax(message: "backreferences are not supported", offset: at)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:256:11 ]
+#      │
+#  256 │     Some('k') -> raise RegexSyntax(message: "backreferences are not supported", offset: at)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:256:11 ]
+#      │
+#  256 │     Some('k') -> raise RegexSyntax(message: "backreferences are not supported", offset: at)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:256:12 ]
+#      │
+#  256 │     Some('k') -> raise RegexSyntax(message: "backreferences are not supported", offset: at)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/syntax.emel:257:10 ]
+#      │
+#  257 │     _ -> match class_escape(s) {
+#      │          ──┬──  
+#      │            ╰──── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:267:3 ]
+#      │
+#  267 │   let at = s.pos
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:267:7 ]
+#      │
+#  267 │   let at = s.pos
+#      │       ─┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:268:3 ]
+#      │
+#  268 │   let invalid = RegexSyntax(message: "invalid escape", offset: at)
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:268:7 ]
+#      │
+#  268 │   let invalid = RegexSyntax(message: "invalid escape", offset: at)
+#      │       ───┬───  
+#      │          ╰───── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/syntax.emel:269:3 ]
+#      │
+#  269 │   match peek_at(s, 1) {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:270:10 ]
+#      │
+#  270 │     Some('d') -> (Escape(Digit), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:270:11 ]
+#      │
+#  270 │     Some('d') -> (Escape(Digit), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:270:11 ]
+#      │
+#  270 │     Some('d') -> (Escape(Digit), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:270:12 ]
+#      │
+#  270 │     Some('d') -> (Escape(Digit), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:271:10 ]
+#      │
+#  271 │     Some('D') -> (Escape(NotDigit), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:271:11 ]
+#      │
+#  271 │     Some('D') -> (Escape(NotDigit), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:271:11 ]
+#      │
+#  271 │     Some('D') -> (Escape(NotDigit), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:271:12 ]
+#      │
+#  271 │     Some('D') -> (Escape(NotDigit), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:272:10 ]
+#      │
+#  272 │     Some('w') -> (Escape(Word), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:272:11 ]
+#      │
+#  272 │     Some('w') -> (Escape(Word), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:272:11 ]
+#      │
+#  272 │     Some('w') -> (Escape(Word), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:272:12 ]
+#      │
+#  272 │     Some('w') -> (Escape(Word), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:273:10 ]
+#      │
+#  273 │     Some('W') -> (Escape(NotWord), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:273:11 ]
+#      │
+#  273 │     Some('W') -> (Escape(NotWord), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:273:11 ]
+#      │
+#  273 │     Some('W') -> (Escape(NotWord), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:273:12 ]
+#      │
+#  273 │     Some('W') -> (Escape(NotWord), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:274:10 ]
+#      │
+#  274 │     Some('s') -> (Escape(Space), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:274:11 ]
+#      │
+#  274 │     Some('s') -> (Escape(Space), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:274:11 ]
+#      │
+#  274 │     Some('s') -> (Escape(Space), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:274:12 ]
+#      │
+#  274 │     Some('s') -> (Escape(Space), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:275:10 ]
+#      │
+#  275 │     Some('S') -> (Escape(NotSpace), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:275:11 ]
+#      │
+#  275 │     Some('S') -> (Escape(NotSpace), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:275:11 ]
+#      │
+#  275 │     Some('S') -> (Escape(NotSpace), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:275:12 ]
+#      │
+#  275 │     Some('S') -> (Escape(NotSpace), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:276:10 ]
+#      │
+#  276 │     Some('p') | Some('P') ->
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:276:11 ]
+#      │
+#  276 │     Some('p') | Some('P') ->
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:276:11 ]
+#      │
+#  276 │     Some('p') | Some('P') ->
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:276:12 ]
+#      │
+#  276 │     Some('p') | Some('P') ->
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:277:13 ]
+#      │
+#  277 │       raise RegexSyntax(message: "Unicode property escapes are not supported", offset: at)
+#      │             ─────┬─────  
+#      │                  ╰─────── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:278:10 ]
+#      │
+#  278 │     Some('f') -> (Single(0x0C), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:278:11 ]
+#      │
+#  278 │     Some('f') -> (Single(0x0C), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:278:11 ]
+#      │
+#  278 │     Some('f') -> (Single(0x0C), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:278:12 ]
+#      │
+#  278 │     Some('f') -> (Single(0x0C), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:279:10 ]
+#      │
+#  279 │     Some('n') -> (Single(0x0A), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:279:11 ]
+#      │
+#  279 │     Some('n') -> (Single(0x0A), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:279:11 ]
+#      │
+#  279 │     Some('n') -> (Single(0x0A), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:279:12 ]
+#      │
+#  279 │     Some('n') -> (Single(0x0A), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:280:10 ]
+#      │
+#  280 │     Some('r') -> (Single(0x0D), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:280:11 ]
+#      │
+#  280 │     Some('r') -> (Single(0x0D), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:280:11 ]
+#      │
+#  280 │     Some('r') -> (Single(0x0D), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:280:12 ]
+#      │
+#  280 │     Some('r') -> (Single(0x0D), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:281:10 ]
+#      │
+#  281 │     Some('t') -> (Single(0x09), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:281:11 ]
+#      │
+#  281 │     Some('t') -> (Single(0x09), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:281:11 ]
+#      │
+#  281 │     Some('t') -> (Single(0x09), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:281:12 ]
+#      │
+#  281 │     Some('t') -> (Single(0x09), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:282:10 ]
+#      │
+#  282 │     Some('v') -> (Single(0x0B), advance(s, 2))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:282:11 ]
+#      │
+#  282 │     Some('v') -> (Single(0x0B), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:282:11 ]
+#      │
+#  282 │     Some('v') -> (Single(0x0B), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:282:12 ]
+#      │
+#  282 │     Some('v') -> (Single(0x0B), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:283:10 ]
+#      │
+#  283 │     Some('c') -> match peek_at(s, 2) {
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:283:11 ]
+#      │
+#  283 │     Some('c') -> match peek_at(s, 2) {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:283:11 ]
+#      │
+#  283 │     Some('c') -> match peek_at(s, 2) {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:283:12 ]
+#      │
+#  283 │     Some('c') -> match peek_at(s, 2) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:287:10 ]
+#      │
+#  287 │     Some('0') -> match peek_at(s, 2) {
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:287:11 ]
+#      │
+#  287 │     Some('0') -> match peek_at(s, 2) {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:287:11 ]
+#      │
+#  287 │     Some('0') -> match peek_at(s, 2) {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:287:12 ]
+#      │
+#  287 │     Some('0') -> match peek_at(s, 2) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:291:10 ]
+#      │
+#  291 │     Some('x') -> match hex(advance(s, 2), 2, 0) {
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:291:11 ]
+#      │
+#  291 │     Some('x') -> match hex(advance(s, 2), 2, 0) {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:291:11 ]
+#      │
+#  291 │     Some('x') -> match hex(advance(s, 2), 2, 0) {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:291:12 ]
+#      │
+#  291 │     Some('x') -> match hex(advance(s, 2), 2, 0) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:295:10 ]
+#      │
+#  295 │     Some('u') -> unicode_escape(s)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:295:11 ]
+#      │
+#  295 │     Some('u') -> unicode_escape(s)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:295:11 ]
+#      │
+#  295 │     Some('u') -> unicode_escape(s)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:295:12 ]
+#      │
+#  295 │     Some('u') -> unicode_escape(s)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:297:16 ]
+#      │
+#  297 │     _ -> raise invalid
+#      │                ───┬───  
+#      │                   ╰───── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:303:3 ]
+#      │
+#  303 │   let invalid = RegexSyntax(message: "invalid Unicode escape", offset: s.pos)
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:303:7 ]
+#      │
+#  303 │   let invalid = RegexSyntax(message: "invalid Unicode escape", offset: s.pos)
+#      │       ───┬───  
+#      │          ╰───── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/syntax.emel:304:3 ]
+#      │
+#  304 │   match peek_at(s, 2) {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:305:10 ]
+#      │
+#  305 │     Some('{') -> match hex_until_brace(advance(s, 3), None) {
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:305:11 ]
+#      │
+#  305 │     Some('{') -> match hex_until_brace(advance(s, 3), None) {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:305:11 ]
+#      │
+#  305 │     Some('{') -> match hex_until_brace(advance(s, 3), None) {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:305:12 ]
+#      │
+#  305 │     Some('{') -> match hex_until_brace(advance(s, 3), None) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:305:13 ]
+#      │
+#  305 │     Some('{') -> match hex_until_brace(advance(s, 3), None) {
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `}`
+#      ╭─[ src/syntax.emel:321:1 ]
+#      │
+#  321 │ fn hex(s: State, n: Int, acc: Int) -> Option[(Int, State)] {
+#      │ ─┬  
+#      │  ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:325:5 ]
+#      │
+#  325 │     let d = hex_digit(peek(s))?
+#      │     ─┬─  
+#      │      ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:325:9 ]
+#      │
+#  325 │     let d = hex_digit(peek(s))?
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/syntax.emel:332:3 ]
+#      │
+#  332 │   match (peek(s), acc) {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:333:11 ]
+#      │
+#  333 │     (Some('}'), Some(n)) -> Some((n, advance(s, 1)))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:333:12 ]
+#      │
+#  333 │     (Some('}'), Some(n)) -> Some((n, advance(s, 1)))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/syntax.emel:333:12 ]
+#      │
+#  333 │     (Some('}'), Some(n)) -> Some((n, advance(s, 1)))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:333:12 ]
+#      │
+#  333 │     (Some('}'), Some(n)) -> Some((n, advance(s, 1)))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:333:12 ]
+#      │
+#  333 │     (Some('}'), Some(n)) -> Some((n, advance(s, 1)))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:333:13 ]
+#      │
+#  333 │     (Some('}'), Some(n)) -> Some((n, advance(s, 1)))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0123]: `_` can only be used in patterns
+#      ╭─[ src/syntax.emel:334:5 ]
+#      │
+#  334 │     _ -> {
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:334:7 ]
+#      │
+#  334 │     _ -> {
+#      │       ─┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0126]: expected declaration
+#      ╭─[ src/syntax.emel:339:1 ]
+#      │
+#  339 │ }
+#      │ ┬  
+#      │ ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/syntax.emel:342:3 ]
+#      │
+#  342 │   match c {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:343:21 ]
+#      │
+#  343 │     Some(d) if d >= '0' && d <= '9' -> Some(d - '0')
+#      │                     ┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:343:22 ]
+#      │
+#  343 │     Some(d) if d >= '0' && d <= '9' -> Some(d - '0')
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:343:23 ]
+#      │
+#  343 │     Some(d) if d >= '0' && d <= '9' -> Some(d - '0')
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:344:21 ]
+#      │
+#  344 │     Some(d) if d >= 'a' && d <= 'f' -> Some(d - 'a' + 10)
+#      │                     ┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:344:22 ]
+#      │
+#  344 │     Some(d) if d >= 'a' && d <= 'f' -> Some(d - 'a' + 10)
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:344:23 ]
+#      │
+#  344 │     Some(d) if d >= 'a' && d <= 'f' -> Some(d - 'a' + 10)
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:345:21 ]
+#      │
+#  345 │     Some(d) if d >= 'A' && d <= 'F' -> Some(d - 'A' + 10)
+#      │                     ┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:345:22 ]
+#      │
+#  345 │     Some(d) if d >= 'A' && d <= 'F' -> Some(d - 'A' + 10)
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:345:23 ]
+#      │
+#  345 │     Some(d) if d >= 'A' && d <= 'F' -> Some(d - 'A' + 10)
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:351:3 ]
+#      │
+#  351 │   let open = s.pos
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:351:7 ]
+#      │
+#  351 │   let open = s.pos
+#      │       ──┬─  
+#      │         ╰─── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/syntax.emel:352:3 ]
+#      │
+#  352 │   match peek_at(s, 1) {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:353:10 ]
+#      │
+#  353 │     Some('^') -> {
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:353:11 ]
+#      │
+#  353 │     Some('^') -> {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:353:11 ]
+#      │
+#  353 │     Some('^') -> {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:353:11 ]
+#      │
+#  353 │     Some('^') -> {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:353:12 ]
+#      │
+#  353 │     Some('^') -> {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:358:7 ]
+#      │
+#  358 │       let (items, s1) = class_items(advance(s, 1), open, [])
+#      │       ─┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:358:11 ]
+#      │
+#  358 │       let (items, s1) = class_items(advance(s, 1), open, [])
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/syntax.emel:365:3 ]
+#      │
+#  365 │   match peek(s) {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:366:19 ]
+#      │
+#  366 │     None -> raise RegexSyntax(message: "unterminated character class", offset: open)
+#      │                   ─────┬─────  
+#      │                        ╰─────── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:367:10 ]
+#      │
+#  367 │     Some(']') -> (acc.reverse(), advance(s, 1))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:367:11 ]
+#      │
+#  367 │     Some(']') -> (acc.reverse(), advance(s, 1))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:367:11 ]
+#      │
+#  367 │     Some(']') -> (acc.reverse(), advance(s, 1))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:367:11 ]
+#      │
+#  367 │     Some(']') -> (acc.reverse(), advance(s, 1))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:367:11 ]
+#      │
+#  367 │     Some(']') -> (acc.reverse(), advance(s, 1))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:369:7 ]
+#      │
+#  369 │       let at = s.pos
+#      │       ─┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:369:11 ]
+#      │
+#  369 │       let at = s.pos
+#      │           ─┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:370:7 ]
+#      │
+#  370 │       let (first, s1) = class_atom(s, open)
+#      │       ─┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/syntax.emel:370:11 ]
+#      │
+#  370 │       let (first, s1) = class_atom(s, open)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/syntax.emel:371:7 ]
+#      │
+#  371 │       match (peek(s1), peek_at(s1, 1)) {
+#      │       ──┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:372:15 ]
+#      │
+#  372 │         (Some('-'), Some(next)) if next != ']' -> {
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:372:16 ]
+#      │
+#  372 │         (Some('-'), Some(next)) if next != ']' -> {
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/syntax.emel:372:16 ]
+#      │
+#  372 │         (Some('-'), Some(next)) if next != ']' -> {
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:372:16 ]
+#      │
+#  372 │         (Some('-'), Some(next)) if next != ']' -> {
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:372:16 ]
+#      │
+#  372 │         (Some('-'), Some(next)) if next != ']' -> {
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:372:17 ]
+#      │
+#  372 │         (Some('-'), Some(next)) if next != ']' -> {
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:372:18 ]
+#      │
+#  372 │         (Some('-'), Some(next)) if next != ']' -> {
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/syntax.emel:388:3 ]
+#      │
+#  388 │   match (peek(s), peek_at(s, 1)) {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:389:24 ]
+#      │
+#  389 │     (None, _) -> raise RegexSyntax(message: "unterminated character class", offset: open)
+#      │                        ─────┬─────  
+#      │                             ╰─────── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:390:11 ]
+#      │
+#  390 │     (Some('\\'), Some('b')) -> (Single(0x08), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:390:12 ]
+#      │
+#  390 │     (Some('\\'), Some('b')) -> (Single(0x08), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/syntax.emel:390:12 ]
+#      │
+#  390 │     (Some('\\'), Some('b')) -> (Single(0x08), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:390:12 ]
+#      │
+#  390 │     (Some('\\'), Some('b')) -> (Single(0x08), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:390:12 ]
+#      │
+#  390 │     (Some('\\'), Some('b')) -> (Single(0x08), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:390:12 ]
+#      │
+#  390 │     (Some('\\'), Some('b')) -> (Single(0x08), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:390:13 ]
+#      │
+#  390 │     (Some('\\'), Some('b')) -> (Single(0x08), advance(s, 2))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:391:11 ]
+#      │
+#  391 │     (Some('\\'), Some('-')) -> (Single('-'), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:391:12 ]
+#      │
+#  391 │     (Some('\\'), Some('-')) -> (Single('-'), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/syntax.emel:391:12 ]
+#      │
+#  391 │     (Some('\\'), Some('-')) -> (Single('-'), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:391:12 ]
+#      │
+#  391 │     (Some('\\'), Some('-')) -> (Single('-'), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:391:12 ]
+#      │
+#  391 │     (Some('\\'), Some('-')) -> (Single('-'), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:391:12 ]
+#      │
+#  391 │     (Some('\\'), Some('-')) -> (Single('-'), advance(s, 2))
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:391:13 ]
+#      │
+#  391 │     (Some('\\'), Some('-')) -> (Single('-'), advance(s, 2))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/syntax.emel:392:11 ]
+#      │
+#  392 │     (Some('\\'), _) -> class_escape(s)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:392:12 ]
+#      │
+#  392 │     (Some('\\'), _) -> class_escape(s)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/syntax.emel:392:12 ]
+#      │
+#  392 │     (Some('\\'), _) -> class_escape(s)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/syntax.emel:392:12 ]
+#      │
+#  392 │     (Some('\\'), _) -> class_escape(s)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/syntax.emel:392:12 ]
+#      │
+#  392 │     (Some('\\'), _) -> class_escape(s)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/syntax.emel:392:12 ]
+#      │
+#  392 │     (Some('\\'), _) -> class_escape(s)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/syntax.emel:392:13 ]
+#      │
+#  392 │     (Some('\\'), _) -> class_escape(s)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0213]: `Escape` is defined more than once
+#     ╭─[ src/syntax.emel:40:3 ]
+#     │
+#  27 │   Escape(ClassEscape)
+#     │   ───┬──  
+#     │      ╰──── `Escape` is first defined here
+#     │ 
+#  40 │   Escape(ClassEscape)                                     # class の外の \d など
+#     │   ───┬──  
+#     │      ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Map` in this scope
+#     ╭─[ src/syntax.emel:50:51 ]
+#     │
+#  50 │ pub type Ast(root: Node, group_count: Int, names: Map[String, Int])
+#     │                                                   ─┬─  
+#     │                                                    ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#     ╭─[ src/syntax.emel:52:17 ]
+#     │
+#  52 │ type State(cps: Array[Int], pos: Int, groups: Int, names: Map[String, Int])
+#     │                 ──┬──  
+#     │                   ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Map` in this scope
+#     ╭─[ src/syntax.emel:52:59 ]
+#     │
+#  52 │ type State(cps: Array[Int], pos: Int, groups: Int, names: Map[String, Int])
+#     │                                                           ─┬─  
+#     │                                                            ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `s` in this scope
+#     ╭─[ src/syntax.emel:59:14 ]
+#     │
+#  59 │   match peek(s) {
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0211]: cannot find value `root` in this scope
+#     ╭─[ src/syntax.emel:61:20 ]
+#     │
+#  61 │     _ -> Ast(root: root, group_count: s.groups, names: s.names)
+#     │                    ──┬─  
+#     │                      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `s` in this scope
+#     ╭─[ src/syntax.emel:61:39 ]
+#     │
+#  61 │     _ -> Ast(root: root, group_count: s.groups, names: s.names)
+#     │                                       ┬  
+#     │                                       ╰── 
+# ────╯
+#
+# error[E0211]: cannot find value `s` in this scope
+#     ╭─[ src/syntax.emel:61:56 ]
+#     │
+#  61 │     _ -> Ast(root: root, group_count: s.groups, names: s.names)
+#     │                                                        ┬  
+#     │                                                        ╰── 
+# ────╯
+#
+# error[E0211]: cannot find value `s1` in this scope
+#     ╭─[ src/syntax.emel:79:16 ]
+#     │
+#  79 │   alternatives(s1, [first])
+#     │                ─┬  
+#     │                 ╰── 
+# ────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `first` in this scope
+#     ╭─[ src/syntax.emel:79:21 ]
+#     │
+#  79 │   alternatives(s1, [first])
+#     │                     ──┬──  
+#     │                       ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `s1` in this scope
+#      ╭─[ src/syntax.emel:103:19 ]
+#      │
+#  103 │       alternative(s1, [t, ..acc])
+#      │                   ─┬  
+#      │                    ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `t` in this scope
+#      ╭─[ src/syntax.emel:103:24 ]
+#      │
+#  103 │       alternative(s1, [t, ..acc])
+#      │                        ┬  
+#      │                        ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `a` in this scope
+#      ╭─[ src/syntax.emel:124:18 ]
+#      │
+#  124 │       quantified(a, s1)
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `s1` in this scope
+#      ╭─[ src/syntax.emel:124:21 ]
+#      │
+#  124 │       quantified(a, s1)
+#      │                     ─┬  
+#      │                      ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `s1` in this scope
+#      ╭─[ src/syntax.emel:172:14 ]
+#      │
+#  172 │   match peek(s1) {
+#      │              ─┬  
+#      │               ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `open` in this scope
+#      ╭─[ src/syntax.emel:207:72 ]
+#      │
+#  207 │       raise RegexSyntax(message: "lookahead is not supported", offset: open)
+#      │                                                                        ──┬─  
+#      │                                                                          ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `open` in this scope
+#      ╭─[ src/syntax.emel:209:73 ]
+#      │
+#  209 │       raise RegexSyntax(message: "lookbehind is not supported", offset: open)
+#      │                                                                         ──┬─  
+#      │                                                                           ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `open` in this scope
+#      ╭─[ src/syntax.emel:221:73 ]
+#      │
+#  221 │       raise RegexSyntax(message: "modifiers are not supported", offset: open)
+#      │                                                                         ──┬─  
+#      │                                                                           ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `index` in this scope
+#      ╭─[ src/syntax.emel:226:21 ]
+#      │
+#  226 │       (Group(index: index, name: None, body: body), close(s1, open))
+#      │                     ──┬──  
+#      │                       ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find value `body` in this scope
+#      ╭─[ src/syntax.emel:226:46 ]
+#      │
+#  226 │       (Group(index: index, name: None, body: body), close(s1, open))
+#      │                                              ──┬─  
+#      │                                                ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `s1` in this scope
+#      ╭─[ src/syntax.emel:226:59 ]
+#      │
+#  226 │       (Group(index: index, name: None, body: body), close(s1, open))
+#      │                                                           ─┬  
+#      │                                                            ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `open` in this scope
+#      ╭─[ src/syntax.emel:226:63 ]
+#      │
+#  226 │       (Group(index: index, name: None, body: body), close(s1, open))
+#      │                                                               ──┬─  
+#      │                                                                 ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `raise` in this scope
+#      ╭─[ src/syntax.emel:234:10 ]
+#      │
+#  234 │     _ -> raise RegexSyntax(message: "unterminated group", offset: open)
+#      │          ──┬──  
+#      │            ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find module or trait `Char` in this scope
+#      ╭─[ src/syntax.emel:245:30 ]
+#      │
+#  245 │     Some(c) if (acc == [] && Char.is_id_start(c)) || (acc != [] && Char.is_id_continue(c)) ->
+#      │                              ──┬─  
+#      │                                ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find module or trait `Char` in this scope
+#      ╭─[ src/syntax.emel:245:68 ]
+#      │
+#  245 │     Some(c) if (acc == [] && Char.is_id_start(c)) || (acc != [] && Char.is_id_continue(c)) ->
+#      │                                                                    ──┬─  
+#      │                                                                      ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `c` in this scope
+#      ╭─[ src/syntax.emel:246:40 ]
+#      │
+#  246 │       group_name(advance(s, 1), open, [c, ..acc])
+#      │                                        ┬  
+#      │                                        ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `raise` in this scope
+#      ╭─[ src/syntax.emel:247:10 ]
+#      │
+#  247 │     _ -> raise RegexSyntax(message: "invalid capture group name", offset: open)
+#      │          ──┬──  
+#      │            ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find value `at` in this scope
+#      ╭─[ src/syntax.emel:255:78 ]
+#      │
+#  255 │       raise RegexSyntax(message: "backreferences are not supported", offset: at)
+#      │                                                                              ─┬  
+#      │                                                                               ╰── 
+# ─────╯
+#
+# error[E0211]: cannot find value `k` in this scope
+#      ╭─[ src/syntax.emel:256:11 ]
+#      │
+#  256 │     Some('k') -> raise RegexSyntax(message: "backreferences are not supported", offset: at)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `d` in this scope
+#      ╭─[ src/syntax.emel:270:11 ]
+#      │
+#  270 │     Some('d') -> (Escape(Digit), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `D` in this scope
+#      ╭─[ src/syntax.emel:271:11 ]
+#      │
+#  271 │     Some('D') -> (Escape(NotDigit), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `w` in this scope
+#      ╭─[ src/syntax.emel:272:11 ]
+#      │
+#  272 │     Some('w') -> (Escape(Word), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `W` in this scope
+#      ╭─[ src/syntax.emel:273:11 ]
+#      │
+#  273 │     Some('W') -> (Escape(NotWord), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `S` in this scope
+#      ╭─[ src/syntax.emel:275:11 ]
+#      │
+#  275 │     Some('S') -> (Escape(NotSpace), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `p` in this scope
+#      ╭─[ src/syntax.emel:276:11 ]
+#      │
+#  276 │     Some('p') | Some('P') ->
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `at` in this scope
+#      ╭─[ src/syntax.emel:277:88 ]
+#      │
+#  277 │       raise RegexSyntax(message: "Unicode property escapes are not supported", offset: at)
+#      │                                                                                        ─┬  
+#      │                                                                                         ╰── 
+# ─────╯
+#
+# error[E0211]: cannot find value `f` in this scope
+#      ╭─[ src/syntax.emel:278:11 ]
+#      │
+#  278 │     Some('f') -> (Single(0x0C), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `n` in this scope
+#      ╭─[ src/syntax.emel:279:11 ]
+#      │
+#  279 │     Some('n') -> (Single(0x0A), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `r` in this scope
+#      ╭─[ src/syntax.emel:280:11 ]
+#      │
+#  280 │     Some('r') -> (Single(0x0D), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `t` in this scope
+#      ╭─[ src/syntax.emel:281:11 ]
+#      │
+#  281 │     Some('t') -> (Single(0x09), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `v` in this scope
+#      ╭─[ src/syntax.emel:282:11 ]
+#      │
+#  282 │     Some('v') -> (Single(0x0B), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `c` in this scope
+#      ╭─[ src/syntax.emel:283:11 ]
+#      │
+#  283 │     Some('c') -> match peek_at(s, 2) {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `x` in this scope
+#      ╭─[ src/syntax.emel:291:11 ]
+#      │
+#  291 │     Some('x') -> match hex(advance(s, 2), 2, 0) {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `u` in this scope
+#      ╭─[ src/syntax.emel:295:11 ]
+#      │
+#  295 │     Some('u') -> unicode_escape(s)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `raise` in this scope
+#      ╭─[ src/syntax.emel:297:10 ]
+#      │
+#  297 │     _ -> raise invalid
+#      │          ──┬──  
+#      │            ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find value `d` in this scope
+#      ╭─[ src/syntax.emel:326:42 ]
+#      │
+#  326 │     hex(advance(s, 1), n - 1, acc * 16 + d)
+#      │                                          ┬  
+#      │                                          ╰── 
+# ─────╯
+#    = help: did you mean `n`?
+#
+# error[E0211]: cannot find value `a` in this scope
+#      ╭─[ src/syntax.emel:344:22 ]
+#      │
+#  344 │     Some(d) if d >= 'a' && d <= 'f' -> Some(d - 'a' + 10)
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#    = help: did you mean `c`?
+#
+# error[E0211]: cannot find value `A` in this scope
+#      ╭─[ src/syntax.emel:345:22 ]
+#      │
+#  345 │     Some(d) if d >= 'A' && d <= 'F' -> Some(d - 'A' + 10)
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#    = help: did you mean `c`?
+#
+# error[E0211]: cannot find value `items` in this scope
+#      ╭─[ src/syntax.emel:359:21 ]
+#      │
+#  359 │       (Class(items: items, negated: false), s1)
+#      │                     ──┬──  
+#      │                       ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find value `false` in this scope
+#      ╭─[ src/syntax.emel:359:37 ]
+#      │
+#  359 │       (Class(items: items, negated: false), s1)
+#      │                                     ──┬──  
+#      │                                       ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find value `s1` in this scope
+#      ╭─[ src/syntax.emel:359:45 ]
+#      │
+#  359 │       (Class(items: items, negated: false), s1)
+#      │                                             ─┬  
+#      │                                              ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `raise` in this scope
+#      ╭─[ src/syntax.emel:366:13 ]
+#      │
+#  366 │     None -> raise RegexSyntax(message: "unterminated character class", offset: open)
+#      │             ──┬──  
+#      │               ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find value `s1` in this scope
+#      ╭─[ src/syntax.emel:371:19 ]
+#      │
+#  371 │       match (peek(s1), peek_at(s1, 1)) {
+#      │                   ─┬  
+#      │                    ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `s1` in this scope
+#      ╭─[ src/syntax.emel:371:32 ]
+#      │
+#  371 │       match (peek(s1), peek_at(s1, 1)) {
+#      │                                ─┬  
+#      │                                 ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `s1` in this scope
+#      ╭─[ src/syntax.emel:381:26 ]
+#      │
+#  381 │         _ -> class_items(s1, open, [first, ..acc])
+#      │                          ─┬  
+#      │                           ╰── 
+# ─────╯
+#    = help: did you mean `s`?
+#
+# error[E0211]: cannot find value `first` in this scope
+#      ╭─[ src/syntax.emel:381:37 ]
+#      │
+#  381 │         _ -> class_items(s1, open, [first, ..acc])
+#      │                                     ──┬──  
+#      │                                       ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find value `raise` in this scope
+#      ╭─[ src/syntax.emel:389:18 ]
+#      │
+#  389 │     (None, _) -> raise RegexSyntax(message: "unterminated character class", offset: open)
+#      │                  ──┬──  
+#      │                    ╰──── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#     ╭─[ src/syntax.emel:60:5 ]
+#     │
+#  60 │     Some(')') -> raise RegexSyntax(message: "unmatched ')'", offset: s.pos)
+#     │     ───┬───  
+#     │        ╰───── 
+# ────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#     ╭─[ src/syntax.emel:84:5 ]
+#     │
+#  84 │     Some('|') -> {
+#     │     ───┬──  
+#     │        ╰──── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Node, State)`, found `fn(?1) -> {unknown}`
+#     ╭─[ src/syntax.emel:84:11 ]
+#     │
+#  84 │     Some('|') -> {
+#     │           ─┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Node, State)`, found `fn(Option[?2]) -> {unknown}`
+#     ╭─[ src/syntax.emel:97:10 ]
+#     │
+#  97 │     None | Some('|') | Some(')') -> match acc {
+#     │          ─────┬────  
+#     │               ╰────── 
+# ────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#     ╭─[ src/syntax.emel:97:12 ]
+#     │
+#  97 │     None | Some('|') | Some(')') -> match acc {
+#     │            ───┬──  
+#     │               ╰──── 
+# ────╯
+#
+# error[E0317]: refutable pattern in binding: pattern `None` not covered
+#     ╭─[ src/syntax.emel:97:12 ]
+#     │
+#  97 │     None | Some('|') | Some(')') -> match acc {
+#     │            ───┬──  
+#     │               ╰──── 
+# ────╯
+#    = help: use `match` to handle the other cases
+#
+# error[E0301]: type mismatch: expected `(Option[Int], Option[Int])`, found `(?1)`
+#      ╭─[ src/syntax.emel:110:5 ]
+#      │
+#  110 │     (Some('^'), _) -> (Assert(LineStart), advance(s, 1))
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:110:6 ]
+#      │
+#  110 │     (Some('^'), _) -> (Assert(LineStart), advance(s, 1))
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[Int], Option[Int])`, found `(?3)`
+#      ╭─[ src/syntax.emel:111:5 ]
+#      │
+#  111 │     (Some('$'), _) -> (Assert(LineEnd), advance(s, 1))
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:111:5 ]
+#      │
+#  111 │     (Some('$'), _) -> (Assert(LineEnd), advance(s, 1))
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:111:6 ]
+#      │
+#  111 │     (Some('$'), _) -> (Assert(LineEnd), advance(s, 1))
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[Int], Option[Int])`, found `(?5)`
+#      ╭─[ src/syntax.emel:112:5 ]
+#      │
+#  112 │     (Some('\\'), Some('b')) -> (Assert(WordBoundary), advance(s, 2))
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:112:5 ]
+#      │
+#  112 │     (Some('\\'), Some('b')) -> (Assert(WordBoundary), advance(s, 2))
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:112:6 ]
+#      │
+#  112 │     (Some('\\'), Some('b')) -> (Assert(WordBoundary), advance(s, 2))
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[Int], Option[Int])`, found `(?7)`
+#      ╭─[ src/syntax.emel:113:5 ]
+#      │
+#  113 │     (Some('\\'), Some('B')) -> (Assert(NotWordBoundary), advance(s, 2))
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:113:5 ]
+#      │
+#  113 │     (Some('\\'), Some('B')) -> (Assert(NotWordBoundary), advance(s, 2))
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:113:6 ]
+#      │
+#  113 │     (Some('\\'), Some('B')) -> (Assert(NotWordBoundary), advance(s, 2))
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[Int], Option[Int])`, found `(?9)`
+#      ╭─[ src/syntax.emel:114:5 ]
+#      │
+#  114 │     (Some('*'), _) | (Some('+'), _) | (Some('?'), _) ->
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:114:5 ]
+#      │
+#  114 │     (Some('*'), _) | (Some('+'), _) | (Some('?'), _) ->
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:114:6 ]
+#      │
+#  114 │     (Some('*'), _) | (Some('+'), _) | (Some('?'), _) ->
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:115:7 ]
+#      │
+#  115 │       raise RegexSyntax(message: "nothing to repeat", offset: s.pos)
+#      │       ──┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Node, State)`, found `RegexSyntax`
+#      ╭─[ src/syntax.emel:115:13 ]
+#      │
+#  115 │       raise RegexSyntax(message: "nothing to repeat", offset: s.pos)
+#      │             ────────────────────────────┬───────────────────────────  
+#      │                                         ╰───────────────────────────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[Int], Option[Int])`, found `(?11)`
+#      ╭─[ src/syntax.emel:116:5 ]
+#      │
+#  116 │     (Some('{'), _) -> match braces(s) {
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:116:5 ]
+#      │
+#  116 │     (Some('{'), _) -> match braces(s) {
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:116:6 ]
+#      │
+#  116 │     (Some('{'), _) -> match braces(s) {
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Node, State)`, found `()`
+#      ╭─[ src/syntax.emel:116:12 ]
+#      │
+#  116 │ ╭─▶     (Some('{'), _) -> match braces(s) {
+#      ┆ ┆   
+#  120 │ ├─▶     (Some('}'), _) | (Some(']'), _) ->
+#      │ │                                            
+#      │ ╰──────────────────────────────────────────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:121:7 ]
+#      │
+#  121 │       raise RegexSyntax(message: "lone quantifier brackets", offset: s.pos)
+#      │       ──┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Node, State)`, found `RegexSyntax`
+#      ╭─[ src/syntax.emel:121:13 ]
+#      │
+#  121 │       raise RegexSyntax(message: "lone quantifier brackets", offset: s.pos)
+#      │             ───────────────────────────────┬───────────────────────────────  
+#      │                                            ╰───────────────────────────────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:122:5 ]
+#      │
+#  122 │     _ -> {
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0303]: non-exhaustive match: pattern `None` not covered
+#      ╭─[ src/syntax.emel:130:9 ]
+#      │
+#  130 │   match peek(s) {
+#      │         ───┬───  
+#      │            ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:131:5 ]
+#      │
+#  131 │     Some('.') -> (Dot, advance(s, 1))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:132:5 ]
+#      │
+#  132 │     Some('(') -> group(s)
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:132:5 ]
+#      │
+#  132 │     Some('(') -> group(s)
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Node, State)`, found `()`
+#      ╭─[ src/syntax.emel:140:72 ]
+#      │
+#  140 │ ╭─▶ fn quantified(body: Node, s: State) -> (Node, State) fails RegexSyntax {
+#      ┆ ┆   
+#  169 │ ├─▶ ## `{n}` `{n,}` `{n,m}` を読む。形になっていなければ None。
+#      │ │                                                                 
+#      │ ╰───────────────────────────────────────────────────────────────── 
+# ─────╯
+#
+# error[E0303]: non-exhaustive match: pattern `None` not covered
+#      ╭─[ src/syntax.emel:172:9 ]
+#      │
+#  172 │   match peek(s1) {
+#      │         ────┬───  
+#      │             ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:173:5 ]
+#      │
+#  173 │     Some('}') -> Some((min, Some(min), advance(s1, 1)))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0305]: wrong number of arguments: `Some` takes 1, found 0
+#      ╭─[ src/syntax.emel:174:5 ]
+#      │
+#  174 │     Some(',') -> match peek_at(s1, 1) {
+#      │     ────┬────  
+#      │         ╰────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `Option[(Int, State)]`, found `Int`
+#      ╭─[ src/syntax.emel:191:22 ]
+#      │
+#  191 │     Some(c) if c >= '0' && c <= '9' -> {
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[Int], Option[Int], Option[Int])`, found `(?3)`
+#      ╭─[ src/syntax.emel:202:5 ]
+#      │
+#  202 │     (Some('?'), Some(':'), _) -> {
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:202:6 ]
+#      │
+#  202 │     (Some('?'), Some(':'), _) -> {
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[Int], Option[Int], Option[Int])`, found `(?5)`
+#      ╭─[ src/syntax.emel:206:5 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:206:5 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:206:6 ]
+#      │
+#  206 │     (Some('?'), Some('='), _) | (Some('?'), Some('!'), _) ->
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:207:7 ]
+#      │
+#  207 │       raise RegexSyntax(message: "lookahead is not supported", offset: open)
+#      │       ──┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Node, State)`, found `RegexSyntax`
+#      ╭─[ src/syntax.emel:207:13 ]
+#      │
+#  207 │       raise RegexSyntax(message: "lookahead is not supported", offset: open)
+#      │             ────────────────────────────────┬───────────────────────────────  
+#      │                                             ╰───────────────────────────────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[Int], Option[Int], Option[Int])`, found `(?7)`
+#      ╭─[ src/syntax.emel:208:5 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:208:5 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:208:6 ]
+#      │
+#  208 │     (Some('?'), Some('<'), Some('=')) | (Some('?'), Some('<'), Some('!')) ->
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:209:7 ]
+#      │
+#  209 │       raise RegexSyntax(message: "lookbehind is not supported", offset: open)
+#      │       ──┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Node, State)`, found `RegexSyntax`
+#      ╭─[ src/syntax.emel:209:13 ]
+#      │
+#  209 │       raise RegexSyntax(message: "lookbehind is not supported", offset: open)
+#      │             ────────────────────────────────┬────────────────────────────────  
+#      │                                             ╰────────────────────────────────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[Int], Option[Int], Option[Int])`, found `(?9)`
+#      ╭─[ src/syntax.emel:210:5 ]
+#      │
+#  210 │     (Some('?'), Some('<'), _) -> {
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:210:5 ]
+#      │
+#  210 │     (Some('?'), Some('<'), _) -> {
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:210:6 ]
+#      │
+#  210 │     (Some('?'), Some('<'), _) -> {
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[Int], Option[Int], Option[Int])`, found `(?11)`
+#      ╭─[ src/syntax.emel:220:5 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:220:5 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:220:6 ]
+#      │
+#  220 │     (Some('?'), Some('i'), _) | (Some('?'), Some('m'), _) | (Some('?'), Some('s'), _) | (Some('?'), Some('-'), _) ->
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:221:7 ]
+#      │
+#  221 │       raise RegexSyntax(message: "modifiers are not supported", offset: open)
+#      │       ──┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Node, State)`, found `RegexSyntax`
+#      ╭─[ src/syntax.emel:221:13 ]
+#      │
+#  221 │       raise RegexSyntax(message: "modifiers are not supported", offset: open)
+#      │             ────────────────────────────────┬────────────────────────────────  
+#      │                                             ╰────────────────────────────────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[Int], Option[Int], Option[Int])`, found `(?13)`
+#      ╭─[ src/syntax.emel:222:5 ]
+#      │
+#  222 │     (Some('?'), _, _) -> raise RegexSyntax(message: "invalid group", offset: open)
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:222:5 ]
+#      │
+#  222 │     (Some('?'), _, _) -> raise RegexSyntax(message: "invalid group", offset: open)
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:222:6 ]
+#      │
+#  222 │     (Some('?'), _, _) -> raise RegexSyntax(message: "invalid group", offset: open)
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:223:5 ]
+#      │
+#  223 │     _ -> {
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:233:5 ]
+#      │
+#  233 │     Some(')') -> advance(s, 1)
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:241:5 ]
+#      │
+#  241 │     Some('>') if acc != [] -> match Text.from_code_points(acc.reverse()) {
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:245:5 ]
+#      │
+#  245 │     Some(c) if (acc == [] && Char.is_id_start(c)) || (acc != [] && Char.is_id_continue(c)) ->
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(String, State)`, found `(State, Int, List[{unknown}])`
+#      ╭─[ src/syntax.emel:246:17 ]
+#      │
+#  246 │       group_name(advance(s, 1), open, [c, ..acc])
+#      │                 ────────────────┬────────────────  
+#      │                                 ╰────────────────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:247:5 ]
+#      │
+#  247 │     _ -> raise RegexSyntax(message: "invalid capture group name", offset: open)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Node, State)`, found `Int`
+#      ╭─[ src/syntax.emel:254:22 ]
+#      │
+#  254 │     Some(c) if c >= '1' && c <= '9' ->
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Node, State)`, found `RegexSyntax`
+#      ╭─[ src/syntax.emel:255:13 ]
+#      │
+#  255 │       raise RegexSyntax(message: "backreferences are not supported", offset: at)
+#      │             ──────────────────────────────────┬─────────────────────────────────  
+#      │                                               ╰─────────────────────────────────── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:256:5 ]
+#      │
+#  256 │     Some('k') -> raise RegexSyntax(message: "backreferences are not supported", offset: at)
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:256:5 ]
+#      │
+#  256 │     Some('k') -> raise RegexSyntax(message: "backreferences are not supported", offset: at)
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:257:5 ]
+#      │
+#  257 │     _ -> match class_escape(s) {
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Node, State)`, found `(ClassItem, State)`
+#      ╭─[ src/syntax.emel:258:26 ]
+#      │
+#  258 │       (Escape(e), s1) -> (Escape(e), s1)
+#      │                          ───────┬───────  
+#      │                                 ╰───────── 
+# ─────╯
+#    = note: the mismatch is between `Node` and `ClassItem`
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:270:5 ]
+#      │
+#  270 │     Some('d') -> (Escape(Digit), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:271:5 ]
+#      │
+#  271 │     Some('D') -> (Escape(NotDigit), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:271:5 ]
+#      │
+#  271 │     Some('D') -> (Escape(NotDigit), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:272:5 ]
+#      │
+#  272 │     Some('w') -> (Escape(Word), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:272:5 ]
+#      │
+#  272 │     Some('w') -> (Escape(Word), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:273:5 ]
+#      │
+#  273 │     Some('W') -> (Escape(NotWord), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:273:5 ]
+#      │
+#  273 │     Some('W') -> (Escape(NotWord), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:274:5 ]
+#      │
+#  274 │     Some('s') -> (Escape(Space), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:274:5 ]
+#      │
+#  274 │     Some('s') -> (Escape(Space), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(ClassItem, State)`, found `State`
+#      ╭─[ src/syntax.emel:274:11 ]
+#      │
+#  274 │     Some('s') -> (Escape(Space), advance(s, 2))
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:275:5 ]
+#      │
+#  275 │     Some('S') -> (Escape(NotSpace), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:275:5 ]
+#      │
+#  275 │     Some('S') -> (Escape(NotSpace), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:276:5 ]
+#      │
+#  276 │     Some('p') | Some('P') ->
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:276:5 ]
+#      │
+#  276 │     Some('p') | Some('P') ->
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(ClassItem, State)`, found `RegexSyntax`
+#      ╭─[ src/syntax.emel:277:13 ]
+#      │
+#  277 │       raise RegexSyntax(message: "Unicode property escapes are not supported", offset: at)
+#      │             ───────────────────────────────────────┬──────────────────────────────────────  
+#      │                                                    ╰──────────────────────────────────────── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:278:5 ]
+#      │
+#  278 │     Some('f') -> (Single(0x0C), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:278:5 ]
+#      │
+#  278 │     Some('f') -> (Single(0x0C), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:279:5 ]
+#      │
+#  279 │     Some('n') -> (Single(0x0A), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:279:5 ]
+#      │
+#  279 │     Some('n') -> (Single(0x0A), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:280:5 ]
+#      │
+#  280 │     Some('r') -> (Single(0x0D), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:280:5 ]
+#      │
+#  280 │     Some('r') -> (Single(0x0D), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:281:5 ]
+#      │
+#  281 │     Some('t') -> (Single(0x09), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:281:5 ]
+#      │
+#  281 │     Some('t') -> (Single(0x09), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:282:5 ]
+#      │
+#  282 │     Some('v') -> (Single(0x0B), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:282:5 ]
+#      │
+#  282 │     Some('v') -> (Single(0x0B), advance(s, 2))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:283:5 ]
+#      │
+#  283 │     Some('c') -> match peek_at(s, 2) {
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:283:5 ]
+#      │
+#  283 │     Some('c') -> match peek_at(s, 2) {
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:287:5 ]
+#      │
+#  287 │     Some('0') -> match peek_at(s, 2) {
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:287:5 ]
+#      │
+#  287 │     Some('0') -> match peek_at(s, 2) {
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(ClassItem, State)`, found `Int`
+#      ╭─[ src/syntax.emel:287:11 ]
+#      │
+#  287 │     Some('0') -> match peek_at(s, 2) {
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:291:5 ]
+#      │
+#  291 │     Some('x') -> match hex(advance(s, 2), 2, 0) {
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:291:5 ]
+#      │
+#  291 │     Some('x') -> match hex(advance(s, 2), 2, 0) {
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:295:5 ]
+#      │
+#  295 │     Some('u') -> unicode_escape(s)
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:295:5 ]
+#      │
+#  295 │     Some('u') -> unicode_escape(s)
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:296:5 ]
+#      │
+#  296 │     Some(c) if "^$\\.*+?()[]{}|/".code_points().contains(c) -> (Single(c), advance(s, 2))
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0313]: type `List[Int]` has no field or function `contains`
+#      ╭─[ src/syntax.emel:296:49 ]
+#      │
+#  296 │     Some(c) if "^$\\.*+?()[]{}|/".code_points().contains(c) -> (Single(c), advance(s, 2))
+#      │                                                 ────┬───  
+#      │                                                     ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:297:5 ]
+#      │
+#  297 │     _ -> raise invalid
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0303]: non-exhaustive match: pattern `None` not covered
+#      ╭─[ src/syntax.emel:304:9 ]
+#      │
+#  304 │   match peek_at(s, 2) {
+#      │         ──────┬──────  
+#      │               ╰──────── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:305:5 ]
+#      │
+#  305 │     Some('{') -> match hex_until_brace(advance(s, 3), None) {
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(ClassItem, State)`, found `()`
+#      ╭─[ src/syntax.emel:305:11 ]
+#      │
+#  305 │ ╭─▶     Some('{') -> match hex_until_brace(advance(s, 3), None) {
+#      ┆ ┆   
+#  318 │ ├─▶   }
+#      │ │         
+#      │ ╰───────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[Int], Option[Int])`, found `(?0)`
+#      ╭─[ src/syntax.emel:333:5 ]
+#      │
+#  333 │     (Some('}'), Some(n)) -> Some((n, advance(s, 1)))
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:333:6 ]
+#      │
+#  333 │     (Some('}'), Some(n)) -> Some((n, advance(s, 1)))
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `Option[Int]`, found `Int`
+#      ╭─[ src/syntax.emel:343:22 ]
+#      │
+#  343 │     Some(d) if d >= '0' && d <= '9' -> Some(d - '0')
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:353:5 ]
+#      │
+#  353 │     Some('^') -> {
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:367:5 ]
+#      │
+#  367 │     Some(']') -> (acc.reverse(), advance(s, 1))
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:368:5 ]
+#      │
+#  368 │     _ -> {
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[Int], Option[Int])`, found `(?3)`
+#      ╭─[ src/syntax.emel:372:9 ]
+#      │
+#  372 │         (Some('-'), Some(next)) if next != ']' -> {
+#      │         ───┬───  
+#      │            ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:372:10 ]
+#      │
+#  372 │         (Some('-'), Some(next)) if next != ']' -> {
+#      │          ───┬──  
+#      │             ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:381:9 ]
+#      │
+#  381 │         _ -> class_items(s1, open, [first, ..acc])
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[Int], Option[Int])`, found `(?4)`
+#      ╭─[ src/syntax.emel:390:5 ]
+#      │
+#  390 │     (Some('\\'), Some('b')) -> (Single(0x08), advance(s, 2))
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:390:6 ]
+#      │
+#  390 │     (Some('\\'), Some('b')) -> (Single(0x08), advance(s, 2))
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[Int], Option[Int])`, found `(?6)`
+#      ╭─[ src/syntax.emel:391:5 ]
+#      │
+#  391 │     (Some('\\'), Some('-')) -> (Single('-'), advance(s, 2))
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:391:5 ]
+#      │
+#  391 │     (Some('\\'), Some('-')) -> (Single('-'), advance(s, 2))
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:391:6 ]
+#      │
+#  391 │     (Some('\\'), Some('-')) -> (Single('-'), advance(s, 2))
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[Int], Option[Int])`, found `(?8)`
+#      ╭─[ src/syntax.emel:392:5 ]
+#      │
+#  392 │     (Some('\\'), _) -> class_escape(s)
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:392:5 ]
+#      │
+#  392 │     (Some('\\'), _) -> class_escape(s)
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/syntax.emel:392:6 ]
+#      │
+#  392 │     (Some('\\'), _) -> class_escape(s)
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/syntax.emel:393:5 ]
+#      │
+#  393 │     (Some(c), _) -> (Single(c), advance(s, 1))
+#      │     ──────┬─────  
+#      │           ╰─────── 
+# ─────╯
+#
+# 735 errors, 45 warnings
+# --- end wish check ---

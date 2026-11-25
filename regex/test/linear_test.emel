@@ -1,0 +1,87 @@
+import Brix.Assert
+import Lib.{NO_FLAGS}
+import Program
+import Std.Array.{Array}
+import Std.Clock.{Clock, SystemClock}
+import Syntax.{RegexSyntax}
+import Vm
+
+# The program of `pattern`, without flags.
+fn program(pattern: String) -> Vm.Program fails RegexSyntax {
+  Program.build(Syntax.parse(pattern), ignore_case: False, multiline: False, dot_all: False) match {
+    Some(program) -> program
+    None          -> panic("#{pattern} is too large")
+  }
+}
+
+# The threads the vm processes while it searches `pattern` in `n` copies of `a`. It counts work,
+# not time, so the comparison is the same on every run.
+fn steps(pattern: String, n: Int) -> Int fails RegexSyntax {
+  Vm.search(program(pattern), Array.repeat(0x61, n), 0).steps # a
+}
+
+# The most threads that `Vm.search` processes for `pattern` on `n` code points: twice the
+# instructions of its program at each of the n + 1 positions.
+fn bound(pattern: String, n: Int) -> Int fails RegexSyntax {
+  2 * program(pattern).insts.size() * (n + 1)
+}
+
+# Each of the next three tests checks that the work stays within the bound, and that twice the
+# input takes at most 2.5 times the work.
+
+@test
+fn a_nested_star_is_linear() {
+  assert steps("(a*)*b", 4000) <= bound("(a*)*b", 4000)
+  assert steps("(a*)*b", 4000) * 2 <= steps("(a*)*b", 2000) * 5
+}
+
+@test
+fn a_star_over_alternatives_that_match_the_same_is_linear() {
+  assert steps("(a|a)*b", 4000) <= bound("(a|a)*b", 4000)
+  assert steps("(a|a)*b", 4000) * 2 <= steps("(a|a)*b", 2000) * 5
+}
+
+# `b` is not in the input, so the search cannot stop at an early match: the work must grow, and
+# this test also checks that it takes at least 1.5 times as much.
+@test
+fn optional_copies_before_mandatory_ones_are_linear() {
+  assert steps("(a?){30}a{30}b", 4000) <= bound("(a?){30}a{30}b", 4000)
+  assert steps("(a?){30}a{30}b", 4000) * 2 <= steps("(a?){30}a{30}b", 2000) * 5
+  assert steps("(a?){30}a{30}b", 4000) * 2 >= steps("(a?){30}a{30}b", 2000) * 3
+}
+
+# The median of the milliseconds that each of 10 runs of `f` on `input` takes.
+fn took[A](input: String, f: fn(String) -> A) -> Int64 {
+  clock = use Clock
+  # FRICTION(032): std's Clock reads only the wall clock, which now and then steps forward, so each
+  # run is timed on its own and the median is taken.
+  times = List.range(0, 10).map(|_| {
+    start = clock.now()
+    _ = f(input)
+    clock.now().since(start).to_milliseconds()
+  })
+  sorted = times.sort()
+  # FRICTION(009): the positions are in range, but `List.get` returns an Option.
+  (Assert.some(sorted.get(4)) + Assert.some(sorted.get(5))) / 2
+}
+
+# The vm counts the threads it processes but not the strings that `replace` builds, so this test
+# measures time. `find_all` finds the same matches without building strings, so `replace` taking at
+# most 4 times as long shows that building the result costs at most a constant factor over finding
+# the matches. Each of the 10 runs is timed on its own and the medians are compared, because the
+# wall clock that `SystemClock` reads (`Date.now()`) now and then steps forward by about 3 s: such a
+# step moves a sum of the 10 runs past the bound, but not their median.
+@test
+fn replace_builds_its_result_in_time_proportional_to_the_matches() {
+  re = Lib.compile("a", NO_FLAGS)
+  # FRICTION(022): std has no `String.repeat`.
+  input = String.concat(List.range(0, 4000).map(|_| "a"))
+  with SystemClock {
+    finding = |s| Lib.find_all(re, s)
+    replacing = |s| Lib.replace(re, s, |m| m.text())
+    _ = [took(input, replacing), took(input, finding)] # warms up the JIT
+    replacing_ms = took(input, replacing)
+    finding_ms = took(input, finding)
+    assert replacing_ms <= finding_ms * 4
+  }
+}

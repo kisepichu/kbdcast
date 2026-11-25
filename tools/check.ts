@@ -1,18 +1,18 @@
 #!/usr/bin/env bun
 // The single entry of every check: run by the agent hooks after edits and at the end of a turn, and by prek on commit.
-// prek passes `--commit`, which also reports checked files that the commit lacks (see checkUntracked).
+// prek passes `--commit`, which also reports checked files that the commit lacks (see checkUntracked), and `--test`, which runs `emela test`.
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { parseEmelaVersion, pinnedEmelaVersion, type RunResult, runEmela } from "./lib/emela";
 import { checkMarks, checkNotes, findMarks } from "./lib/friction";
 import { lintSource, parseAllowlist } from "./lib/lint";
-import { findPomes, LINT_POMES, listFiles } from "./lib/pomes";
+import { findPomes, LINT_POMES, listFiles, pomeInputs } from "./lib/pomes";
 import { formatProblems, type Problem } from "./lib/report";
 
 export const ROOT = resolve(import.meta.dir, "..");
 const ALLOWLIST = "tools/lint/foundation.allow";
 
-export function runCheck(root: string, { commit = false } = {}): Problem[] {
+export function runCheck(root: string, { commit = false, test = false } = {}): Problem[] {
   // Every file the check depends on lands in `inputs`: through `read`, or directly for files only emela reads.
   // Commit mode looks at exactly these files, so it cannot drift from what the check reads.
   const inputs = new Set<string>();
@@ -20,7 +20,7 @@ export function runCheck(root: string, { commit = false } = {}): Problem[] {
     inputs.add(path);
     return readFileSync(join(root, path), "utf8");
   };
-  const problems = [...checkVersion(root, read), ...checkPomes(root, inputs), ...checkLint(root, read), ...checkFriction(root, read)];
+  const problems = [...checkVersion(root, read), ...checkPomes(root, inputs, test), ...checkLint(root, read), ...checkFriction(root, read)];
   return commit ? [...problems, ...checkUntracked(root, inputs)] : problems;
 }
 
@@ -39,15 +39,15 @@ function checkVersion(root: string, read: Read): Problem[] {
   return [];
 }
 
-function checkPomes(root: string, inputs: Set<string>): Problem[] {
+function checkPomes(root: string, inputs: Set<string>, test: boolean): Problem[] {
   const problems: Problem[] = [];
   for (const pome of findPomes(root)) {
     const dir = join(root, pome);
-    // emela reads the manifest and the sources, not this script.
-    inputs.add(join(pome, "Pome.toml"));
-    for (const file of listFiles(dir, ".emel")) inputs.add(relative(root, file));
+    // emela reads these files, not this script.
+    for (const file of pomeInputs(root, pome)) inputs.add(file);
     const fmtPaths = ["src", "test"].filter((p) => existsSync(join(dir, p)));
-    for (const args of [["fmt", "--check", ...fmtPaths], ["check", "."]]) {
+    const commands = [["fmt", "--check", ...fmtPaths], ["check", "."], ...(test ? [["test", "."]] : [])];
+    for (const args of commands) {
       const result = runEmela(args, dir);
       if (result.code !== 0) {
         problems.push({ kind: "emela", path: join(pome, "Pome.toml"), message: `emela ${args.join(" ")} が失敗した`, detail: result.stdout + result.stderr });
@@ -107,11 +107,11 @@ export function checkUntracked(root: string, inputs: Iterable<string>): Problem[
 
 if (import.meta.main) {
   const args = process.argv.slice(2);
-  if (args.some((arg) => arg !== "--commit")) {
-    console.error("使い方: mise exec -- bun tools/check.ts [--commit]");
+  if (args.some((arg) => arg !== "--commit" && arg !== "--test")) {
+    console.error("使い方: mise exec -- bun tools/check.ts [--commit] [--test]");
     process.exit(1);
   }
-  const problems = runCheck(ROOT, { commit: args.includes("--commit") });
+  const problems = runCheck(ROOT, { commit: args.includes("--commit"), test: args.includes("--test") });
   if (problems.length === 0) {
     console.log("tools/check: ok");
   } else {

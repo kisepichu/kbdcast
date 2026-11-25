@@ -10,7 +10,8 @@ kbdcast は、端末アプリのデモ GIF を、操作を書いた tape から�
 | 場所 | 中身 | `@external` |
 |---|---|---|
 | `/`（`src/`） | core。純粋な部分と effect を使う部分 | 置かない |
-| `regex/` | 汎用の正規表現の Pome | 置かない |
+| `text/` | std に足りない String の関数（std に入ったら消す） | 置かない |
+| `regex/` | 汎用の正規表現の Pome | 置かない（`test/` の正解役を除く） |
 | `pty/` | effect Pty の宣言だけ | 置かない |
 | `pty-bun/` | handler BunPty | ここだけ |
 | `cli/` | main | 置かない |
@@ -27,7 +28,7 @@ kbdcast は、端末アプリのデモ GIF を、操作を書いた tape から�
 新しい単位（モジュール、effect、主要な関数）を書くときは:
 
 1. spec を調べる前に、推測の文法で「こう書きたい」コードを `wish/<name>.emel` に書く。先頭に `# wish-target: <置く予定の repo からの相対パス>` を書く。
-2. `mise exec -- bun tools/wish.ts check wish/<name>.emel` を走らせる。診断がファイルの末尾に貼られる。
+2. `mise exec -- bun tools/wish.ts check wish/<name>.emel` を走らせる。診断がファイルの末尾に貼られる。Pome がまだ無ければ、wish check が仮の Pome.toml を置く。
 3. wish だけを commit する。
 4. それから spec を調べ、`src/` に実装する。wish と実装が違ったら、その差が回り道かどうかを判断する。
 
@@ -52,12 +53,15 @@ kbdcast は、端末アプリのデモ GIF を、操作を書いた tape から�
 
 ### 3. 基盤レベル
 
-core、regex、cli の `src/` で基盤レベルのキーワードを書けるのは、`tools/lint/foundation.allow` に理由と一緒に登録したモジュールだけ。登録するのは、設計として選んだもの（ドメインの port にする effect など）。登録の理由と実際の使い方がずれたら、それも回り道として記録する。
+core、text、regex、cli の `src/` で基盤レベルのキーワードを書けるのは、`tools/lint/foundation.allow` に理由と一緒に登録したモジュールだけ。登録するのは、設計として選んだもの（ドメインの port にする effect など）。登録の理由と実際の使い方がずれたら、それも回り道として記録する。
+
+各 Pome の `test/` はこの規則の外にある（lint の対象でもない）。Test 用の handler、正解役を呼ぶ `@external`、テストする library の error を伝える `fails`（`fails RegexSyntax` を書いた補助関数など）は、回り道として記録しなくてよい。ただし、テストを書くために library の側に回り道が要ったなら、それは記録する。
 
 ### 4. 検査
 
 - clone したら一度 `mise install` と `mise exec -- prek install` を走らせる。
 - ターンを終える前と commit の前に `mise exec -- bun tools/check.ts` を通す。
+- commit のときの prek は `--test` も付け、各 Pome の `emela test` を走らせる。編集のたびとターンの終わりの hook は走らせない（時間がかかるため）。
 - Claude Code と omp の hook は、対象のファイル（`.emel`、`Pome.toml`、`friction/`、`wish/`、`tools/lint/foundation.allow`）を編集したときとターンの終わりに検査を走らせる。prek は commit のたびに `--commit` を付けて走らせ、検査するファイルが commit に入っていないときも止める。hook や prek を止めたり飛ばしたりして通さない。
 - `tools/` を変えたら `mise exec -- bun test tools/test` も通す。
 

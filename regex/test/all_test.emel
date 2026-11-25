@@ -1,0 +1,73 @@
+import Lib.{Flags, NO_FLAGS, RegexSyntax}
+
+# The expected results are those of JavaScript's `s.matchAll(re)`, `s.replace(re, f)` and
+# `s.split(re)` with the `g` and `u` flags, from both Bun and Node, with the positions turned into
+# code point offsets and the captures that `split` puts between the pieces left out.
+
+const I: Flags = Flags(ignore_case: True, ..NO_FLAGS)
+const M: Flags = Flags(multiline: True, ..NO_FLAGS)
+
+# Where each match of `pattern` in `input` starts, and its text.
+fn find_all(pattern: String, flags: Flags, input: String) -> List[(Int, String)] fails RegexSyntax {
+  Lib.find_all(Lib.compile(pattern, flags), input).map(|m| (m.start(), m.text()))
+}
+
+# `input` with each match of `pattern` enclosed in `<` and `>`.
+fn enclose(pattern: String, input: String) -> String fails RegexSyntax {
+  Lib.replace(Lib.compile(pattern, NO_FLAGS), input, |m| "<#{m.text()}>")
+}
+
+fn split(pattern: String, input: String) -> List[String] fails RegexSyntax {
+  Lib.split(Lib.compile(pattern, NO_FLAGS), input)
+}
+
+@test
+fn find_all_searches_again_where_a_match_ends() {
+  assert find_all("\\d", NO_FLAGS, "a1b22") == [(1, "1"), (3, "2"), (4, "2")]
+}
+
+# Each search after the first starts inside the input, where `^`, `\b` and `\B` still see the code
+# point before it.
+@test
+fn find_all_checks_assertions_against_the_input_before_where_a_search_starts() {
+  assert find_all("^a", NO_FLAGS, "aa") == [(0, "a")]
+  assert find_all("^a", M, "aa") == [(0, "a")]
+  assert find_all("^a", M, "a\na") == [(0, "a"), (2, "a")]
+  assert find_all("a$", M, "a\na") == [(0, "a"), (2, "a")]
+  assert find_all("\\ba", NO_FLAGS, "a aa") == [(0, "a"), (2, "a")]
+  assert find_all("\\Ba", NO_FLAGS, "aaa") == [(1, "a"), (2, "a")]
+  # With ignore_case, the Kelvin sign is a word character.
+  assert find_all("\\bk", I, "k\u{212A}") == [(0, "k")]
+}
+
+@test
+fn find_all_searches_again_one_code_point_after_an_empty_match() {
+  assert find_all("a*", NO_FLAGS, "baac") == [(0, ""), (1, "aa"), (3, ""), (4, "")]
+  assert find_all("", NO_FLAGS, "\u{1F600}a") == [(0, ""), (1, ""), (2, "")]
+}
+
+@test
+fn replace_replaces_each_match_with_the_result_of_f() {
+  assert enclose("\\d", "a1b22") == "a<1>b<2><2>"
+  assert enclose("x*", "ab") == "<>a<>b<>"
+  assert enclose("", "\u{1F600}a") == "<>\u{1F600}<>a<>"
+}
+
+@test
+fn split_cuts_at_each_match_and_leaves_out_the_captures() {
+  assert split(",\\s*", "a, b,c") == ["a", "b", "c"]
+  assert split("(-)", "a-b") == ["a", "b"]
+  assert split("b", "abba") == ["a", "", "a"]
+}
+
+@test
+fn split_does_not_cut_with_an_empty_match_where_a_piece_would_be_empty() {
+  assert split("x*", "abc") == ["a", "b", "c"]
+  assert split("", "\u{1F600}b") == ["\u{1F600}", "b"]
+}
+
+@test
+fn split_of_the_empty_string_is_empty_if_the_pattern_matches_there() {
+  assert split("a", "") == [""]
+  assert split("(?:)", "") == []
+}

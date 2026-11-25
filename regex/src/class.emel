@@ -1,0 +1,216 @@
+# Sets of code points, as spans in increasing order that neither overlap nor touch ([a-c] and [d-f]
+# are kept as one span [a-f], so that equal sets are equal values). `Program` turns a class, a class
+# escape, `.` and a character into one of these, and `Vm` looks a code point up in it in
+# O(log spans).
+#
+# With `ignore_case`, ECMAScript compares canonicalized characters: `Vm` canonicalizes the input
+# with `Fold.canonicalize`, looks it up in the `canonicalize` of the class's set, and only then
+# applies the negation of `[^...]` (so `/[^k]/iu` does not match KELVIN SIGN). `\D \W \S` are
+# complements of sets, not negations.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment, and `emela doc` does not show it.
+
+import FoldTable.{SOURCES, TARGETS}
+import Std.Array.{Array}
+
+const MAX_CODE_POINT: Int = 0x10FFFF
+
+# The code points from `from` to `to`, both included.
+type Span(from: Int, to: Int)
+
+## A set of code points. `starts` and `ends` hold the first and the last code point of each span,
+## in increasing order.
+# FRICTION(031): std's `lower_bound` takes a value of the element type, not a key, so the spans
+# are two Arrays, searched by `ends`, instead of one `Array[Span]` searched by `to`.
+pub opaque type CharSet(starts: Array[Int], ends: Array[Int]) derive Eq, Show
+
+## The set of no code points: `[]`.
+pub const EMPTY: CharSet = CharSet(starts: Array.empty(), ends: Array.empty())
+
+## The set of `c` alone.
+pub fn single(c: Int) -> CharSet {
+  range(c, c)
+}
+
+## The code points from `from` to `to`, both included. Empty if `from` is greater than `to`.
+pub fn range(from: Int, to: Int) -> CharSet {
+  if from > to { EMPTY } else { of_sorted([Span(from, to)]) }
+}
+
+## The code points in `a` or in `b`. O(spans of `a` + spans of `b`).
+pub fn union(a: CharSet, b: CharSet) -> CharSet {
+  of_sorted(merge(a.spans(), b.spans(), []))
+}
+
+## The code points from 0 to 0x10FFFF that are not in `set`.
+pub fn complement(set: CharSet) -> CharSet {
+  of_sorted(gaps(0, set.spans(), []))
+}
+
+## Whether `c` is in `set`. O(log spans).
+pub fn contains(set: CharSet, c: Int) -> Bool {
+  # The first span that does not end before `c`. `c` is in it if it starts at or before `c`.
+  set.starts.get(set.ends.lower_bound(c)) match {
+    Some(start) -> start <= c
+    None        -> False
+  }
+}
+
+## `\d`: the ASCII digits.
+# FRICTION(013): Emela has no literal for the code point of a character, so these are hexadecimal.
+pub const DIGIT: CharSet = range(0x30, 0x39) # 0-9
+
+# FRICTION(013)
+const ASCII_WORD: CharSet = of_sorted(
+  [
+    Span(0x30, 0x39), # 0-9
+    Span(0x41, 0x5A), # A-Z
+    Span(0x5F, 0x5F), # _
+    Span(0x61, 0x7A), # a-z
+  ],
+)
+
+# U+017F LATIN SMALL LETTER LONG S folds to s, and U+212A KELVIN SIGN to k. No other code point
+# folds to an ASCII word character.
+const FOLDED_WORD: CharSet = ASCII_WORD.union(single(0x17F)).union(single(0x212A))
+
+## `\w`: the ASCII word characters. With `ignore_case`, also the characters whose canonical form
+## is one (U+017F and U+212A), as ECMAScript's WordCharacters with the `u` and `i` flags.
+pub fn word(ignore_case: Bool) -> CharSet {
+  if ignore_case { FOLDED_WORD } else { ASCII_WORD }
+}
+
+## `\s`: ECMAScript's WhiteSpace (TAB, VT, FF, ZWNBSP and the Space_Separator characters) and
+## LineTerminator (LF, CR, LS, PS).
+pub const SPACE: CharSet = of_sorted(
+  [
+    Span(0x9, 0xD), # TAB LF VT FF CR
+    Span(0x20, 0x20),
+    Span(0xA0, 0xA0),
+    Span(0x1680, 0x1680),
+    Span(0x2000, 0x200A),
+    Span(0x2028, 0x2029), # LS PS
+    Span(0x202F, 0x202F),
+    Span(0x205F, 0x205F),
+    Span(0x3000, 0x3000),
+    Span(0xFEFF, 0xFEFF), # ZWNBSP
+  ],
+)
+
+# FRICTION(013)
+const LINE_TERMINATOR: CharSet = of_sorted(
+  [
+    Span(0xA, 0xA), # \n
+    Span(0xD, 0xD), # \r
+    Span(0x2028, 0x2029), # LS PS
+  ],
+)
+
+const ANY: CharSet = range(0, MAX_CODE_POINT)
+
+const NOT_LINE_TERMINATOR: CharSet = LINE_TERMINATOR.complement()
+
+## `.`: every code point but the line terminators (`\n \r` U+2028 U+2029), or every code point
+## with `dot_all`.
+pub fn dot(dot_all: Bool) -> CharSet {
+  if dot_all { ANY } else { NOT_LINE_TERMINATOR }
+}
+
+## The canonical forms of the members of `set`: `{ Fold.canonicalize(a) | a ∈ set }`. A code point
+## that is not a source of the case folding table is its own canonical form, so this is `set`
+## without the sources, with the targets of the sources in `set` added. It walks the spans and the
+## table together and never goes through the members one by one: O(spans + size of the table).
+pub fn canonicalize(set: CharSet) -> CharSet {
+  (kept, hits) = remove_sources(set.spans(), SOURCES, [], [])
+  hit = Array.from_list(hits)
+  folded = TARGET_ORDER.filter(|(index, _)| {
+    hit.get(index) match {
+      Some(in_set) -> in_set
+      # FRICTION(009): `hits` has an entry for each source, and `index` is the position of one, but
+      # `Array.get` still returns an Option.
+      None         -> panic("Class.canonicalize: no entry for source #{index}")
+    }
+  })
+  of_sorted(merge(kept, folded.map(|(_, target)| Span(target, target)), []))
+}
+
+# The entries of the table, as positions and targets, in the order of the targets.
+const TARGET_ORDER: List[(Int, Int)] = TARGETS.enumerate().sort_by(
+  |(_, a), (_, b)| Ord.compare(a, b),
+)
+
+# The set of `spans`, which are in the order of `from`, and may overlap or touch.
+fn of_sorted(spans: List[Span]) -> CharSet {
+  joined = coalesce(spans, [])
+  CharSet(
+    starts: Array.from_list(joined.map(|s| s.from)),
+    ends: Array.from_list(joined.map(|s| s.to)),
+  )
+}
+
+fn spans(set: CharSet) -> List[Span] {
+  List.zip(set.starts.to_list(), set.ends.to_list()).map(|(from, to)| Span(from, to))
+}
+
+# The spans of `a` and `b`, which are each in the order of `from`, in the order of `from`, after
+# the reverse of `done`.
+# FRICTION(021): only a self tail call is guaranteed not to use the stack, so the result is built
+# in reverse in `done` instead of as `[x, ..merge(xs, b)]`.
+fn merge(a: List[Span], b: List[Span], done: List[Span]) -> List[Span] {
+  (a, b) match {
+    ([], _)                                  -> done.reverse().append(b)
+    (_, [])                                  -> done.reverse().append(a)
+    ([x, ..xs], [y, ..]) if x.from <= y.from -> merge(xs, b, [x, ..done])
+    (_, [y, ..ys])                           -> merge(a, ys, [y, ..done])
+  }
+}
+
+# `spans`, in the order of `from`, with the spans that overlap or touch joined, after the reverse
+# of `done`.
+# FRICTION(021)
+fn coalesce(spans: List[Span], done: List[Span]) -> List[Span] {
+  (spans, done) match {
+    ([], _)          -> done.reverse()
+    ([s, ..rest], [last, ..before]) if s.from <= last.to + 1 -> {
+      coalesce(rest, [Span(last.from, Int.max(last.to, s.to)), ..before])
+    }
+    ([s, ..rest], _) -> coalesce(rest, [s, ..done])
+  }
+}
+
+# The code points from `next` to MAX_CODE_POINT that are not in `spans`, after the reverse of
+# `done`.
+# FRICTION(021)
+fn gaps(next: Int, spans: List[Span], done: List[Span]) -> List[Span] {
+  spans match {
+    [] if next <= MAX_CODE_POINT -> [Span(next, MAX_CODE_POINT), ..done].reverse()
+    []                           -> done.reverse()
+    [s, ..rest] if next < s.from -> gaps(s.to + 1, rest, [Span(next, s.from - 1), ..done])
+    [s, ..rest]                  -> gaps(s.to + 1, rest, done)
+  }
+}
+
+# Walks `spans` and `sources`, both in increasing order, together. The spans without the sources
+# (after the reverse of `kept`), and for each source whether it is in the spans (after the reverse
+# of `hits`).
+# FRICTION(021)
+fn remove_sources(
+  spans: List[Span],
+  sources: List[Int],
+  kept: List[Span],
+  hits: List[Bool],
+) -> (List[Span], List[Bool]) {
+  (spans, sources) match {
+    (_, []) -> (kept.reverse().append(spans), hits.reverse())
+    ([], _) -> (kept.reverse(), hits.reverse().append(sources.map(|_| False)))
+    ([s, ..], [c, ..more]) if c < s.from -> remove_sources(spans, more, kept, [False, ..hits])
+    ([s, ..rest], [c, ..]) if c > s.to -> remove_sources(rest, sources, [s, ..kept], hits)
+    ([s, ..rest], [c, ..more]) -> {
+      # `c` is in `s`: keep the parts of `s` before and after it.
+      before = if s.from < c { [Span(s.from, c - 1), ..kept] } else { kept }
+      after = if c < s.to { [Span(c + 1, s.to), ..rest] } else { rest }
+      remove_sources(after, more, before, [True, ..hits])
+    }
+  }
+}

@@ -1,0 +1,288 @@
+# Generators for the differential test (`differential_test.emel`): patterns of the syntax that
+# `Syntax.parse` accepts (spec §6) nested at most 4 deep, flags, and inputs, drawn from a small
+# alphabet.
+#
+# FRICTION(028): brix's Gen has no choice between generators (`one_of`, `frequency`, `element`), no
+# generator made from a generated value (`and_then`), and no list with bounds on its length, so
+# `and_then` is built here from Gen and Tree, and the others on top of it.
+
+import Brix.Pbt.Gen.{Gen, Tree}
+
+# The characters of patterns and inputs: ASCII letters and the characters that case folding maps
+# to them or to each other (k and the Kelvin sign, s and the long s, ß and ẞ, Σ and ς), a line
+# terminator, a space, and a character outside the BMP.
+const ALPHABET: List[String] = [
+  "a",
+  "b",
+  "k",
+  "s",
+  "\n",
+  " ",
+  "\u{17F}",
+  "\u{212A}",
+  "\u{DF}",
+  "\u{1E9E}",
+  "\u{3A3}",
+  "\u{3C2}",
+  "\u{1F600}",
+]
+
+const CLASS_ESCAPES: List[String] = ["\\d", "\\D", "\\w", "\\W", "\\s", "\\S"]
+
+# A generated pattern, before `render` writes it.
+enum Node {
+  # A character, `.`, a class, or a class escape: text that a quantifier may follow.
+  Atom(String)
+  # `^ $ \b \B`, which no quantifier may follow.
+  Assert(String)
+  # The terms in order. No terms is the empty pattern.
+  Concat(List[Node])
+  Alternate(Node, Node)
+  # `quantifier` is `*`, `+`, `?`, `{n}`, `{n,}` or `{n,m}`, followed by `?` if it is lazy.
+  Repeat(body: Node, quantifier: String)
+  # A capture group, named after `prefix` if it has one.
+  Group(prefix: Option[String], body: Node)
+  NonCapture(Node)
+}
+
+## A pattern: characters, `.`, classes (with ranges, negation and class escapes), class escapes,
+## `^ $ \b \B`, concatenation, alternation, the quantifiers with counts from 0 to 3 and their lazy
+## forms, capture groups (named or not), and groups that do not capture.
+pub fn pattern() -> Gen[String] {
+  node(4) |> Gen.map(render)
+}
+
+## The letters of ECMAScript's `i`, `m` and `s` flags, each one there or not, in that order.
+pub fn flags() -> Gen[String] {
+  Gen.pair(element(["", "i"]), Gen.pair(element(["", "m"]), element(["", "s"])))
+    |> Gen.map(|(i, (m, s))| "#{i}#{m}#{s}")
+}
+
+## 0 to 8 characters of the alphabet.
+pub fn input() -> Gen[String] {
+  list_between(character(), 0, 8) |> Gen.map(|cs| cs.join(""))
+}
+
+# A node with at most `depth` levels of nodes that hold other nodes. A leaf comes first, so that a
+# counterexample shrinks toward leaves, and a concatenation last, where `frequency` adds weight.
+fn node(depth: Int) -> Gen[Node] {
+  if depth == 0 {
+    leaf()
+  } else {
+    sub = node(depth - 1)
+    frequency(
+      [
+        (2, leaf()),
+        (1, sub |> Gen.map(|body| NonCapture(body))),
+        (
+          2,
+          Gen.pair(option(name_prefix()), sub) |> Gen.map(|(prefix, body)| Group(prefix:, body:)),
+        ),
+        (2, Gen.pair(sub, sub) |> Gen.map(|(left, right)| Alternate(left, right))),
+        (
+          3,
+          Gen.pair(sub, quantifier()) |> Gen.map(|(body, quantifier)| Repeat(body:, quantifier:)),
+        ),
+        (2, list_between(sub, 2, 3) |> Gen.map(|parts| Concat(parts))),
+      ],
+    )
+  }
+}
+
+fn leaf() -> Gen[Node] {
+  frequency(
+    [
+      (4, character() |> Gen.map(|c| Atom(literal(c)))),
+      # The empty pattern.
+      (1, Gen.constant(Concat([]))),
+      (1, Gen.constant(Atom("."))),
+      (2, class()),
+      (1, element(CLASS_ESCAPES) |> Gen.map(|e| Atom(e))),
+      (1, element(["^", "$", "\\b", "\\B"]) |> Gen.map(|a| Assert(a))),
+    ],
+  )
+}
+
+fn class() -> Gen[Node] {
+  items = Gen.pair(element(["[", "[^"]), list_between(class_item(), 1, 3))
+    |> Gen.map(|(open, items)| "#{open}#{items.join("")}]")
+  frequency([(4, items), (1, element(["[]", "[^]"]))]) |> Gen.map(|text| Atom(text))
+}
+
+# A character, a range of two characters, or a class escape.
+fn class_item() -> Gen[String] {
+  one_of(
+    [
+      character() |> Gen.map(literal),
+      Gen.pair(character(), character())
+        |> Gen.map(|(a, b)| {
+          # String's order is the order of the code points.
+          if a <= b { "#{literal(a)}-#{literal(b)}" } else { "#{literal(b)}-#{literal(a)}" }
+        }),
+      element(CLASS_ESCAPES),
+    ],
+  )
+}
+
+fn quantifier() -> Gen[String] {
+  count = frequency(
+    [
+      (3, element(["*", "+", "?"])),
+      (1, Gen.int_between(0, 3) |> Gen.map(|n| "{#{n}}")),
+      (1, Gen.int_between(0, 3) |> Gen.map(|n| "{#{n},}")),
+      (
+        1,
+        Gen.int_between(0, 3) |> and_then(|n| Gen.int_between(n, 3) |> Gen.map(|m| "{#{n},#{m}}")),
+      ),
+    ],
+  )
+  Gen.pair(count, element(["", "?"])) |> Gen.map(|(count, lazy)| "#{count}#{lazy}")
+}
+
+# The start of a group name: letters, `$` and `_`, but no digits, so that `render` can append the
+# number of the group and keep each name unique.
+fn name_prefix() -> Gen[String] {
+  list_between(element(["a", "Z", "$", "_"]), 1, 2) |> Gen.map(|cs| cs.join(""))
+}
+
+fn character() -> Gen[String] {
+  element(ALPHABET)
+}
+
+# `c` as a character of a pattern.
+fn literal(c: String) -> String {
+  if c == "\n" { "\\n" } else { c }
+}
+
+# FRICTION(028): brix has no `option`.
+fn option[A](gen: Gen[A]) -> Gen[Option[A]] {
+  one_of([Gen.constant(None), gen |> Gen.map(|value| Some(value))])
+}
+
+# The text of a pattern. The n-th named group from the left (from 0) is named its prefix followed
+# by n.
+fn render(node: Node) -> String {
+  (text, _) = write(node, 0)
+  text
+}
+
+# The text of `node`, whose first named group is the `named`-th one, and the number of the named
+# groups up to its end.
+fn write(node: Node, named: Int) -> (String, Int) {
+  node match {
+    Atom(text)   -> (text, named)
+    Assert(text) -> (text, named)
+    Concat(parts) -> {
+      (texts, after) = parts.fold(([], named), |(texts, named), part| {
+        (text, after) = write(part, named)
+        # An alternation inside a concatenation needs a group around it.
+        text = part match {
+          Alternate(..) -> "(?:#{text})"
+          _             -> text
+        }
+        ([text, ..texts], after)
+      })
+      (texts.reverse().join(""), after)
+    }
+    Alternate(left, right) -> {
+      (left, named) = write(left, named)
+      (right, named) = write(right, named)
+      ("#{left}|#{right}", named)
+    }
+    Repeat(body:, quantifier:) -> {
+      (text, after) = write(body, named)
+      # A quantifier follows an atom: anything else needs a group around it.
+      # FRICTION(015): the three kinds of atoms are three arms.
+      atom = body match {
+        Atom(_)       -> text
+        Group(..)     -> text
+        NonCapture(_) -> text
+        _             -> "(?:#{text})"
+      }
+      ("#{atom}#{quantifier}", after)
+    }
+    Group(prefix: None, body:) -> {
+      (text, after) = write(body, named)
+      ("(#{text})", after)
+    }
+    Group(prefix: Some(prefix), body:) -> {
+      (text, after) = write(body, named + 1)
+      ("(?<#{prefix}#{named}>#{text})", after)
+    }
+    NonCapture(body) -> {
+      (text, after) = write(body, named)
+      ("(?:#{text})", after)
+    }
+  }
+}
+
+# FRICTION(028): brix has no `and_then`, so it is built from Gen and Tree.
+# A generator made from the value of `gen`. A shrink of that value makes the second generator again
+# from the same seed.
+fn and_then[A, B](gen: Gen[A], f: fn(A) -> Gen[B] fails {} uses {}) -> Gen[B] {
+  Gen(|seed, size| {
+    (a, s) = Gen.sample(gen, seed, size)
+    (b, rest) = Gen.sample(f(a.value), s, size)
+    (bound(a, b, f, s, size), rest)
+  })
+}
+
+# The tree of `and_then`: first the shrinks of `a`, each with the tree of its own generator made
+# from `seed`, then the shrinks of `b`.
+fn bound[A, B](
+  a: Tree[A],
+  b: Tree[B],
+  f: fn(A) -> Gen[B] fails {} uses {},
+  seed: Int,
+  size: Int,
+) -> Tree[B] {
+  Tree(b.value, || {
+    again = a.children().map(|child| {
+      (tree, _) = Gen.sample(f(child.value), seed, size)
+      bound(child, tree, f, seed, size)
+    })
+    again.append(b.children().map(|child| bound(a, child, f, seed, size)))
+  })
+}
+
+# FRICTION(028): brix has no `frequency`.
+# One of the generators, each chosen in proportion to its weight. Shrinks toward the first one. The
+# choice goes through `Gen.int_between`, which picks its min, its max or 0 for three draws in eight,
+# so the first generator comes 2/8 + 5/8 × weight / total of the time, and the last 1/8 + 5/8 ×
+# weight / total.
+fn frequency[A](weighted: List[(Int, Gen[A])]) -> Gen[A] {
+  total = weighted.fold(0, |sum, (weight, _)| sum + weight)
+  Gen.int_between(0, total - 1) |> and_then(|k| pick(weighted, k))
+}
+
+# The generator that `k` falls on when each one of `weighted` counts `weight` times.
+fn pick[A](weighted: List[(Int, Gen[A])], k: Int) -> Gen[A] {
+  weighted match {
+    [(weight, gen), ..rest] -> if k < weight { gen } else { pick(rest, k - weight) }
+    []                      -> panic("pick: k is not below the total weight")
+  }
+}
+
+# FRICTION(028): brix has no `one_of`.
+fn one_of[A](gens: List[Gen[A]]) -> Gen[A] {
+  frequency(gens.map(|gen| (1, gen)))
+}
+
+# FRICTION(028): brix has no `element`.
+fn element[A](values: List[A]) -> Gen[A] {
+  one_of(values.map(|value| Gen.constant(value)))
+}
+
+# FRICTION(028): brix's `list` has 0 to `size` values.
+# `min` to `max` values of `gen`.
+fn list_between[A](gen: Gen[A], min: Int, max: Int) -> Gen[List[A]] {
+  Gen.int_between(min, max) |> and_then(|n| copies(gen, n))
+}
+
+fn copies[A](gen: Gen[A], n: Int) -> Gen[List[A]] {
+  if n == 0 {
+    Gen.constant([])
+  } else {
+    Gen.pair(gen, copies(gen, n - 1)) |> Gen.map(|(x, xs)| [x, ..xs])
+  }
+}

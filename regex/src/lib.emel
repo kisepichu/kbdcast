@@ -1,0 +1,207 @@
+# Regular expressions: the regular subset of ECMAScript's syntax with the `u` flag, matched in
+# time linear in the input by a Pike VM, with the results of JavaScript's RegExp. Positions count
+# code points.
+#
+# ```emela
+# import Regex
+# import Regex.{NO_FLAGS}
+#
+# re = Regex.compile("(?<y>\\d{4})-(?<m>\\d\\d)", NO_FLAGS)
+# Regex.find(re, "on 2026-11") # Some(m): m.start() is 3, m.text() is "2026-11", m.named("m") is Some("11")
+# Regex.find_all(re, "2026-11, 2027-01").map(|m| m.text()) # ["2026-11", "2027-01"]
+# Regex.replace(re, "on 2026-11", |m| "[#{m.text()}]") # "on [2026-11]"
+# Regex.split(Regex.compile(",\\s*", NO_FLAGS), "a, b,c") # ["a", "b", "c"]
+# ```
+#
+# FRICTION(010): a const of another module cannot be written `Regex.NO_FLAGS`, so it is imported
+# by name.
+#
+# FRICTION(002): std cannot take the part of a String between two positions, and `Text.slice` goes
+# through every code point of the String on each call. So each call here turns the input into an
+# Array of code points once, and builds the text of a match, of a group, and of each piece that
+# `replace` and `split` keep from a range of that Array: O(n) for the Array, then the length of
+# each part.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment, and `emela doc` does not show it.
+
+import Program
+import Std.Map.{Map}
+import Std.Array.{Array}
+import Syntax
+import Text
+import Vm.{Found}
+
+## ECMAScript's `i`, `m` and `s` flags. `ignore_case` compares characters by simple case folding,
+## `multiline` lets `^` and `$` match at line terminators, and `dot_all` lets `.` match them.
+pub type Flags(ignore_case: Bool, multiline: Bool, dot_all: Bool)
+
+## No flag set. Set some with `Flags(ignore_case: True, ..NO_FLAGS)`.
+pub const NO_FLAGS: Flags = Flags(ignore_case: False, multiline: False, dot_all: False)
+
+## Why a pattern was rejected, at `offset`: where the construct it rejected starts (the `[` or `(`
+## of a class or group that is not closed). Offsets count code points from the start of the
+## pattern. A pattern whose unrolled program would be too large (`pattern too large`) has offset
+## 0: no single construct is at fault.
+# FRICTION(012): Emela has no re-export, so this is a second declaration of the error that
+# `Syntax.parse` fails with, for `import Regex.{RegexSyntax}`.
+pub error RegexSyntax(message: String, offset: Int)
+
+## A compiled pattern.
+pub opaque type Regex(program: Vm.Program, names: Map[String, Int])
+
+## A match of a Regex in a string.
+pub opaque type Match(input: Array[Int], found: Found, names: Map[String, Int])
+
+## Compiles `pattern`, written in ECMAScript's syntax with the `u` flag. Fails with RegexSyntax
+## for what the syntax or this engine rejects, including a pattern whose counted repetitions
+## unroll to more than `Program.MAX_SIZE` instructions.
+pub fn compile(pattern: String, flags: Flags) -> Regex fails RegexSyntax {
+  # FRICTION(012): `parse` fails with the RegexSyntax of Syntax, which is another type.
+  ast = Syntax.parse(pattern) escape {
+    Syntax.RegexSyntax(message:, offset:) -> fail RegexSyntax(message:, offset:)
+  }
+  Program.build(
+    ast,
+    ignore_case: flags.ignore_case,
+    multiline: flags.multiline,
+    dot_all: flags.dot_all,
+  ) match {
+    Some(program) -> Regex(program:, names: ast.names)
+    None          -> fail RegexSyntax(message: "pattern too large", offset: 0)
+  }
+}
+
+## Whether `re` matches somewhere in `s`.
+pub fn is_match(re: Regex, s: String) -> Bool {
+  find(re, s).is_some()
+}
+
+## The first match of `re` in `s`, as JavaScript's `re.exec(s)` finds it.
+pub fn find(re: Regex, s: String) -> Option[Match] {
+  input = Array.from_list(s.code_points())
+  Vm.search(re.program, input, 0).found.map(|found| Match(input:, found:, names: re.names))
+}
+
+## Every match of `re` in `s`, in order, as JavaScript's `s.matchAll(re)` finds them with the `g`
+## and `u` flags: each search starts where the previous match ends, or one code point after it if
+## that match is empty.
+pub fn find_all(re: Regex, s: String) -> List[Match] {
+  matches_from(re, Array.from_list(s.code_points()), 0, [])
+}
+
+# The matches of `re` in `input`, the code points of a string, from `from` on, after the reverse of
+# `done`.
+# FRICTION(027): std has no `List.unfold`, so the search loop is this recursive function.
+# FRICTION(021): only a self tail call is guaranteed not to use the stack, so the result is built
+# in reverse in `done`.
+fn matches_from(re: Regex, input: Array[Int], from: Int, done: List[Match]) -> List[Match] {
+  if from > input.size() {
+    done.reverse()
+  } else {
+    Vm.search(re.program, input, from).found match {
+      None -> done.reverse()
+      Some(found) -> {
+        next = if found.end == found.start { found.end + 1 } else { found.end }
+        matches_from(re, input, next, [Match(input:, found:, names: re.names), ..done])
+      }
+    }
+  }
+}
+
+## `s` with each match `m` of `re` that `find_all` finds replaced with `f(m)`, as JavaScript's
+## `s.replace(re, f)` does with the `g` and `u` flags. `f` is called on the matches in order.
+pub fn replace(re: Regex, s: String, f: fn(Match) -> String) -> String {
+  input = Array.from_list(s.code_points())
+  # The pieces of the result in reverse, and where the text after the last match starts.
+  (pieces, rest) = matches_from(re, input, 0, []).fold(
+    ([], 0),
+    |(pieces, at), m| ([f(m), string_of(input, at, m.start()), ..pieces], m.end()),
+  )
+  [string_of(input, rest, input.size()), ..pieces].reverse().join("")
+}
+
+## `s` cut at the matches of `re`, as JavaScript's `s.split(re)` with the `u` flag, without the
+## captures that it puts between the pieces. A match that starts at the end of `s` does not cut,
+## and neither does an empty match where the previous cut ends or at the start of `s`. The empty
+## string gives `[""]`, or `[]` if `re` matches it.
+pub fn split(re: Regex, s: String) -> List[String] {
+  input = Array.from_list(s.code_points())
+  if input.is_empty() {
+    if Vm.search(re.program, input, 0).found.is_some() { [] } else { [""] }
+  } else {
+    split_from(re, input, 0, 0, [])
+  }
+}
+
+# The pieces of `input`, the code points of a string, from `last`, where the previous cut ends, on,
+# after the reverse of `done`, with the next cut at a match that starts at `at` or later.
+# FRICTION(021): only a self tail call is guaranteed not to use the stack, so the result is built
+# in reverse in `done` instead of as `[piece, ..split_from(...)]`.
+fn split_from(
+  re: Regex,
+  input: Array[Int],
+  last: Int,
+  at: Int,
+  done: List[String],
+) -> List[String] {
+  # FRICTION(016): Option has no `filter`, so this match drops a match that starts at the end of
+  # `input`, where JavaScript stops trying.
+  cut = Vm.search(re.program, input, at).found match {
+    Some(found) if found.start < input.size() -> Some(found)
+    _                                         -> None
+  }
+  cut match {
+    None                             -> [string_of(input, last, input.size()), ..done].reverse()
+    # The previous cut and this empty match would leave an empty piece: try one code point later.
+    Some(found) if found.end == last -> split_from(re, input, last, found.start + 1, done)
+    Some(found) -> {
+      split_from(re, input, found.end, found.end, [string_of(input, last, found.start), ..done])
+    }
+  }
+}
+
+## Where `m` starts, in code points.
+pub fn start(m: Match) -> Int {
+  m.found.start
+}
+
+## Where `m` ends, in code points.
+pub fn end(m: Match) -> Int {
+  m.found.end
+}
+
+## The matched text.
+pub fn text(m: Match) -> String {
+  string_of(m.input, m.found.start, m.found.end)
+}
+
+## The text of group `index`: 0 is the whole match. `None` for a group that did not take part in
+## the match, and for an index out of range.
+pub fn group(m: Match, index: Int) -> Option[String] {
+  if index == 0 {
+    Some(m.text())
+  } else {
+    m.found.groups.get(index - 1) match {
+      Some(Some((from, to))) -> Some(string_of(m.input, from, to))
+      _                      -> None
+    }
+  }
+}
+
+## The text of the group named `name`. `None` for a name the pattern does not have, and for a group
+## that did not take part in the match.
+pub fn named(m: Match, name: String) -> Option[String] {
+  m.names.get(name).and_then(|index| m.group(index))
+}
+
+# The string of the code points of `input` from `from` inclusive to `to` exclusive, in time
+# proportional to `to - from`.
+fn string_of(input: Array[Int], from: Int, to: Int) -> String {
+  # FRICTION(003): the code points come from a String, so they are scalar values and `None` cannot
+  # happen.
+  Text.from_code_points(input.slice(from, to).to_list()) match {
+    Some(part) -> part
+    None       -> panic("Regex: a code point of a String is not a scalar value")
+  }
+}

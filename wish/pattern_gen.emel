@@ -1,0 +1,1719 @@
+# wish-target: regex/test/pattern_gen.emel
+# Random patterns of the accepted grammar (spec §6), flags, and inputs, for the differential test against JS RegExp.
+import brix/pbt.{Gen}
+import brix/pbt as gen
+import regex.{Flags}
+
+# The small alphabet: ASCII, the characters whose case folding crosses into or out of ASCII, and one astral character.
+const ALPHABET: List[String] = ["a", "b", "k", "s", "\n", " ", "\u{17F}", "\u{212A}", "\u{DF}", "\u{1E9E}", "\u{3A3}", "\u{3C2}", "\u{1F600}"]
+
+pub type Item {
+  Single(c: String)
+  Range(from: String, to: String)
+  Escape(name: String)
+}
+
+pub type Node {
+  Literal(c: String)
+  Dot
+  Class(negated: Bool, items: List[Item])
+  Concat(parts: List[Node])
+  Alt(left: Node, right: Node)
+  Repeat(body: Node, min: Int, max: Option[Int], lazy: Bool)
+  Capture(name: Option[String], body: Node)
+  NonCapture(body: Node)
+  Assertion(text: String)
+}
+
+pub fn char() -> Gen[String] {
+  gen.element(ALPHABET)
+}
+
+fn item() -> Gen[Item] {
+  gen.one_of([
+    char().map(Single),
+    gen.map2(char(), char(), fn(a, b) { if a.code_point() <= b.code_point() { Range(a, b) } else { Range(b, a) } }),
+    gen.element(["\\d", "\\D", "\\w", "\\W", "\\s", "\\S"]).map(Escape),
+  ])
+}
+
+fn leaf() -> Gen[Node] {
+  gen.one_of([
+    char().map(Literal),
+    gen.constant(Dot),
+    gen.map2(gen.bool(), gen.list(item(), 0, 3), Class),
+    gen.element(["^", "$", "\\b", "\\B"]).map(Assertion),
+  ])
+}
+
+fn quantifier() -> Gen[(Int, Option[Int])] {
+  gen.one_of([
+    gen.constant((0, None)),
+    gen.constant((1, None)),
+    gen.constant((0, Some(1))),
+    gen.int(0, 3).flat_map(fn(n) { gen.int(n, 3).map(fn(m) { (n, Some(m)) }) }),
+    gen.int(0, 3).map(fn(n) { (n, Some(n)) }),
+    gen.int(0, 3).map(fn(n) { (n, None) }),
+  ])
+}
+
+# Each named group gets a prefix of letters, `$`, and `_`; render appends the group's number, so every name is unique in the whole pattern.
+fn name_prefix() -> Gen[String] {
+  gen.list(gen.element(["a", "Z", "$", "_"]), 1, 2).map(fn(cs) { cs.join("") })
+}
+
+pub fn node(depth: Int) -> Gen[Node] {
+  if depth == 0 {
+    leaf()
+  } else {
+    let sub = node(depth - 1)
+    gen.frequency([
+      (3, leaf()),
+      (2, gen.list(sub, 2, 3).map(Concat)),
+      (1, gen.map2(sub, sub, Alt)),
+      (2, gen.map3(sub, quantifier(), gen.bool(), fn(body, (min, max), lazy) { Repeat(body, min, max, lazy) })),
+      (1, gen.map2(gen.option(name_prefix()), sub, Capture)),
+      (1, sub.map(NonCapture)),
+    ])
+  }
+}
+
+pub fn pattern() -> Gen[Node] {
+  node(4)
+}
+
+pub fn flags() -> Gen[Flags] {
+  gen.map3(gen.bool(), gen.bool(), gen.bool(), Flags)
+}
+
+pub fn input() -> Gen[String] {
+  gen.list(char(), 0, 8).map(fn(cs) { cs.join("") })
+}
+
+# The pattern text. `names` is the number of named groups written so far; the result carries the new count.
+pub fn render(node: Node) -> String {
+  go(node, 0).0
+}
+
+fn go(n: Node, names: Int) -> (String, Int) {
+  match n {
+    Literal(c) -> (escape(c), names)
+    Dot -> (".", names)
+    Class(negated, items) -> ("[" ++ (if negated { "^" } else { "" }) ++ items.map(render_item).join("") ++ "]", names)
+    Concat(parts) -> parts.fold(("", names), fn((text, k), part) {
+      let (t, k2) = go(part, k)
+      (text ++ (match part { Alt(_, _) -> "(?:" ++ t ++ ")"; _ -> t }), k2)
+    })
+    Alt(l, r) -> {
+      let (a, k) = go(l, names)
+      let (b, k2) = go(r, k)
+      (a ++ "|" ++ b, k2)
+    }
+    Repeat(body, min, max, lazy) -> {
+      let (t, k) = go(body, names)
+      let atom = match body { Literal(_) | Dot | Class(_, _) | Capture(_, _) | NonCapture(_) -> t; _ -> "(?:" ++ t ++ ")" }
+      (atom ++ quantifier_text(min, max) ++ (if lazy { "?" } else { "" }), k)
+    }
+    Capture(None, body) -> {
+      let (t, k) = go(body, names)
+      ("(" ++ t ++ ")", k)
+    }
+    Capture(Some(prefix), body) -> {
+      let (t, k) = go(body, names + 1)
+      ("(?<" ++ prefix ++ names.to_string() ++ ">" ++ t ++ ")", k)
+    }
+    NonCapture(body) -> {
+      let (t, k) = go(body, names)
+      ("(?:" ++ t ++ ")", k)
+    }
+    Assertion(t) -> (t, names)
+  }
+}
+
+pub fn flag_letters(f: Flags) -> String {
+  (if f.ignore_case { "i" } else { "" }) ++ (if f.multiline { "m" } else { "" }) ++ (if f.dot_all { "s" } else { "" })
+}
+
+fn escape(c: String) -> String {
+  match c {
+    "\n" -> "\\n"
+    _ -> c
+  }
+}
+
+fn render_item(i: Item) -> String {
+  match i {
+    Single(c) -> escape(c)
+    Range(a, b) -> escape(a) ++ "-" ++ escape(b)
+    Escape(e) -> e
+  }
+}
+
+fn quantifier_text(min: Int, max: Option[Int]) -> String {
+  match (min, max) {
+    (0, None) -> "*"
+    (1, None) -> "+"
+    (0, Some(1)) -> "?"
+    (n, None) -> "{" ++ n.to_string() ++ ",}"
+    (n, Some(m)) if n == m -> "{" ++ n.to_string() ++ "}"
+    (n, Some(m)) -> "{" ++ n.to_string() ++ "," ++ m.to_string() ++ "}"
+  }
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0105]: unrecognized character `;`
+#      ╭─[ test/pattern_gen.emel:105:60 ]
+#      │
+#  105 │       (text ++ (match part { Alt(_, _) -> "(?:" ++ t ++ ")"; _ -> t }), k2)
+#      │                                                            ┬  
+#      │                                                            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `;`
+#      ╭─[ test/pattern_gen.emel:114:98 ]
+#      │
+#  114 │       let atom = match body { Literal(_) | Dot | Class(_, _) | Capture(_, _) | NonCapture(_) -> t; _ -> "(?:" ++ t ++ ")" }
+#      │                                                                                                  ┬  
+#      │                                                                                                  ╰── 
+# ─────╯
+#
+# error[E0110]: expected module path
+#    ╭─[ test/pattern_gen.emel:3:8 ]
+#    │
+#  3 │ import brix/pbt.{Gen}
+#    │        ──┬─  
+#    │          ╰─── 
+# ───╯
+#
+# error[E0122]: expected newline after declaration
+#    ╭─[ test/pattern_gen.emel:3:12 ]
+#    │
+#  3 │ import brix/pbt.{Gen}
+#    │            ┬  
+#    │            ╰── 
+# ───╯
+#
+# error[E0110]: expected module path
+#    ╭─[ test/pattern_gen.emel:4:8 ]
+#    │
+#  4 │ import brix/pbt as gen
+#    │        ──┬─  
+#    │          ╰─── 
+# ───╯
+#
+# error[E0122]: expected newline after declaration
+#    ╭─[ test/pattern_gen.emel:4:12 ]
+#    │
+#  4 │ import brix/pbt as gen
+#    │            ┬  
+#    │            ╰── 
+# ───╯
+#
+# error[E0110]: expected module path
+#    ╭─[ test/pattern_gen.emel:5:8 ]
+#    │
+#  5 │ import regex.{Flags}
+#    │        ──┬──  
+#    │          ╰──── 
+# ───╯
+#
+# error[E0130]: a type without fields must be `@external`
+#     ╭─[ test/pattern_gen.emel:10:10 ]
+#     │
+#  10 │ pub type Item {
+#     │          ──┬─  
+#     │            ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ test/pattern_gen.emel:10:15 ]
+#     │
+#  10 │ pub type Item {
+#     │               ┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0130]: a type without fields must be `@external`
+#     ╭─[ test/pattern_gen.emel:16:10 ]
+#     │
+#  16 │ pub type Node {
+#     │          ──┬─  
+#     │            ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ test/pattern_gen.emel:16:15 ]
+#     │
+#  16 │ pub type Node {
+#     │               ┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#     ╭─[ test/pattern_gen.emel:35:30 ]
+#     │
+#  35 │     gen.map2(char(), char(), fn(a, b) { if a.code_point() <= b.code_point() { Range(a, b) } else { Range(b, a) } }),
+#     │                              ────┬───  
+#     │                                  ╰───── 
+# ────╯
+#    = help: write `|a, b| if a.code_point() <= b.code_point() { Range(a, b) } else { Range(b, a) }`
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#     ╭─[ test/pattern_gen.emel:54:28 ]
+#     │
+#  54 │     gen.int(0, 3).flat_map(fn(n) { gen.int(n, 3).map(fn(m) { (n, Some(m)) }) }),
+#     │                            ──┬──  
+#     │                              ╰──── 
+# ────╯
+#    = help: write `|n| gen.int(n, 3).map(fn(m) { (n, Some(m)) })`
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#     ╭─[ test/pattern_gen.emel:54:54 ]
+#     │
+#  54 │     gen.int(0, 3).flat_map(fn(n) { gen.int(n, 3).map(fn(m) { (n, Some(m)) }) }),
+#     │                                                      ──┬──  
+#     │                                                        ╰──── 
+# ────╯
+#    = help: write `|m| (n, Some(m))`
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#     ╭─[ test/pattern_gen.emel:55:23 ]
+#     │
+#  55 │     gen.int(0, 3).map(fn(n) { (n, Some(n)) }),
+#     │                       ──┬──  
+#     │                         ╰──── 
+# ────╯
+#    = help: write `|n| (n, Some(n))`
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#     ╭─[ test/pattern_gen.emel:56:23 ]
+#     │
+#  56 │     gen.int(0, 3).map(fn(n) { (n, None) }),
+#     │                       ──┬──  
+#     │                         ╰──── 
+# ────╯
+#    = help: write `|n| (n, None)`
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#     ╭─[ test/pattern_gen.emel:62:57 ]
+#     │
+#  62 │   gen.list(gen.element(["a", "Z", "$", "_"]), 1, 2).map(fn(cs) { cs.join("") })
+#     │                                                         ───┬──  
+#     │                                                            ╰──── 
+# ────╯
+#    = help: write `|cs| cs.join("")`
+#
+# error[E0118]: expected expression
+#     ╭─[ test/pattern_gen.emel:69:5 ]
+#     │
+#  69 │     let sub = node(depth - 1)
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ test/pattern_gen.emel:69:9 ]
+#     │
+#  69 │     let sub = node(depth - 1)
+#     │         ─┬─  
+#     │          ╰─── 
+# ────╯
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#     ╭─[ test/pattern_gen.emel:74:51 ]
+#     │
+#  74 │       (2, gen.map3(sub, quantifier(), gen.bool(), fn(body, (min, max), lazy) { Repeat(body, min, max, lazy) })),
+#     │                                                   ─────────────┬────────────  
+#     │                                                                ╰────────────── 
+# ────╯
+#    = help: write `|body, (min, max), lazy| Repeat(body, min, max, lazy)`
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#     ╭─[ test/pattern_gen.emel:90:30 ]
+#     │
+#  90 │   gen.list(char(), 0, 8).map(fn(cs) { cs.join("") })
+#     │                              ───┬──  
+#     │                                 ╰──── 
+# ────╯
+#    = help: write `|cs| cs.join("")`
+#
+# error[E0110]: expected lower name
+#     ╭─[ test/pattern_gen.emel:95:15 ]
+#     │
+#  95 │   go(node, 0).0
+#     │               ┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ test/pattern_gen.emel:95:15 ]
+#     │
+#  95 │   go(node, 0).0
+#     │               ┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ test/pattern_gen.emel:99:3 ]
+#     │
+#  99 │   match n {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:100:20 ]
+#      │
+#  100 │     Literal(c) -> (escape(c), names)
+#      │                    ───┬──  
+#      │                       ╰──── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ test/pattern_gen.emel:100:26 ]
+#      │
+#  100 │     Literal(c) -> (escape(c), names)
+#      │                          ┬  
+#      │                          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ test/pattern_gen.emel:100:29 ]
+#      │
+#  100 │     Literal(c) -> (escape(c), names)
+#      │                             ┬  
+#      │                             ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:102:36 ]
+#      │
+#  102 │     Class(negated, items) -> ("[" ++ (if negated { "^" } else { "" }) ++ items.map(render_item).join("") ++ "]", names)
+#      │                                    ┬  
+#      │                                    ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ test/pattern_gen.emel:102:38 ]
+#      │
+#  102 │     Class(negated, items) -> ("[" ++ (if negated { "^" } else { "" }) ++ items.map(render_item).join("") ++ "]", names)
+#      │                                      ┬  
+#      │                                      ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:102:72 ]
+#      │
+#  102 │     Class(negated, items) -> ("[" ++ (if negated { "^" } else { "" }) ++ items.map(render_item).join("") ++ "]", names)
+#      │                                                                        ┬  
+#      │                                                                        ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ test/pattern_gen.emel:102:74 ]
+#      │
+#  102 │     Class(negated, items) -> ("[" ++ (if negated { "^" } else { "" }) ++ items.map(render_item).join("") ++ "]", names)
+#      │                                                                          ──┬──  
+#      │                                                                            ╰──── 
+# ─────╯
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#      ╭─[ test/pattern_gen.emel:103:46 ]
+#      │
+#  103 │     Concat(parts) -> parts.fold(("", names), fn((text, k), part) {
+#      │                                              ─────────┬─────────  
+#      │                                                       ╰─────────── 
+# ─────╯
+#    = help: write `|(text, k), part| ...`
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:104:7 ]
+#      │
+#  104 │       let (t, k2) = go(part, k)
+#      │       ─┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ test/pattern_gen.emel:104:11 ]
+#      │
+#  104 │       let (t, k2) = go(part, k)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:105:14 ]
+#      │
+#  105 │       (text ++ (match part { Alt(_, _) -> "(?:" ++ t ++ ")"; _ -> t }), k2)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ test/pattern_gen.emel:105:16 ]
+#      │
+#  105 │       (text ++ (match part { Alt(_, _) -> "(?:" ++ t ++ ")"; _ -> t }), k2)
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ test/pattern_gen.emel:105:17 ]
+#      │
+#  105 │       (text ++ (match part { Alt(_, _) -> "(?:" ++ t ++ ")"; _ -> t }), k2)
+#      │                 ──┬──  
+#      │                   ╰──── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:105:50 ]
+#      │
+#  105 │       (text ++ (match part { Alt(_, _) -> "(?:" ++ t ++ ")"; _ -> t }), k2)
+#      │                                                  ┬  
+#      │                                                  ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ test/pattern_gen.emel:105:52 ]
+#      │
+#  105 │       (text ++ (match part { Alt(_, _) -> "(?:" ++ t ++ ")"; _ -> t }), k2)
+#      │                                                    ┬  
+#      │                                                    ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ test/pattern_gen.emel:105:71 ]
+#      │
+#  105 │       (text ++ (match part { Alt(_, _) -> "(?:" ++ t ++ ")"; _ -> t }), k2)
+#      │                                                                       ┬  
+#      │                                                                       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:108:7 ]
+#      │
+#  108 │       let (a, k) = go(l, names)
+#      │       ─┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ test/pattern_gen.emel:108:11 ]
+#      │
+#  108 │       let (a, k) = go(l, names)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:109:7 ]
+#      │
+#  109 │       let (b, k2) = go(r, k)
+#      │       ─┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ test/pattern_gen.emel:109:11 ]
+#      │
+#  109 │       let (b, k2) = go(r, k)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:110:11 ]
+#      │
+#  110 │       (a ++ "|" ++ b, k2)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ test/pattern_gen.emel:110:13 ]
+#      │
+#  110 │       (a ++ "|" ++ b, k2)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ test/pattern_gen.emel:110:13 ]
+#      │
+#  110 │       (a ++ "|" ++ b, k2)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:113:7 ]
+#      │
+#  113 │       let (t, k) = go(body, names)
+#      │       ─┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ test/pattern_gen.emel:113:11 ]
+#      │
+#  113 │       let (t, k) = go(body, names)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:114:7 ]
+#      │
+#  114 │       let atom = match body { Literal(_) | Dot | Class(_, _) | Capture(_, _) | NonCapture(_) -> t; _ -> "(?:" ++ t ++ ")" }
+#      │       ─┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ test/pattern_gen.emel:114:11 ]
+#      │
+#  114 │       let atom = match body { Literal(_) | Dot | Class(_, _) | Capture(_, _) | NonCapture(_) -> t; _ -> "(?:" ++ t ++ ")" }
+#      │           ──┬─  
+#      │             ╰─── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:115:14 ]
+#      │
+#  115 │       (atom ++ quantifier_text(min, max) ++ (if lazy { "?" } else { "" }), k)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ test/pattern_gen.emel:115:16 ]
+#      │
+#  115 │       (atom ++ quantifier_text(min, max) ++ (if lazy { "?" } else { "" }), k)
+#      │                ───────┬───────  
+#      │                       ╰───────── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ test/pattern_gen.emel:115:16 ]
+#      │
+#  115 │       (atom ++ quantifier_text(min, max) ++ (if lazy { "?" } else { "" }), k)
+#      │                ───────┬───────  
+#      │                       ╰───────── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:118:7 ]
+#      │
+#  118 │       let (t, k) = go(body, names)
+#      │       ─┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ test/pattern_gen.emel:118:11 ]
+#      │
+#  118 │       let (t, k) = go(body, names)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:119:13 ]
+#      │
+#  119 │       ("(" ++ t ++ ")", k)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ test/pattern_gen.emel:119:15 ]
+#      │
+#  119 │       ("(" ++ t ++ ")", k)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ test/pattern_gen.emel:119:15 ]
+#      │
+#  119 │       ("(" ++ t ++ ")", k)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:122:7 ]
+#      │
+#  122 │       let (t, k) = go(body, names + 1)
+#      │       ─┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ test/pattern_gen.emel:122:11 ]
+#      │
+#  122 │       let (t, k) = go(body, names + 1)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:123:15 ]
+#      │
+#  123 │       ("(?<" ++ prefix ++ names.to_string() ++ ">" ++ t ++ ")", k)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ test/pattern_gen.emel:123:17 ]
+#      │
+#  123 │       ("(?<" ++ prefix ++ names.to_string() ++ ">" ++ t ++ ")", k)
+#      │                 ───┬──  
+#      │                    ╰──── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ test/pattern_gen.emel:123:17 ]
+#      │
+#  123 │       ("(?<" ++ prefix ++ names.to_string() ++ ">" ++ t ++ ")", k)
+#      │                 ───┬──  
+#      │                    ╰──── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:126:7 ]
+#      │
+#  126 │       let (t, k) = go(body, names)
+#      │       ─┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ test/pattern_gen.emel:126:11 ]
+#      │
+#  126 │       let (t, k) = go(body, names)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:127:15 ]
+#      │
+#  127 │       ("(?:" ++ t ++ ")", k)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ test/pattern_gen.emel:127:17 ]
+#      │
+#  127 │       ("(?:" ++ t ++ ")", k)
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ test/pattern_gen.emel:127:17 ]
+#      │
+#  127 │       ("(?:" ++ t ++ ")", k)
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:134:43 ]
+#      │
+#  134 │   (if f.ignore_case { "i" } else { "" }) ++ (if f.multiline { "m" } else { "" }) ++ (if f.dot_all { "s" } else { "" })
+#      │                                           ┬  
+#      │                                           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ test/pattern_gen.emel:134:45 ]
+#      │
+#  134 │   (if f.ignore_case { "i" } else { "" }) ++ (if f.multiline { "m" } else { "" }) ++ (if f.dot_all { "s" } else { "" })
+#      │                                             ┬  
+#      │                                             ╰── 
+# ─────╯
+#
+# error[E0110]: expected lower name
+#      ╭─[ test/pattern_gen.emel:137:4 ]
+#      │
+#  137 │ fn escape(c: String) -> String {
+#      │    ───┬──  
+#      │       ╰──── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ test/pattern_gen.emel:138:3 ]
+#      │
+#  138 │   match c {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ test/pattern_gen.emel:145:3 ]
+#      │
+#  145 │   match i {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:146:18 ]
+#      │
+#  146 │     Single(c) -> escape(c)
+#      │                  ───┬──  
+#      │                     ╰──── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ test/pattern_gen.emel:146:24 ]
+#      │
+#  146 │     Single(c) -> escape(c)
+#      │                        ┬  
+#      │                        ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:147:20 ]
+#      │
+#  147 │     Range(a, b) -> escape(a) ++ "-" ++ escape(b)
+#      │                    ───┬──  
+#      │                       ╰──── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ test/pattern_gen.emel:147:26 ]
+#      │
+#  147 │     Range(a, b) -> escape(a) ++ "-" ++ escape(b)
+#      │                          ┬  
+#      │                          ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ test/pattern_gen.emel:153:3 ]
+#      │
+#  153 │   match (min, max) {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:157:23 ]
+#      │
+#  157 │     (n, None) -> "{" ++ n.to_string() ++ ",}"
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ test/pattern_gen.emel:157:25 ]
+#      │
+#  157 │     (n, None) -> "{" ++ n.to_string() ++ ",}"
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:158:36 ]
+#      │
+#  158 │     (n, Some(m)) if n == m -> "{" ++ n.to_string() ++ "}"
+#      │                                    ┬  
+#      │                                    ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ test/pattern_gen.emel:158:38 ]
+#      │
+#  158 │     (n, Some(m)) if n == m -> "{" ++ n.to_string() ++ "}"
+#      │                                      ┬  
+#      │                                      ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ test/pattern_gen.emel:159:26 ]
+#      │
+#  159 │     (n, Some(m)) -> "{" ++ n.to_string() ++ "," ++ m.to_string() ++ "}"
+#      │                          ┬  
+#      │                          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ test/pattern_gen.emel:159:28 ]
+#      │
+#  159 │     (n, Some(m)) -> "{" ++ n.to_string() ++ "," ++ m.to_string() ++ "}"
+#      │                            ┬  
+#      │                            ╰── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Gen` in this scope
+#     ╭─[ test/pattern_gen.emel:28:18 ]
+#     │
+#  28 │ pub fn char() -> Gen[String] {
+#     │                  ─┬─  
+#     │                   ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:29:3 ]
+#     │
+#  29 │   gen.element(ALPHABET)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find type `Gen` in this scope
+#     ╭─[ test/pattern_gen.emel:32:14 ]
+#     │
+#  32 │ fn item() -> Gen[Item] {
+#     │              ─┬─  
+#     │               ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:33:3 ]
+#     │
+#  33 │   gen.one_of([
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Single` in this scope
+#     ╭─[ test/pattern_gen.emel:34:16 ]
+#     │
+#  34 │     char().map(Single),
+#     │                ───┬──  
+#     │                   ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:35:5 ]
+#     │
+#  35 │     gen.map2(char(), char(), fn(a, b) { if a.code_point() <= b.code_point() { Range(a, b) } else { Range(b, a) } }),
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Range` in this scope
+#     ╭─[ test/pattern_gen.emel:35:79 ]
+#     │
+#  35 │     gen.map2(char(), char(), fn(a, b) { if a.code_point() <= b.code_point() { Range(a, b) } else { Range(b, a) } }),
+#     │                                                                               ──┬──  
+#     │                                                                                 ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Range` in this scope
+#     ╭─[ test/pattern_gen.emel:35:100 ]
+#     │
+#  35 │     gen.map2(char(), char(), fn(a, b) { if a.code_point() <= b.code_point() { Range(a, b) } else { Range(b, a) } }),
+#     │                                                                                                    ──┬──  
+#     │                                                                                                      ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:36:5 ]
+#     │
+#  36 │     gen.element(["\\d", "\\D", "\\w", "\\W", "\\s", "\\S"]).map(Escape),
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Escape` in this scope
+#     ╭─[ test/pattern_gen.emel:36:65 ]
+#     │
+#  36 │     gen.element(["\\d", "\\D", "\\w", "\\W", "\\s", "\\S"]).map(Escape),
+#     │                                                                 ───┬──  
+#     │                                                                    ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Gen` in this scope
+#     ╭─[ test/pattern_gen.emel:40:14 ]
+#     │
+#  40 │ fn leaf() -> Gen[Node] {
+#     │              ─┬─  
+#     │               ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:41:3 ]
+#     │
+#  41 │   gen.one_of([
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Literal` in this scope
+#     ╭─[ test/pattern_gen.emel:42:16 ]
+#     │
+#  42 │     char().map(Literal),
+#     │                ───┬───  
+#     │                   ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:43:5 ]
+#     │
+#  43 │     gen.constant(Dot),
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Dot` in this scope
+#     ╭─[ test/pattern_gen.emel:43:18 ]
+#     │
+#  43 │     gen.constant(Dot),
+#     │                  ─┬─  
+#     │                   ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:44:5 ]
+#     │
+#  44 │     gen.map2(gen.bool(), gen.list(item(), 0, 3), Class),
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:44:14 ]
+#     │
+#  44 │     gen.map2(gen.bool(), gen.list(item(), 0, 3), Class),
+#     │              ─┬─  
+#     │               ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:44:26 ]
+#     │
+#  44 │     gen.map2(gen.bool(), gen.list(item(), 0, 3), Class),
+#     │                          ─┬─  
+#     │                           ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Class` in this scope
+#     ╭─[ test/pattern_gen.emel:44:50 ]
+#     │
+#  44 │     gen.map2(gen.bool(), gen.list(item(), 0, 3), Class),
+#     │                                                  ──┬──  
+#     │                                                    ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:45:5 ]
+#     │
+#  45 │     gen.element(["^", "$", "\\b", "\\B"]).map(Assertion),
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Assertion` in this scope
+#     ╭─[ test/pattern_gen.emel:45:47 ]
+#     │
+#  45 │     gen.element(["^", "$", "\\b", "\\B"]).map(Assertion),
+#     │                                               ────┬────  
+#     │                                                   ╰────── 
+# ────╯
+#
+# error[E0211]: cannot find type `Gen` in this scope
+#     ╭─[ test/pattern_gen.emel:49:20 ]
+#     │
+#  49 │ fn quantifier() -> Gen[(Int, Option[Int])] {
+#     │                    ─┬─  
+#     │                     ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:50:3 ]
+#     │
+#  50 │   gen.one_of([
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:51:5 ]
+#     │
+#  51 │     gen.constant((0, None)),
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:52:5 ]
+#     │
+#  52 │     gen.constant((1, None)),
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:53:5 ]
+#     │
+#  53 │     gen.constant((0, Some(1))),
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:54:5 ]
+#     │
+#  54 │     gen.int(0, 3).flat_map(fn(n) { gen.int(n, 3).map(fn(m) { (n, Some(m)) }) }),
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:54:36 ]
+#     │
+#  54 │     gen.int(0, 3).flat_map(fn(n) { gen.int(n, 3).map(fn(m) { (n, Some(m)) }) }),
+#     │                                    ─┬─  
+#     │                                     ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:55:5 ]
+#     │
+#  55 │     gen.int(0, 3).map(fn(n) { (n, Some(n)) }),
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:56:5 ]
+#     │
+#  56 │     gen.int(0, 3).map(fn(n) { (n, None) }),
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find type `Gen` in this scope
+#     ╭─[ test/pattern_gen.emel:61:21 ]
+#     │
+#  61 │ fn name_prefix() -> Gen[String] {
+#     │                     ─┬─  
+#     │                      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:62:3 ]
+#     │
+#  62 │   gen.list(gen.element(["a", "Z", "$", "_"]), 1, 2).map(fn(cs) { cs.join("") })
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:62:12 ]
+#     │
+#  62 │   gen.list(gen.element(["a", "Z", "$", "_"]), 1, 2).map(fn(cs) { cs.join("") })
+#     │            ─┬─  
+#     │             ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find type `Gen` in this scope
+#     ╭─[ test/pattern_gen.emel:65:28 ]
+#     │
+#  65 │ pub fn node(depth: Int) -> Gen[Node] {
+#     │                            ─┬─  
+#     │                             ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:70:5 ]
+#     │
+#  70 │     gen.frequency([
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:72:11 ]
+#     │
+#  72 │       (2, gen.list(sub, 2, 3).map(Concat)),
+#     │           ─┬─  
+#     │            ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `sub` in this scope
+#     ╭─[ test/pattern_gen.emel:72:20 ]
+#     │
+#  72 │       (2, gen.list(sub, 2, 3).map(Concat)),
+#     │                    ─┬─  
+#     │                     ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Concat` in this scope
+#     ╭─[ test/pattern_gen.emel:72:35 ]
+#     │
+#  72 │       (2, gen.list(sub, 2, 3).map(Concat)),
+#     │                                   ───┬──  
+#     │                                      ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:73:11 ]
+#     │
+#  73 │       (1, gen.map2(sub, sub, Alt)),
+#     │           ─┬─  
+#     │            ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `sub` in this scope
+#     ╭─[ test/pattern_gen.emel:73:20 ]
+#     │
+#  73 │       (1, gen.map2(sub, sub, Alt)),
+#     │                    ─┬─  
+#     │                     ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `sub` in this scope
+#     ╭─[ test/pattern_gen.emel:73:25 ]
+#     │
+#  73 │       (1, gen.map2(sub, sub, Alt)),
+#     │                         ─┬─  
+#     │                          ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Alt` in this scope
+#     ╭─[ test/pattern_gen.emel:73:30 ]
+#     │
+#  73 │       (1, gen.map2(sub, sub, Alt)),
+#     │                              ─┬─  
+#     │                               ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:74:11 ]
+#     │
+#  74 │       (2, gen.map3(sub, quantifier(), gen.bool(), fn(body, (min, max), lazy) { Repeat(body, min, max, lazy) })),
+#     │           ─┬─  
+#     │            ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `sub` in this scope
+#     ╭─[ test/pattern_gen.emel:74:20 ]
+#     │
+#  74 │       (2, gen.map3(sub, quantifier(), gen.bool(), fn(body, (min, max), lazy) { Repeat(body, min, max, lazy) })),
+#     │                    ─┬─  
+#     │                     ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:74:39 ]
+#     │
+#  74 │       (2, gen.map3(sub, quantifier(), gen.bool(), fn(body, (min, max), lazy) { Repeat(body, min, max, lazy) })),
+#     │                                       ─┬─  
+#     │                                        ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Repeat` in this scope
+#     ╭─[ test/pattern_gen.emel:74:80 ]
+#     │
+#  74 │       (2, gen.map3(sub, quantifier(), gen.bool(), fn(body, (min, max), lazy) { Repeat(body, min, max, lazy) })),
+#     │                                                                                ───┬──  
+#     │                                                                                   ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:75:11 ]
+#     │
+#  75 │       (1, gen.map2(gen.option(name_prefix()), sub, Capture)),
+#     │           ─┬─  
+#     │            ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:75:20 ]
+#     │
+#  75 │       (1, gen.map2(gen.option(name_prefix()), sub, Capture)),
+#     │                    ─┬─  
+#     │                     ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `sub` in this scope
+#     ╭─[ test/pattern_gen.emel:75:47 ]
+#     │
+#  75 │       (1, gen.map2(gen.option(name_prefix()), sub, Capture)),
+#     │                                               ─┬─  
+#     │                                                ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Capture` in this scope
+#     ╭─[ test/pattern_gen.emel:75:52 ]
+#     │
+#  75 │       (1, gen.map2(gen.option(name_prefix()), sub, Capture)),
+#     │                                                    ───┬───  
+#     │                                                       ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find value `sub` in this scope
+#     ╭─[ test/pattern_gen.emel:76:11 ]
+#     │
+#  76 │       (1, sub.map(NonCapture)),
+#     │           ─┬─  
+#     │            ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `NonCapture` in this scope
+#     ╭─[ test/pattern_gen.emel:76:19 ]
+#     │
+#  76 │       (1, sub.map(NonCapture)),
+#     │                   ─────┬────  
+#     │                        ╰────── 
+# ────╯
+#
+# error[E0211]: cannot find type `Gen` in this scope
+#     ╭─[ test/pattern_gen.emel:81:21 ]
+#     │
+#  81 │ pub fn pattern() -> Gen[Node] {
+#     │                     ─┬─  
+#     │                      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find type `Gen` in this scope
+#     ╭─[ test/pattern_gen.emel:85:19 ]
+#     │
+#  85 │ pub fn flags() -> Gen[Flags] {
+#     │                   ─┬─  
+#     │                    ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find type `Flags` in this scope
+#     ╭─[ test/pattern_gen.emel:85:23 ]
+#     │
+#  85 │ pub fn flags() -> Gen[Flags] {
+#     │                       ──┬──  
+#     │                         ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:86:3 ]
+#     │
+#  86 │   gen.map3(gen.bool(), gen.bool(), gen.bool(), Flags)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:86:12 ]
+#     │
+#  86 │   gen.map3(gen.bool(), gen.bool(), gen.bool(), Flags)
+#     │            ─┬─  
+#     │             ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:86:24 ]
+#     │
+#  86 │   gen.map3(gen.bool(), gen.bool(), gen.bool(), Flags)
+#     │                        ─┬─  
+#     │                         ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:86:36 ]
+#     │
+#  86 │   gen.map3(gen.bool(), gen.bool(), gen.bool(), Flags)
+#     │                                    ─┬─  
+#     │                                     ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Flags` in this scope
+#     ╭─[ test/pattern_gen.emel:86:48 ]
+#     │
+#  86 │   gen.map3(gen.bool(), gen.bool(), gen.bool(), Flags)
+#     │                                                ──┬──  
+#     │                                                  ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Gen` in this scope
+#     ╭─[ test/pattern_gen.emel:89:19 ]
+#     │
+#  89 │ pub fn input() -> Gen[String] {
+#     │                   ─┬─  
+#     │                    ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `gen` in this scope
+#     ╭─[ test/pattern_gen.emel:90:3 ]
+#     │
+#  90 │   gen.list(char(), 0, 8).map(fn(cs) { cs.join("") })
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Literal` in this scope
+#      ╭─[ test/pattern_gen.emel:100:5 ]
+#      │
+#  100 │     Literal(c) -> (escape(c), names)
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Dot` in this scope
+#      ╭─[ test/pattern_gen.emel:101:5 ]
+#      │
+#  101 │     Dot -> (".", names)
+#      │     ─┬─  
+#      │      ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Class` in this scope
+#      ╭─[ test/pattern_gen.emel:102:5 ]
+#      │
+#  102 │     Class(negated, items) -> ("[" ++ (if negated { "^" } else { "" }) ++ items.map(render_item).join("") ++ "]", names)
+#      │     ──┬──  
+#      │       ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Concat` in this scope
+#      ╭─[ test/pattern_gen.emel:103:5 ]
+#      │
+#  103 │     Concat(parts) -> parts.fold(("", names), fn((text, k), part) {
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Alt` in this scope
+#      ╭─[ test/pattern_gen.emel:105:30 ]
+#      │
+#  105 │       (text ++ (match part { Alt(_, _) -> "(?:" ++ t ++ ")"; _ -> t }), k2)
+#      │                              ─┬─  
+#      │                               ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Alt` in this scope
+#      ╭─[ test/pattern_gen.emel:107:5 ]
+#      │
+#  107 │     Alt(l, r) -> {
+#      │     ─┬─  
+#      │      ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `a` in this scope
+#      ╭─[ test/pattern_gen.emel:110:8 ]
+#      │
+#  110 │       (a ++ "|" ++ b, k2)
+#      │        ┬  
+#      │        ╰── 
+# ─────╯
+#    = help: did you mean `n`?
+#
+# error[E0211]: cannot find constructor `Repeat` in this scope
+#      ╭─[ test/pattern_gen.emel:112:5 ]
+#      │
+#  112 │     Repeat(body, min, max, lazy) -> {
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find value `atom` in this scope
+#      ╭─[ test/pattern_gen.emel:115:8 ]
+#      │
+#  115 │       (atom ++ quantifier_text(min, max) ++ (if lazy { "?" } else { "" }), k)
+#      │        ──┬─  
+#      │          ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Capture` in this scope
+#      ╭─[ test/pattern_gen.emel:117:5 ]
+#      │
+#  117 │     Capture(None, body) -> {
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Capture` in this scope
+#      ╭─[ test/pattern_gen.emel:121:5 ]
+#      │
+#  121 │     Capture(Some(prefix), body) -> {
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `NonCapture` in this scope
+#      ╭─[ test/pattern_gen.emel:125:5 ]
+#      │
+#  125 │     NonCapture(body) -> {
+#      │     ─────┬────  
+#      │          ╰────── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Assertion` in this scope
+#      ╭─[ test/pattern_gen.emel:129:5 ]
+#      │
+#  129 │     Assertion(t) -> (t, names)
+#      │     ────┬────  
+#      │         ╰────── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Flags` in this scope
+#      ╭─[ test/pattern_gen.emel:133:24 ]
+#      │
+#  133 │ pub fn flag_letters(f: Flags) -> String {
+#      │                        ──┬──  
+#      │                          ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Single` in this scope
+#      ╭─[ test/pattern_gen.emel:146:5 ]
+#      │
+#  146 │     Single(c) -> escape(c)
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Range` in this scope
+#      ╭─[ test/pattern_gen.emel:147:5 ]
+#      │
+#  147 │     Range(a, b) -> escape(a) ++ "-" ++ escape(b)
+#      │     ──┬──  
+#      │       ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Escape` in this scope
+#      ╭─[ test/pattern_gen.emel:148:5 ]
+#      │
+#  148 │     Escape(e) -> e
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0314]: the type of this value must be known to call `code_point`
+#     ╭─[ test/pattern_gen.emel:35:46 ]
+#     │
+#  35 │     gen.map2(char(), char(), fn(a, b) { if a.code_point() <= b.code_point() { Range(a, b) } else { Range(b, a) } }),
+#     │                                              ─────┬────  
+#     │                                                   ╰────── 
+# ────╯
+#    = help: add a type annotation
+#
+# error[E0314]: the type of this value must be known to call `code_point`
+#     ╭─[ test/pattern_gen.emel:35:64 ]
+#     │
+#  35 │     gen.map2(char(), char(), fn(a, b) { if a.code_point() <= b.code_point() { Range(a, b) } else { Range(b, a) } }),
+#     │                                                                ─────┬────  
+#     │                                                                     ╰────── 
+# ────╯
+#    = help: add a type annotation
+#
+# error[E0314]: the type of this value must be known to call `join`
+#     ╭─[ test/pattern_gen.emel:62:69 ]
+#     │
+#  62 │   gen.list(gen.element(["a", "Z", "$", "_"]), 1, 2).map(fn(cs) { cs.join("") })
+#     │                                                                     ──┬─  
+#     │                                                                       ╰─── 
+# ────╯
+#    = help: add a type annotation
+#
+# error[E0314]: the type of this value must be known to call `join`
+#     ╭─[ test/pattern_gen.emel:90:42 ]
+#     │
+#  90 │   gen.list(char(), 0, 8).map(fn(cs) { cs.join("") })
+#     │                                          ──┬─  
+#     │                                            ╰─── 
+# ────╯
+#    = help: add a type annotation
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ test/pattern_gen.emel:101:5 ]
+#      │
+#  101 │     Dot -> (".", names)
+#      │     ─┬─  
+#      │      ╰─── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ test/pattern_gen.emel:102:5 ]
+#      │
+#  102 │     Class(negated, items) -> ("[" ++ (if negated { "^" } else { "" }) ++ items.map(render_item).join("") ++ "]", names)
+#      │     ──────────┬──────────  
+#      │               ╰──────────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `fn(?0) -> ?1`, found `String`
+#      ╭─[ test/pattern_gen.emel:102:31 ]
+#      │
+#  102 │     Class(negated, items) -> ("[" ++ (if negated { "^" } else { "" }) ++ items.map(render_item).join("") ++ "]", names)
+#      │                               ───┬──  
+#      │                                  ╰──── 
+# ─────╯
+#
+# error[E0310]: expected a number (`Int`, `Int64` or `Float`), found `String`
+#      ╭─[ test/pattern_gen.emel:102:31 ]
+#      │
+#  102 │     Class(negated, items) -> ("[" ++ (if negated { "^" } else { "" }) ++ items.map(render_item).join("") ++ "]", names)
+#      │                               ───┬──  
+#      │                                  ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ test/pattern_gen.emel:103:5 ]
+#      │
+#  103 │     Concat(parts) -> parts.fold(("", names), fn((text, k), part) {
+#      │     ──────┬──────  
+#      │           ╰──────── 
+# ─────╯
+#
+# error[E0310]: expected a number (`Int`, `Int64` or `Float`), found `String`
+#      ╭─[ test/pattern_gen.emel:105:43 ]
+#      │
+#  105 │       (text ++ (match part { Alt(_, _) -> "(?:" ++ t ++ ")"; _ -> t }), k2)
+#      │                                           ────┬───  
+#      │                                               ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ test/pattern_gen.emel:107:5 ]
+#      │
+#  107 │     Alt(l, r) -> {
+#      │     ────┬────  
+#      │         ╰────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ test/pattern_gen.emel:112:5 ]
+#      │
+#  112 │     Repeat(body, min, max, lazy) -> {
+#      │     ──────────────┬─────────────  
+#      │                   ╰─────────────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ test/pattern_gen.emel:117:5 ]
+#      │
+#  117 │     Capture(None, body) -> {
+#      │     ─────────┬─────────  
+#      │              ╰─────────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(String, Int)`, found `String`
+#      ╭─[ test/pattern_gen.emel:119:8 ]
+#      │
+#  119 │       ("(" ++ t ++ ")", k)
+#      │        ───┬──  
+#      │           ╰──── 
+# ─────╯
+#
+# error[E0310]: expected a number (`Int`, `Int64` or `Float`), found `String`
+#      ╭─[ test/pattern_gen.emel:119:8 ]
+#      │
+#  119 │       ("(" ++ t ++ ")", k)
+#      │        ───┬──  
+#      │           ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ test/pattern_gen.emel:121:5 ]
+#      │
+#  121 │     Capture(Some(prefix), body) -> {
+#      │     ─────────────┬─────────────  
+#      │                  ╰─────────────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(String, Int)`, found `String`
+#      ╭─[ test/pattern_gen.emel:123:8 ]
+#      │
+#  123 │       ("(?<" ++ prefix ++ names.to_string() ++ ">" ++ t ++ ")", k)
+#      │        ────┬───  
+#      │            ╰───── 
+# ─────╯
+#
+# error[E0310]: expected a number (`Int`, `Int64` or `Float`), found `String`
+#      ╭─[ test/pattern_gen.emel:123:8 ]
+#      │
+#  123 │       ("(?<" ++ prefix ++ names.to_string() ++ ">" ++ t ++ ")", k)
+#      │        ────┬───  
+#      │            ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ test/pattern_gen.emel:125:5 ]
+#      │
+#  125 │     NonCapture(body) -> {
+#      │     ────────┬───────  
+#      │             ╰───────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(String, Int)`, found `String`
+#      ╭─[ test/pattern_gen.emel:127:8 ]
+#      │
+#  127 │       ("(?:" ++ t ++ ")", k)
+#      │        ────┬───  
+#      │            ╰───── 
+# ─────╯
+#
+# error[E0310]: expected a number (`Int`, `Int64` or `Float`), found `String`
+#      ╭─[ test/pattern_gen.emel:127:8 ]
+#      │
+#  127 │       ("(?:" ++ t ++ ")", k)
+#      │        ────┬───  
+#      │            ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ test/pattern_gen.emel:129:5 ]
+#      │
+#  129 │     Assertion(t) -> (t, names)
+#      │     ──────┬─────  
+#      │           ╰─────── 
+# ─────╯
+#
+# error[E0310]: expected a number (`Int`, `Int64` or `Float`), found `String`
+#      ╭─[ test/pattern_gen.emel:134:3 ]
+#      │
+#  134 │   (if f.ignore_case { "i" } else { "" }) ++ (if f.multiline { "m" } else { "" }) ++ (if f.dot_all { "s" } else { "" })
+#      │   ────────────────────┬────────────────────  
+#      │                       ╰────────────────────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ test/pattern_gen.emel:147:5 ]
+#      │
+#  147 │     Range(a, b) -> escape(a) ++ "-" ++ escape(b)
+#      │     ─────┬─────  
+#      │          ╰─────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ test/pattern_gen.emel:148:5 ]
+#      │
+#  148 │     Escape(e) -> e
+#      │     ────┬────  
+#      │         ╰────── 
+# ─────╯
+#
+# error[E0310]: expected a number (`Int`, `Int64` or `Float`), found `String`
+#      ╭─[ test/pattern_gen.emel:157:18 ]
+#      │
+#  157 │     (n, None) -> "{" ++ n.to_string() ++ ",}"
+#      │                  ───┬──  
+#      │                     ╰──── 
+# ─────╯
+#
+# error[E0310]: expected a number (`Int`, `Int64` or `Float`), found `String`
+#      ╭─[ test/pattern_gen.emel:158:31 ]
+#      │
+#  158 │     (n, Some(m)) if n == m -> "{" ++ n.to_string() ++ "}"
+#      │                               ───┬──  
+#      │                                  ╰──── 
+# ─────╯
+#
+# error[E0310]: expected a number (`Int`, `Int64` or `Float`), found `String`
+#      ╭─[ test/pattern_gen.emel:159:21 ]
+#      │
+#  159 │     (n, Some(m)) -> "{" ++ n.to_string() ++ "," ++ m.to_string() ++ "}"
+#      │                     ───┬──  
+#      │                        ╰──── 
+# ─────╯
+#
+# 181 errors, 12 warnings
+# --- end wish check ---

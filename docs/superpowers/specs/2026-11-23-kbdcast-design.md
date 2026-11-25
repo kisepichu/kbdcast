@@ -155,6 +155,7 @@ kbdcast/
 │   ├── tape.emel, recorder.emel                           (1)
 │   └── overlay.emel                                       (4)
 ├── test/
+├── text/            github.com/kisepichu/kbdcast/text      (R) std に足りない String の関数。std に入ったら消す
 ├── regex/           github.com/kisepichu/kbdcast/regex     (R) 汎用の正規表現
 ├── pty/             github.com/kisepichu/kbdcast/pty       effect Pty の宣言だけ。全ターゲットで使える
 ├── pty-bun/         github.com/kisepichu/kbdcast/pty-bun   handler BunPty。targets = ["js"]
@@ -171,15 +172,16 @@ flowchart LR
   cli --> bun[pty-bun]
   core --> pty
   core --> regex
+  regex --> text
   bun --> pty
 ```
 
 決めごと:
 
-- `@external` は pty-bun（後で pty-native）にだけ置く。dependency の Pome については、`[external] allow` に無ければコンパイラが E0233 にする。core、regex、cli の中の `@external` は lint で止める。
-- lint の対象は core、regex、cli の `src/`。`pty*/`（host を触る library）と `test/`（Test 用の handler や、テストで正解役として呼ぶ `@external` を置く）は対象外とする。
+- `@external` は pty-bun（後で pty-native）にだけ置く。dependency の Pome については、`[external] allow` に無ければコンパイラが E0233 にする。core、text、regex、cli の中の `@external` は lint で止める。
+- lint の対象は core、text、regex、cli の `src/`。`pty*/`（host を触る library）と `test/`（Test 用の handler や、テストで正解役として呼ぶ `@external` を置く）は対象外とする。
 - 対象の中では、基盤レベルのキーワード（`effect`、`handler`、`layer`、`suspend`、`trait`、`impl`、`@external`、明示した `fails` と `uses`）を、`tools/lint/foundation.allow` に理由と一緒に登録したモジュールでだけ使える。それ以外の場所に出てきたら `FRICTION(NNN)` の印が要る。
-- 兄弟の Pome は `[replace]` で参照する。Pome の置き場所（source path）は最初の tag を打つときに決める。tag を打つ前なら、移しても名前の書き換えだけで済む。regex と pty は、独立した repo に移す可能性がある。
+- 兄弟の Pome は `[replace]` で参照する。汎用の Pome（text、regex、後の pty）は `emela-lang/x` の形で作り、x に出すときに source path を `github.com/emela-lang/x/<name>` に変える。出すのは user。
 - PTY の寿命は handler の init と release に乗せる（`with BunPty(argv, size) { ... }`）。init でプロセスを起動し、release で止める。
 
 ## 8. ドメインモデル
@@ -370,7 +372,10 @@ flowchart LR
 
 | 候補 | 現状 | 行き先 | kbdcast で当たる所 |
 |---|---|---|---|
-| 正規表現 | std に無い。issue、PR、proposal を探したが対応するものは無い。std の方針（`15-stdlib.md`）は、形の決まっていない純粋な部品をまず std の外に出すこと | regex の Pome として公開する。必要なら使い道付きの issue を立てる。動機に使える材料: `Std.Shape` の `pattern` 注記は正規表現を持つのに Emela の中で検査できない、`proposals/array.md` が正規表現エンジンの遷移表を例に挙げている | R |
+| 正規表現 | std に無い。issue、PR、proposal を探したが対応するものは無い。std の方針（`15-stdlib.md`）は、形の決まっていない純粋な部品をまず std の外に出すこと | regex の Pome として公開する。公開先は x（下の「regex の x への持ち込み」）。必要なら使い道付きの issue を立てる。動機に使える材料: `Std.Shape` の `pattern` 注記は正規表現を持つのに Emela の中で検査できない、`proposals/array.md` が正規表現エンジンの遷移表を例に挙げている | R |
+| String の部分文字列と code point からの組み立て | std に無い（`[target.string]`: 「There is no API that takes a position as a number」）。issue と proposal も無い。R で `text` Pome に、std に入れるならこうなる名前と型（`Text.slice`、`Text.from_code_points`）で置いた。code point の List を経由するので、1 回 O(n) | friction 002（003 も）。proposal にする（下書きは friction 002） | R（regex の一致の text、`replace`、`split`）、3 |
+| regex の x への持ち込み | x に正規表現の Pome は無い（2026-11-25 時点）。R で x の形（`Pome.toml`、`README.md`、`src/`、`test/`）で作った。依存する text も同じ形。上の「正規表現」の公開の手段 | x への issue と PR。text も一緒に出し、source path を `github.com/emela-lang/x/<name>` に変える | R |
+| brix の pbt の組み合わせの関数 | brix v0.4.0 の `Brix.Pbt.Gen` に、選択（`one_of`、`frequency`、`element`）、値から次の生成器を作る `and_then`、長さに上下限のある list が無い。R の差分テストの生成器で、`Gen` と `Tree` を直に使って書いた | friction 028。brix への issue にする（下書きは friction 028） | R（regex の差分テスト） |
 | PTY | std にも ecosystem にも無い | pty と pty-bun の Pome として公開する | 1 |
 | native の C FFI で Bytes、Array、callback を渡せない | open question #38（`[ext.boundary]`）。issue は無い | PTY の使い道を添えて issue にする | pty-native |
 | `Array.set` が in place になるかを確かめられない | WASM と C では「最後の参照なら in place」と約束されている（`[api.std.array]`）。in place になるかをコンパイラが教える仕組みは無く、JS は常にコピーする | VT の画面バッファで測った数字を添えて、前提の範囲内の proposal の候補にする | 3 |

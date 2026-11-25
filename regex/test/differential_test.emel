@@ -1,0 +1,51 @@
+import Brix.Pbt.Gen
+import Brix.Pbt.Property.{Config}
+import PatternGen
+import Program
+import Std.Array.{Array}
+import Syntax.{RegexSyntax}
+import Vm
+
+# The test-only oracle `oracle.mjs`: JavaScript's RegExp with the `u` and `d` flags and `flags`
+# (letters of `i`, `m` and `s`). `[]` if it finds no match in `input`, otherwise where the match
+# starts and ends and then where each group does, in code points, with -1 and -1 for a group that
+# did not take part.
+@external(js, "./oracle.mjs", "find")
+fn oracle(pattern: String, flags: String, input: String) -> Array[Int] uses {}
+
+# What `Lib.find` finds, in the form of `oracle`. Match has the text of a group but not where it
+# is, so this takes the steps of `Lib.compile` and `Lib.find` through Syntax, Program and Vm.
+fn find(pattern: String, flags: String, input: String) -> List[Int] fails RegexSyntax {
+  program = Program.build(
+    Syntax.parse(pattern),
+    ignore_case: flags.contains("i"),
+    multiline: flags.contains("m"),
+    dot_all: flags.contains("s"),
+  ) match {
+    Some(program) -> program
+    None          -> panic("#{pattern} is too large")
+  }
+  Vm.search(program, Array.from_list(input.code_points()), 0).found match {
+    None -> []
+    Some(found) -> {
+      groups = found.groups.to_list().flat_map(
+        |group| group match {
+          Some((from, to)) -> [from, to]
+          None             -> [-1, -1]
+        },
+      )
+      [found.start, found.end, ..groups]
+    }
+  }
+}
+
+# A pattern that Syntax rejects fails the case with its RegexSyntax: the generator writes only what
+# the syntax accepts.
+@test
+fn find_agrees_with_javascript() {
+  cases = Gen.pair(PatternGen.pattern(), Gen.pair(PatternGen.flags(), PatternGen.input()))
+    |> Gen.map(|(pattern, (flags, input))| (pattern, flags, input))
+  Property.check_with(cases, Config(cases: 10000, ..Property.config()), |(pattern, flags, input)| {
+    assert find(pattern, flags, input) == oracle(pattern, flags, input).to_list()
+  })
+}

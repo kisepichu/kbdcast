@@ -1,0 +1,269 @@
+# wish-target: regex/src/lib.emel
+
+## Regular expressions with the semantics of JavaScript's RegExp with the `u`
+## flag, matched in linear time (no backtracking). Positions are code point
+## offsets.
+
+import Program
+import Syntax
+import Text
+import Vm
+
+pub type Flags(ignore_case: Bool, multiline: Bool, dot_all: Bool)
+
+## No flag set.
+pub const NO_FLAGS: Flags = Flags(ignore_case: False, multiline: False, dot_all: False)
+
+pub error RegexSyntax(message: String, offset: Int)
+
+pub opaque type Regex(program: Vm.Program, names: Map[String, Int])
+
+pub opaque type Match(input: String, found: Vm.Found, names: Map[String, Int])
+
+pub fn compile(pattern: String, flags: Flags) -> Regex fails RegexSyntax {
+  let ast = Syntax.parse(pattern) catch {
+    Syntax.RegexSyntax(message, offset) => fail RegexSyntax(message, offset)
+  }
+  match Program.build(ast, flags.ignore_case, flags.multiline, flags.dot_all) {
+    Some(program) => Regex(program, ast.names)
+    None => fail RegexSyntax("pattern too large", 0)
+  }
+}
+
+pub fn is_match(re: Regex, s: String) -> Bool {
+  find(re, s).is_some()
+}
+
+pub fn find(re: Regex, s: String) -> Option[Match] {
+  let input = Array.from_list(s.code_points())
+  Vm.search(re.program, input, 0).found.map(fn(found) { Match(s, found, re.names) })
+}
+
+pub fn start(m: Match) -> Int {
+  m.found.start
+}
+
+pub fn end(m: Match) -> Int {
+  m.found.end
+}
+
+pub fn text(m: Match) -> String {
+  Text.slice(m.input, m.start(), m.end())
+}
+
+## Group 0 is the whole match. None for a group that did not match and for an
+## index out of range.
+pub fn group(m: Match, index: Int) -> Option[String] {
+  if index == 0 {
+    Some(m.text())
+  } else {
+    m.found.groups.get(index - 1).flatten().map(fn((from, to)) { Text.slice(m.input, from, to) })
+  }
+}
+
+pub fn named(m: Match, name: String) -> Option[String] {
+  m.names.get(name).and_then(fn(index) { m.group(index) })
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0118]: expected expression
+#     ╭─[ src/lib.emel:24:3 ]
+#     │
+#  24 │   let ast = Syntax.parse(pattern) catch {
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/lib.emel:24:7 ]
+#     │
+#  24 │   let ast = Syntax.parse(pattern) catch {
+#     │       ─┬─  
+#     │        ╰─── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/lib.emel:27:3 ]
+#     │
+#  27 │   match Program.build(ast, flags.ignore_case, flags.multiline, flags.dot_all) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/lib.emel:28:19 ]
+#     │
+#  28 │     Some(program) => Regex(program, ast.names)
+#     │                   ┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/lib.emel:28:19 ]
+#     │
+#  28 │     Some(program) => Regex(program, ast.names)
+#     │                   ┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/lib.emel:28:19 ]
+#     │
+#  28 │     Some(program) => Regex(program, ast.names)
+#     │                   ┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/lib.emel:29:10 ]
+#     │
+#  29 │     None => fail RegexSyntax("pattern too large", 0)
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/lib.emel:29:10 ]
+#     │
+#  29 │     None => fail RegexSyntax("pattern too large", 0)
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/lib.emel:29:10 ]
+#     │
+#  29 │     None => fail RegexSyntax("pattern too large", 0)
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/lib.emel:38:3 ]
+#     │
+#  38 │   let input = Array.from_list(s.code_points())
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/lib.emel:38:7 ]
+#     │
+#  38 │   let input = Array.from_list(s.code_points())
+#     │       ──┬──  
+#     │         ╰──── 
+# ────╯
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#     ╭─[ src/lib.emel:39:45 ]
+#     │
+#  39 │   Vm.search(re.program, input, 0).found.map(fn(found) { Match(s, found, re.names) })
+#     │                                             ────┬────  
+#     │                                                 ╰────── 
+# ────╯
+#    = help: write `|found| Match(s, found, re.names)`
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#     ╭─[ src/lib.emel:60:49 ]
+#     │
+#  60 │     m.found.groups.get(index - 1).flatten().map(fn((from, to)) { Text.slice(m.input, from, to) })
+#     │                                                 ───────┬──────  
+#     │                                                        ╰──────── 
+# ────╯
+#    = help: write `|(from, to)| Text.slice(m.input, from, to)`
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#     ╭─[ src/lib.emel:65:30 ]
+#     │
+#  65 │   m.names.get(name).and_then(fn(index) { m.group(index) })
+#     │                              ────┬────  
+#     │                                  ╰────── 
+# ────╯
+#    = help: write `|index| m.group(index)`
+#
+# error[E0205]: undefined module `Program`
+#    ╭─[ src/lib.emel:7:8 ]
+#    │
+#  7 │ import Program
+#    │        ───┬───  
+#    │           ╰───── 
+# ───╯
+#
+# error[E0205]: undefined module `Vm`
+#     ╭─[ src/lib.emel:10:8 ]
+#     │
+#  10 │ import Vm
+#     │        ─┬  
+#     │         ╰── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Vm` in this scope
+#     ╭─[ src/lib.emel:19:32 ]
+#     │
+#  19 │ pub opaque type Regex(program: Vm.Program, names: Map[String, Int])
+#     │                                ─┬  
+#     │                                 ╰── 
+# ────╯
+#
+# error[E0211]: cannot find type `Map` in this scope
+#     ╭─[ src/lib.emel:19:51 ]
+#     │
+#  19 │ pub opaque type Regex(program: Vm.Program, names: Map[String, Int])
+#     │                                                   ─┬─  
+#     │                                                    ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Vm` in this scope
+#     ╭─[ src/lib.emel:21:45 ]
+#     │
+#  21 │ pub opaque type Match(input: String, found: Vm.Found, names: Map[String, Int])
+#     │                                             ─┬  
+#     │                                              ╰── 
+# ────╯
+#
+# error[E0211]: cannot find type `Map` in this scope
+#     ╭─[ src/lib.emel:21:62 ]
+#     │
+#  21 │ pub opaque type Match(input: String, found: Vm.Found, names: Map[String, Int])
+#     │                                                              ─┬─  
+#     │                                                               ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Program` in this scope
+#     ╭─[ src/lib.emel:27:9 ]
+#     │
+#  27 │   match Program.build(ast, flags.ignore_case, flags.multiline, flags.dot_all) {
+#     │         ───┬───  
+#     │            ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find value `ast` in this scope
+#     ╭─[ src/lib.emel:27:23 ]
+#     │
+#  27 │   match Program.build(ast, flags.ignore_case, flags.multiline, flags.dot_all) {
+#     │                       ─┬─  
+#     │                        ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Vm` in this scope
+#     ╭─[ src/lib.emel:39:3 ]
+#     │
+#  39 │   Vm.search(re.program, input, 0).found.map(fn(found) { Match(s, found, re.names) })
+#     │   ─┬  
+#     │    ╰── 
+# ────╯
+#
+# error[E0211]: cannot find value `input` in this scope
+#     ╭─[ src/lib.emel:39:25 ]
+#     │
+#  39 │   Vm.search(re.program, input, 0).found.map(fn(found) { Match(s, found, re.names) })
+#     │                         ──┬──  
+#     │                           ╰──── 
+# ────╯
+#
+# 24 errors, 1 warning
+# --- end wish check ---

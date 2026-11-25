@@ -1,0 +1,570 @@
+# The syntax of a pattern: the regular subset of ECMAScript's Pattern with the `u` flag, read into
+# an Ast. A pattern that is a SyntaxError in `u` mode fails with RegexSyntax, and so does one that
+# uses what the subset leaves out (backreferences, lookaround, property escapes, modifiers,
+# repetition counts above 1000, and capture group names that are not ASCII identifiers).
+#
+# What the flags change is kept as it is written: `.`, the class escapes `\d \D \w \W \s \S`,
+# `^ $ \b \B` and the characters themselves, which case folding changes. `Class` and `Vm` give
+# them their meaning once the flags are known. Offsets count code points from the start of the
+# pattern.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment, and `emela doc` does not show it.
+
+import Std.Map.{Map}
+import Text
+
+## Why `parse` rejected a pattern, at `offset`: where the construct it rejected starts (the `[` or
+## `(` of a class or group that is not closed).
+# FRICTION(012): Emela has no re-export, so `lib.emel` declares an error of the same shape for the
+# users of the Pome, and `compile` turns this one into that one.
+pub error RegexSyntax(message: String, offset: Int)
+
+## `\d \D \w \W \s \S`, inside a class or outside one.
+pub enum ClassEscape {
+  Digit
+  NotDigit
+  Word
+  NotWord
+  Space
+  NotSpace
+} derive Eq, Show
+
+## One item of a class. In `Range(from, to)`, `from` is not greater than `to`.
+pub enum ClassItem {
+  Single(Int)
+  Range(Int, Int)
+  Escape(ClassEscape)
+} derive Eq, Show
+
+## `^ $ \b \B`.
+pub enum Assertion {
+  LineStart
+  LineEnd
+  WordBoundary
+  NotWordBoundary
+} derive Eq, Show
+
+## A node of an Ast.
+pub enum Node {
+  ## A character, as a code point.
+  Literal(Int)
+  ## `.`
+  Dot
+  ## `[...]`, `[^...]`, and a class escape outside a class (`\d` is `[\d]`).
+  Class(items: List[ClassItem], negated: Bool)
+  Assert(Assertion)
+  ## The terms of an alternative in order, other than one term alone. `Concat([])` matches the
+  ## empty string.
+  Concat(List[Node])
+  ## Two or more alternatives, in order.
+  Alternate(List[Node])
+  ## A capture group. `index` counts the capture groups from 1 in the order of their `(`. A group
+  ## that does not capture leaves no node of its own.
+  Group(index: Int, name: Option[String], body: Node)
+  ## `max` is `None` when there is no upper bound. Both counts are at most 1000.
+  Repeat(body: Node, min: Int, max: Option[Int], greedy: Bool)
+} derive Eq, Show
+
+## A parsed pattern: its root, the number of its capture groups, and the index of each named
+## group.
+pub type Ast(root: Node, group_count: Int, names: Map[String, Int]) derive Eq, Show
+
+## Reads `pattern` with the syntax of the `u` flag.
+pub fn parse(pattern: String) -> Ast fails RegexSyntax {
+  start = State(rest: pattern.code_points(), offset: 0, groups: 0, names: Map.empty())
+  (root, end) = disjunction(start)
+  end.rest match {
+    [] -> Ast(root:, group_count: end.groups, names: end.names)
+    _  -> fail RegexSyntax(message: "unmatched ')'", offset: end.offset)
+  }
+}
+
+const MAX_REPEAT: Int = 1000
+
+# The characters that `\` can escape as themselves outside a class: SyntaxCharacter and `/`.
+const IDENTITY_ESCAPES: List[Int] = "^$\\.*+?()[]{}|/".code_points()
+
+# FRICTION(013): Emela has no literal for the code point of a character, so each character the
+# parser looks for has a name here.
+const EXCLAMATION: Int = 0x21 # !
+const DOLLAR: Int = 0x24 # $
+const OPEN_PAREN: Int = 0x28 # (
+const CLOSE_PAREN: Int = 0x29 # )
+const ASTERISK: Int = 0x2A # *
+const PLUS: Int = 0x2B # +
+const COMMA: Int = 0x2C # ,
+const HYPHEN: Int = 0x2D # -
+const DOT: Int = 0x2E # .
+const DIGIT_0: Int = 0x30
+const DIGIT_1: Int = 0x31
+const DIGIT_9: Int = 0x39
+const COLON: Int = 0x3A # :
+const LESS: Int = 0x3C # <
+const EQUALS: Int = 0x3D # =
+const GREATER: Int = 0x3E # >
+const QUESTION: Int = 0x3F # ?
+const CAPITAL_A: Int = 0x41
+const CAPITAL_B: Int = 0x42
+const CAPITAL_D: Int = 0x44
+const CAPITAL_F: Int = 0x46
+const CAPITAL_P: Int = 0x50
+const CAPITAL_S: Int = 0x53
+const CAPITAL_W: Int = 0x57
+const CAPITAL_Z: Int = 0x5A
+const OPEN_BRACKET: Int = 0x5B # [
+const BACKSLASH: Int = 0x5C # \
+const CLOSE_BRACKET: Int = 0x5D # ]
+const CARET: Int = 0x5E # ^
+const UNDERSCORE: Int = 0x5F # _
+const SMALL_A: Int = 0x61
+const SMALL_B: Int = 0x62
+const SMALL_C: Int = 0x63
+const SMALL_D: Int = 0x64
+const SMALL_F: Int = 0x66
+const SMALL_I: Int = 0x69
+const SMALL_K: Int = 0x6B
+const SMALL_M: Int = 0x6D
+const SMALL_N: Int = 0x6E
+const SMALL_P: Int = 0x70
+const SMALL_R: Int = 0x72
+const SMALL_S: Int = 0x73
+const SMALL_T: Int = 0x74
+const SMALL_U: Int = 0x75
+const SMALL_V: Int = 0x76
+const SMALL_W: Int = 0x77
+const SMALL_X: Int = 0x78
+const SMALL_Z: Int = 0x7A
+const OPEN_BRACE: Int = 0x7B # {
+const BAR: Int = 0x7C # |
+const CLOSE_BRACE: Int = 0x7D # }
+
+# Where the parser is: the code points not read yet, the offset of the first of them, the number
+# of capture groups opened so far, and their names.
+type State(rest: List[Int], offset: Int, groups: Int, names: Map[String, Int])
+
+# `s` after its next `count` code points.
+fn skip(s: State, count: Int) -> State {
+  State(rest: s.rest.drop(count), offset: s.offset + count, ..s)
+}
+
+# Alternatives separated by `|`, up to a `)` or the end of the pattern.
+fn disjunction(s: State) -> (Node, State) fails RegexSyntax {
+  (first, after) = alternative(s, [])
+  alternatives(after, [first])
+}
+
+# After an alternative. `read` holds the alternatives read so far, the last one first.
+fn alternatives(s: State, read: List[Node]) -> (Node, State) fails RegexSyntax {
+  s.rest match {
+    [BAR, ..] -> {
+      (next, after) = alternative(s.skip(1), [])
+      alternatives(after, [next, ..read])
+    }
+    _ -> read match {
+      [one] -> (one, s)
+      _     -> (Alternate(read.reverse()), s)
+    }
+  }
+}
+
+# Terms up to a `|`, a `)` or the end of the pattern. `read` holds the terms read so far, the last
+# one first.
+fn alternative(s: State, read: List[Node]) -> (Node, State) fails RegexSyntax {
+  s.rest match {
+    # FRICTION(015): there are no or-patterns, so the end (`[]`, `|` or `)`) is the guard turned
+    # around.
+    [c, ..] if c != BAR && c != CLOSE_PAREN -> {
+      (next, after) = term(s)
+      alternative(after, [next, ..read])
+    }
+    _ -> read match {
+      [one] -> (one, s)
+      _     -> (Concat(read.reverse()), s)
+    }
+  }
+}
+
+# An assertion, or an atom and the quantifier after it. An assertion cannot be repeated in `u`
+# mode, so a quantifier that follows one is read here, and repeats nothing.
+fn term(s: State) -> (Node, State) fails RegexSyntax {
+  s.rest match {
+    [CARET, ..]                -> (Assert(LineStart), s.skip(1))
+    [DOLLAR, ..]               -> (Assert(LineEnd), s.skip(1))
+    [BACKSLASH, SMALL_B, ..]   -> (Assert(WordBoundary), s.skip(2))
+    [BACKSLASH, CAPITAL_B, ..] -> (Assert(NotWordBoundary), s.skip(2))
+    # FRICTION(015)
+    [c, ..] if c == ASTERISK || c == PLUS || c == QUESTION -> fail RegexSyntax(
+      message: "nothing to repeat",
+      offset: s.offset,
+    )
+    [OPEN_BRACE, ..] -> braces(s) match {
+      Some(_) -> fail RegexSyntax(message: "nothing to repeat", offset: s.offset)
+      None    -> fail RegexSyntax(message: "lone quantifier brackets", offset: s.offset)
+    }
+    # FRICTION(015)
+    [c, ..] if c == CLOSE_BRACE || c == CLOSE_BRACKET -> fail RegexSyntax(
+      message: "lone quantifier brackets",
+      offset: s.offset,
+    )
+    _ -> {
+      (body, after) = atom(s)
+      quantified(body, after)
+    }
+  }
+}
+
+# `term` calls this only before a code point that starts an atom.
+fn atom(s: State) -> (Node, State) fails RegexSyntax {
+  s.rest match {
+    [DOT, ..]          -> (Dot, s.skip(1))
+    [OPEN_PAREN, ..]   -> group(s)
+    [OPEN_BRACKET, ..] -> class(s)
+    [BACKSLASH, ..]    -> atom_escape(s)
+    [c, ..]            -> (Literal(c), s.skip(1))
+    []                 -> panic("Syntax.atom: there is no atom at the end of the pattern")
+  }
+}
+
+# `body` with the quantifier at the start of `s`, if there is one.
+fn quantified(body: Node, s: State) -> (Node, State) fails RegexSyntax {
+  at = s.offset
+  bounds = s.rest match {
+    [ASTERISK, ..] -> Some((0, None, s.skip(1)))
+    [PLUS, ..]     -> Some((1, None, s.skip(1)))
+    [QUESTION, ..] -> Some((0, Some(1), s.skip(1)))
+    [OPEN_BRACE, ..] -> braces(s) match {
+      Some(found) -> Some(found)
+      None        -> fail RegexSyntax(message: "incomplete quantifier", offset: at)
+    }
+    _              -> None
+  }
+  bounds match {
+    None -> (body, s)
+    Some((min, max, after)) -> {
+      if max.map(|m| m < min).or(False) {
+        fail RegexSyntax(message: "numbers out of order in {} quantifier", offset: at)
+      }
+      if min > MAX_REPEAT || max.map(|m| m > MAX_REPEAT).or(False) {
+        fail RegexSyntax(message: "repetition count above 1000", offset: at)
+      }
+      after.rest match {
+        [QUESTION, ..] -> (Repeat(body:, min:, max:, greedy: False), after.skip(1))
+        _              -> (Repeat(body:, min:, max:, greedy: True), after)
+      }
+    }
+  }
+}
+
+# `{n}`, `{n,}` or `{n,m}` at the start of `s`: n, m (`None` for `{n,}`), and `s` after the `}`.
+# `None` if the braces are not one of these.
+fn braces(s: State) -> Option[(Int, Option[Int], State)] {
+  # FRICTION(017): there is no `?` that returns at the first `None`, so each step that can stop
+  # is an `and_then`.
+  decimal(s.skip(1), None).and_then(
+    |(min, after_min)| after_min.rest match {
+      [CLOSE_BRACE, ..]        -> Some((min, Some(min), after_min.skip(1)))
+      [COMMA, CLOSE_BRACE, ..] -> Some((min, None, after_min.skip(2)))
+      [COMMA, ..] -> decimal(after_min.skip(1), None).and_then(|(max, after_max)| {
+        after_max.rest match {
+          [CLOSE_BRACE, ..] -> Some((min, Some(max), after_max.skip(1)))
+          _                 -> None
+        }
+      })
+      _                        -> None
+    },
+  )
+}
+
+# Decimal digits at the start of `s`, at least one, as a number, and `s` after them. `value` is
+# what the digits read so far make, `None` before the first one. A number above MAX_REPEAT stops at
+# MAX_REPEAT + 1, so that a long run of digits cannot overflow.
+fn decimal(s: State, value: Option[Int]) -> Option[(Int, State)] {
+  s.rest match {
+    [c, ..] if is_decimal_digit(c) -> {
+      n = value.or(0) * 10 + (c - DIGIT_0)
+      decimal(s.skip(1), Some(n.min(MAX_REPEAT + 1)))
+    }
+    _ -> value.map(|n| (n, s))
+  }
+}
+
+# A group, from its `(`.
+fn group(s: State) -> (Node, State) fails RegexSyntax {
+  open = s.offset
+  s.rest match {
+    [OPEN_PAREN, QUESTION, COLON, ..] -> {
+      (body, after) = disjunction(s.skip(3))
+      (body, close(after, open))
+    }
+    # FRICTION(015)
+    [OPEN_PAREN, QUESTION, c, ..] if c == EQUALS || c == EXCLAMATION -> fail RegexSyntax(
+      message: "lookahead is not supported",
+      offset: open,
+    )
+    # FRICTION(015)
+    [OPEN_PAREN, QUESTION, LESS, c, ..] if c == EQUALS || c == EXCLAMATION -> fail RegexSyntax(
+      message: "lookbehind is not supported",
+      offset: open,
+    )
+    [OPEN_PAREN, QUESTION, LESS, ..] -> {
+      (name, after) = group_name(s.skip(3), open + 3, [])
+      if after.names.contains(name) {
+        fail RegexSyntax(message: "duplicate capture group name", offset: open)
+      }
+      capture(after, open, Some(name))
+    }
+    # FRICTION(015)
+    # FRICTION(019): `emela fmt` breaks a `||` guard that does not fit without the parentheses
+    # it needs, and stops, so they are written here.
+    [OPEN_PAREN, QUESTION, c, ..] if (c == SMALL_I
+      || c == SMALL_M
+      || c == SMALL_S
+      || c == HYPHEN) -> {
+      fail RegexSyntax(message: "modifiers are not supported", offset: open)
+    }
+    [OPEN_PAREN, QUESTION, ..] -> fail RegexSyntax(message: "invalid group", offset: open)
+    _                          -> capture(s.skip(1), open, None)
+  }
+}
+
+# The body of a capture group, after its `(` or `(?<name>`, and its `)`. The group's index is
+# taken before its body, so that the groups inside it come after it.
+fn capture(s: State, open: Int, name: Option[String]) -> (Node, State) fails RegexSyntax {
+  index = s.groups + 1
+  names = name match {
+    Some(n) -> s.names.insert(n, index)
+    None    -> s.names
+  }
+  (body, after) = disjunction(State(groups: index, names:, ..s))
+  (Group(index:, name:, body:), close(after, open))
+}
+
+# The `)` of the group that starts at `open`.
+fn close(s: State, open: Int) -> State fails RegexSyntax {
+  s.rest match {
+    [CLOSE_PAREN, ..] -> s.skip(1)
+    _                 -> fail RegexSyntax(message: "unterminated group", offset: open)
+  }
+}
+
+# The name of a capture group, from its first character at `start`, and `s` after its `>`. `read`
+# holds the characters read so far, the last one first.
+fn group_name(s: State, start: Int, read: List[Int]) -> (String, State) fails RegexSyntax {
+  s.rest match {
+    [GREATER, ..] if read != [] -> {
+      # FRICTION(003): `is_name_character` let only ASCII through, so `None` cannot happen.
+      name = Text.from_code_points(read.reverse()) match {
+        Some(text) -> text
+        None       -> panic("Syntax.group_name: an ASCII name is not a string")
+      }
+      (name, s.skip(1))
+    }
+    _ -> name_character(s) match {
+      Some((c, after)) if is_name_character(c, read == []) -> group_name(after, start, [c, ..read])
+      _ -> fail RegexSyntax(message: "capture group names must be ASCII identifiers", offset: start)
+    }
+  }
+}
+
+# The next character of a capture group name, written as itself or as a `\u` escape.
+fn name_character(s: State) -> Option[(Int, State)] {
+  s.rest match {
+    [BACKSLASH, ..] -> unicode_escape(s)
+    [c, ..]         -> Some((c, s.skip(1)))
+    []              -> None
+  }
+}
+
+# Whether `c` can come next in a capture group name: `[A-Za-z$_]` as the first character, and
+# `[A-Za-z0-9$_]` after it.
+# FRICTION(014): std has no ID_Start and ID_Continue, which ECMAScript's RegExpIdentifierName uses,
+# so the names are only these ASCII ones.
+fn is_name_character(c: Int, first: Bool) -> Bool {
+  is_ascii_letter(c) || c == DOLLAR || c == UNDERSCORE || (!first && is_decimal_digit(c))
+}
+
+# An escape outside a class, from its `\`. `term` reads `\b` and `\B`.
+fn atom_escape(s: State) -> (Node, State) fails RegexSyntax {
+  s.rest match {
+    [BACKSLASH, c, ..] if c >= DIGIT_1 && c <= DIGIT_9 -> fail RegexSyntax(
+      message: "backreferences are not supported",
+      offset: s.offset,
+    )
+    # Every `\k` is a backreference in `u` mode, whether a name follows or not.
+    [BACKSLASH, SMALL_K, ..] -> fail RegexSyntax(
+      message: "backreferences are not supported",
+      offset: s.offset,
+    )
+    _ -> class_escape(s) match {
+      (Single(c), after) -> (Literal(c), after)
+      (item, after)      -> (Class(items: [item], negated: False), after)
+    }
+  }
+}
+
+# An escape that means the same inside a class and outside one, from its `\`.
+fn class_escape(s: State) -> (ClassItem, State) fails RegexSyntax {
+  invalid = RegexSyntax(message: "invalid escape", offset: s.offset)
+  s.rest match {
+    [BACKSLASH, SMALL_D, ..]                           -> (Escape(Digit), s.skip(2))
+    [BACKSLASH, CAPITAL_D, ..]                         -> (Escape(NotDigit), s.skip(2))
+    [BACKSLASH, SMALL_W, ..]                           -> (Escape(Word), s.skip(2))
+    [BACKSLASH, CAPITAL_W, ..]                         -> (Escape(NotWord), s.skip(2))
+    [BACKSLASH, SMALL_S, ..]                           -> (Escape(Space), s.skip(2))
+    [BACKSLASH, CAPITAL_S, ..]                         -> (Escape(NotSpace), s.skip(2))
+    # FRICTION(015)
+    [BACKSLASH, c, ..] if c == SMALL_P || c == CAPITAL_P -> fail RegexSyntax(
+      message: "Unicode property escapes are not supported",
+      offset: s.offset,
+    )
+    [BACKSLASH, SMALL_F, ..]                           -> (Single(0x0C), s.skip(2))
+    [BACKSLASH, SMALL_N, ..]                           -> (Single(0x0A), s.skip(2))
+    [BACKSLASH, SMALL_R, ..]                           -> (Single(0x0D), s.skip(2))
+    [BACKSLASH, SMALL_T, ..]                           -> (Single(0x09), s.skip(2))
+    [BACKSLASH, SMALL_V, ..]                           -> (Single(0x0B), s.skip(2))
+    [BACKSLASH, SMALL_C, c, ..] if is_ascii_letter(c)  -> (Single(c % 32), s.skip(3))
+    [BACKSLASH, DIGIT_0, c, ..] if is_decimal_digit(c) -> fail invalid
+    [BACKSLASH, DIGIT_0, ..]                           -> (Single(0x00), s.skip(2))
+    [BACKSLASH, SMALL_X, ..] -> hex_digits(s.skip(2), 2, 0) match {
+      Some((c, after)) -> (Single(c), after)
+      None             -> fail invalid
+    }
+    [BACKSLASH, SMALL_U, ..] -> unicode_escape(s) match {
+      Some((c, after)) -> (Single(c), after)
+      None             -> fail RegexSyntax(message: "invalid Unicode escape", offset: s.offset)
+    }
+    # FRICTION(018): a List has no `contains`.
+    [BACKSLASH, c, ..] if IDENTITY_ESCAPES.any(|e| e == c) -> (Single(c), s.skip(2))
+    _                                                  -> fail invalid
+  }
+}
+
+# A `\u` escape at the start of `s`: `\uXXXX`, or `\u{X...}` up to 10FFFF. A lead surrogate and a
+# `\uXXXX` trail surrogate right after it are the code point of the pair. `None` if `s` does not
+# start with one of these.
+fn unicode_escape(s: State) -> Option[(Int, State)] {
+  s.rest match {
+    [BACKSLASH, SMALL_U, OPEN_BRACE, ..] -> hex_until_brace(s.skip(3), None) match {
+      Some((c, after)) if c <= 0x10FFFF -> Some((c, after))
+      _                                 -> None
+    }
+    [BACKSLASH, SMALL_U, ..] -> hex_digits(s.skip(2), 4, 0) match {
+      Some((lead, after)) if lead >= 0xD800 && lead <= 0xDBFF -> {
+        (after.rest, hex_digits(after.skip(2), 4, 0)) match {
+          ([BACKSLASH, SMALL_U, ..], Some((trail, end))) if trail >= 0xDC00 && trail <= 0xDFFF -> {
+            Some((0x10000 + (lead - 0xD800) * 0x400 + (trail - 0xDC00), end))
+          }
+          _ -> Some((lead, after))
+        }
+      }
+      found -> found
+    }
+    _ -> None
+  }
+}
+
+# `count` hexadecimal digits at the start of `s`, read on from `value` as a number, and `s` after
+# them.
+fn hex_digits(s: State, count: Int, value: Int) -> Option[(Int, State)] {
+  if count == 0 {
+    Some((value, s))
+  } else {
+    s.rest match {
+      # FRICTION(017)
+      [c, ..] -> hex_value(c) match {
+        Some(d) -> hex_digits(s.skip(1), count - 1, value * 16 + d)
+        None    -> None
+      }
+      [] -> None
+    }
+  }
+}
+
+# Hexadecimal digits up to and including a `}`, at least one, as a number. `value` is what the
+# digits read so far make, `None` before the first one. A number above 10FFFF stops at 110000, so
+# that a long run of digits cannot overflow.
+fn hex_until_brace(s: State, value: Option[Int]) -> Option[(Int, State)] {
+  (s.rest, value) match {
+    ([CLOSE_BRACE, ..], Some(n)) -> Some((n, s.skip(1)))
+    # FRICTION(017)
+    ([c, ..], _) -> hex_value(c) match {
+      Some(d) -> hex_until_brace(s.skip(1), Some((value.or(0) * 16 + d).min(0x110000)))
+      None    -> None
+    }
+    ([], _)                      -> None
+  }
+}
+
+# The value of the hexadecimal digit `c`, or `None` if it is not one.
+fn hex_value(c: Int) -> Option[Int] {
+  if is_decimal_digit(c) {
+    Some(c - DIGIT_0)
+  } else if c >= SMALL_A && c <= SMALL_F {
+    Some(c - SMALL_A + 10)
+  } else if c >= CAPITAL_A && c <= CAPITAL_F {
+    Some(c - CAPITAL_A + 10)
+  } else {
+    None
+  }
+}
+
+fn is_decimal_digit(c: Int) -> Bool {
+  c >= DIGIT_0 && c <= DIGIT_9
+}
+
+fn is_ascii_letter(c: Int) -> Bool {
+  (c >= SMALL_A && c <= SMALL_Z) || (c >= CAPITAL_A && c <= CAPITAL_Z)
+}
+
+# A class, from its `[`.
+fn class(s: State) -> (Node, State) fails RegexSyntax {
+  (negated, inside) = s.rest match {
+    [OPEN_BRACKET, CARET, ..] -> (True, s.skip(2))
+    _                         -> (False, s.skip(1))
+  }
+  (items, after) = class_items(inside, s.offset, [])
+  (Class(items:, negated:), after)
+}
+
+# The items of a class and its `]`. `open` is the offset of its `[`, and `read` holds the items
+# read so far, the last one first.
+fn class_items(s: State, open: Int, read: List[ClassItem]) -> (List[ClassItem], State)
+  fails RegexSyntax {
+  s.rest match {
+    []                  -> fail RegexSyntax(message: "unterminated character class", offset: open)
+    [CLOSE_BRACKET, ..] -> (read.reverse(), s.skip(1))
+    _ -> {
+      (first, after_first) = class_atom(s, open)
+      after_first.rest match {
+        [HYPHEN, c, ..] if c != CLOSE_BRACKET -> {
+          (last, after_last) = class_atom(after_first.skip(1), open)
+          (first, last) match {
+            (Single(from), Single(to)) if from <= to -> class_items(
+              after_last,
+              open,
+              [Range(from, to), ..read],
+            )
+            (Single(_), Single(_)) -> fail RegexSyntax(
+              message: "range out of order in character class",
+              offset: s.offset,
+            )
+            _ -> fail RegexSyntax(message: "invalid character class", offset: s.offset)
+          }
+        }
+        _ -> class_items(after_first, open, [first, ..read])
+      }
+    }
+  }
+}
+
+# One character or class escape in a class. `open` is the offset of the class's `[`.
+fn class_atom(s: State, open: Int) -> (ClassItem, State) fails RegexSyntax {
+  s.rest match {
+    [BACKSLASH, SMALL_B, ..] -> (Single(0x08), s.skip(2))
+    [BACKSLASH, HYPHEN, ..] -> (Single(HYPHEN), s.skip(2))
+    [BACKSLASH, ..] -> class_escape(s)
+    [c, ..]         -> (Single(c), s.skip(1))
+    []              -> fail RegexSyntax(message: "unterminated character class", offset: open)
+  }
+}

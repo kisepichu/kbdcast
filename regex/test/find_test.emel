@@ -1,0 +1,179 @@
+import Lib.{Flags, NO_FLAGS, RegexSyntax}
+
+# The expected results are those of JavaScript's RegExp with the `u` flag (`re.exec(s)`), from both
+# Bun and Node, with the positions turned into code point offsets.
+
+const I: Flags = Flags(ignore_case: True, ..NO_FLAGS)
+const M: Flags = Flags(multiline: True, ..NO_FLAGS)
+const S: Flags = Flags(dot_all: True, ..NO_FLAGS)
+
+# `Lib.find` of `pattern` in `input`: where the match starts and ends, its text, and its first
+# `groups` groups.
+# FRICTION(023): a type of these four fields with `derive Eq, Show` gets W0303, because the Show
+# that a failed assert uses to show its values does not count as a use. A tuple has its Show built
+# in.
+fn find(
+  pattern: String,
+  flags: Flags,
+  input: String,
+  groups: Int,
+) -> Option[(Int, Int, String, List[Option[String]])]
+  fails RegexSyntax {
+  Lib.find(Lib.compile(pattern, flags), input).map(
+    |m| (m.start(), m.end(), m.text(), List.range(1, groups + 1).map(|i| m.group(i))),
+  )
+}
+
+# The message and the offset of the RegexSyntax that `compile` fails with, or `("", -1)` if it
+# does not fail.
+fn failure(pattern: String) -> (String, Int) {
+  {
+    Lib.compile(pattern, NO_FLAGS)
+    ("", -1)
+  } escape {
+    RegexSyntax(message:, offset:) -> (message, offset)
+  }
+}
+
+# `n` copies of `s`.
+# FRICTION(022): std has no `String.repeat`.
+fn copies(s: String, n: Int) -> String {
+  String.concat(List.range(0, n).map(|_| s))
+}
+
+@test
+fn find_returns_the_leftmost_match_in_priority_order() {
+  assert find("abc", NO_FLAGS, "xabcx", 0) == Some((1, 4, "abc", []))
+  assert find("a|ab", NO_FLAGS, "ab", 0) == Some((0, 1, "a", []))
+}
+
+@test
+fn find_repeats_greedily_or_lazily() {
+  assert find("a+", NO_FLAGS, "aaa", 0) == Some((0, 3, "aaa", []))
+  assert find("a+?", NO_FLAGS, "aaa", 0) == Some((0, 1, "a", []))
+  assert find("a{2,3}", NO_FLAGS, "aaaa", 0) == Some((0, 3, "aaa", []))
+  assert find("a{2,}?", NO_FLAGS, "aaaa", 0) == Some((0, 2, "aa", []))
+  assert find("a{2}", NO_FLAGS, "a", 0) == None
+}
+
+@test
+fn find_matches_classes_and_class_escapes() {
+  assert find("[a-c]+", NO_FLAGS, "xbcay", 0) == Some((1, 4, "bca", []))
+  assert find("[^a-c]+", NO_FLAGS, "abxyc", 0) == Some((2, 4, "xy", []))
+  assert find("\\d+", NO_FLAGS, "ab12c", 0) == Some((2, 4, "12", []))
+  assert find("\\w+", NO_FLAGS, "-a_1-", 0) == Some((1, 4, "a_1", []))
+  assert find("\\s+", NO_FLAGS, "a \t\u{3000}b", 0) == Some((1, 4, " \t\u{3000}", []))
+  assert find("[]", NO_FLAGS, "a", 0) == None
+  assert find("[^]", NO_FLAGS, "\n", 0) == Some((0, 1, "\n", []))
+}
+
+@test
+fn find_matches_dot_by_code_point() {
+  assert find(".", NO_FLAGS, "\n", 0) == None
+  assert find(".", S, "\n", 0) == Some((0, 1, "\n", []))
+  assert find(".", NO_FLAGS, "\u{1F600}", 0) == Some((0, 1, "\u{1F600}", []))
+  assert find("b", NO_FLAGS, "\u{1F600}b", 0) == Some((1, 2, "b", []))
+}
+
+@test
+fn find_checks_assertions() {
+  assert find("^a", NO_FLAGS, "ba", 0) == None
+  assert find("^a", M, "b\na", 0) == Some((2, 3, "a", []))
+  assert find("a$", NO_FLAGS, "ab", 0) == None
+  assert find("a$", M, "a\nb", 0) == Some((0, 1, "a", []))
+  assert find("\\bfoo\\b", NO_FLAGS, "a foo b", 0) == Some((2, 5, "foo", []))
+  assert find("\\Bo", NO_FLAGS, "foo", 0) == Some((1, 2, "o", []))
+}
+
+@test
+fn find_captures_groups() {
+  assert find("(a)(b)?", NO_FLAGS, "a", 2) == Some((0, 1, "a", [Some("a"), None]))
+  assert find("(?<y>\\d{4})-(?<m>\\d\\d)", NO_FLAGS, "on 2026-11 ok", 2)
+    == Some((3, 10, "2026-11", [Some("2026"), Some("11")]))
+  assert find("(?:a)(b)", NO_FLAGS, "ab", 1) == Some((0, 2, "ab", [Some("b")]))
+}
+
+@test
+fn find_clears_the_groups_of_a_quantifier_at_each_iteration() {
+  assert find("(?:(a)|b)+", NO_FLAGS, "ab", 1) == Some((0, 2, "ab", [None]))
+  assert find("(?:(a)|(b))+", NO_FLAGS, "ab", 2) == Some((0, 2, "ab", [None, Some("b")]))
+  # The example of ECMA-262's RepeatMatcher: the groups of nested quantifiers.
+  assert find("(z)((a+)?(b+)?(c))*", NO_FLAGS, "zaacbbbcac", 5)
+    == Some((0, 10, "zaacbbbcac", [Some("z"), Some("ac"), Some("a"), None, Some("c")]))
+  # Each copy of a counted repetition is an iteration too.
+  assert find("(?:(a)|(b)){1,2}", NO_FLAGS, "ab", 2) == Some((0, 2, "ab", [None, Some("b")]))
+  assert find("(?:(a)|(b)|c){0,3}", NO_FLAGS, "abc", 2) == Some((0, 3, "abc", [None, None]))
+}
+
+@test
+fn find_fails_an_optional_iteration_that_matches_the_empty_string() {
+  assert find("(a*)*", NO_FLAGS, "b", 1) == Some((0, 0, "", [None]))
+  assert find("(a*)+", NO_FLAGS, "b", 1) == Some((0, 0, "", [Some("")]))
+  assert find("(?:a|())*?b", NO_FLAGS, "ab", 1) == Some((0, 2, "ab", [None]))
+  assert find("(a|)+b", NO_FLAGS, "aab", 1) == Some((0, 3, "aab", [Some("a")]))
+  assert find("(a*?)*", NO_FLAGS, "aa", 1) == Some((0, 2, "aa", [Some("a")]))
+}
+
+@test
+fn find_repeats_a_nullable_body_after_its_mandatory_copies() {
+  # Lazy: the first iteration may be empty, and has the priority.
+  assert find("(?:|a)+?", NO_FLAGS, "a", 0) == Some((0, 0, "", []))
+  assert find("(?:|a)+?$", NO_FLAGS, "a", 0) == Some((0, 1, "a", []))
+  assert find("(?:a|())+?b", NO_FLAGS, "ab", 1) == Some((0, 2, "ab", [None]))
+  # Greedy: an empty first iteration followed by a non-empty one comes before a single empty one.
+  assert find("(|a)+", NO_FLAGS, "a", 1) == Some((0, 1, "a", [Some("a")]))
+  assert find("(?:()|a){2,}", NO_FLAGS, "aa", 1) == Some((0, 2, "aa", [None]))
+  assert find("(?:(a*)){2,}", NO_FLAGS, "aa", 1) == Some((0, 2, "aa", [Some("")]))
+}
+
+@test
+fn find_compares_case_folded_characters_with_ignore_case() {
+  assert find("k", I, "\u{212A}", 0) == Some((0, 1, "\u{212A}", []))
+  assert find("[^k]", I, "\u{212A}", 0) == None
+  assert find("\\w", I, "\u{17F}", 0) == Some((0, 1, "\u{17F}", []))
+  assert find("ß", I, "\u{1E9E}", 0) == Some((0, 1, "\u{1E9E}", []))
+  assert find("ss", I, "\u{DF}", 0) == None
+  assert find("[a-z]", I, "\u{212A}", 0) == Some((0, 1, "\u{212A}", []))
+  assert find("Σ", I, "\u{3C2}", 0) == Some((0, 1, "\u{3C2}", []))
+  assert find("\\bk", I, "\u{212A}", 0) == Some((0, 1, "\u{212A}", []))
+}
+
+@test
+fn group_and_named_read_a_group_by_index_or_name() {
+  Lib.find(Lib.compile("(?<y>\\d{4})-(?<m>\\d\\d)", NO_FLAGS), "on 2026-11 ok") match {
+    Some(m) -> {
+      assert m.named("y") == Some("2026")
+      assert m.named("z") == None
+      assert m.group(0) == Some("2026-11")
+      assert m.group(3) == None
+      assert m.group(-1) == None
+    }
+    None -> panic("no match")
+  }
+}
+
+@test
+fn is_match_tells_whether_find_finds_a_match() {
+  assert Lib.is_match(Lib.compile("a{2}", NO_FLAGS), "xaa")
+  assert !Lib.is_match(Lib.compile("a{2}", NO_FLAGS), "xa")
+}
+
+@test
+fn compile_fails_with_the_error_of_the_parser() {
+  assert failure("(a(b") == ("unterminated group", 2)
+}
+
+@test
+fn compile_rejects_a_pattern_whose_unrolled_program_is_too_large() {
+  # Nested counts multiply: this would be 10^9 instructions.
+  assert failure("(?:(?:a{1000}){1000}){1000}") == ("pattern too large", 0)
+  assert find("a{1000}", NO_FLAGS, "aaaaaaaaaa", 0) == None
+  assert find("a{1000}", NO_FLAGS, copies("a", 1000), 0) == Some((0, 1000, copies("a", 1000), []))
+  assert find("\\w{1000}", NO_FLAGS, copies("x", 1001), 0) == Some((0, 1000, copies("x", 1000), []))
+  # 99 * 1000 + 999 characters and the final Accept are 100_000 instructions, the most there may
+  # be.
+  assert failure("(?:a{1000}){99}a{999}") == ("", -1)
+  assert failure("(?:a{1000}){99}a{1000}") == ("pattern too large", 0)
+  # A count of 0 has no code, however large its body would be.
+  assert find("(?:(?:a{1000}){1000}){0}b", NO_FLAGS, "b", 0) == Some((0, 1, "b", []))
+}
