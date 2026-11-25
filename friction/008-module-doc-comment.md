@@ -9,7 +9,9 @@
   - 先頭に `#!` の行、空行、`##` の行、空行、`pub fn first` を置いて `emela check` すると、診断なしで終わる（exit 0）
   - 同じ Pome で `emela doc` を走らせると、空行を挟んだ `##` の行が `first` の doc になる。`##` をファイルの先頭に置いても、モジュールの doc にはならない
   - text の写しで `emela doc` を走らせると、`Lib.html` に出るのは 2 つの fn の `##` だけで、`text/src/lib.emel` の先頭のコメントは出ない
-- 回避策: std の `core/string.emel:1-2` と x の `base64/src/lib.emel` に揃え、ふつうの `#` のコメントで書いた（`text/src/lib.emel` の先頭、`FRICTION(008)` の印）
+- 回避策:
+  std の `core/string.emel:1-2` と x の `base64/src/lib.emel` に揃え、ふつうの `#` のコメントで書いた（`text/src/lib.emel` の先頭、`FRICTION(008)` の印）
+  - regex（計画の Task 3 の Step 2、「モジュールの doc comment だけの骨組み」）: `regex/src/lib.emel` の先頭も同じ形（`FRICTION(008)` の印）。wish は書いていない（計画が `#` の形を指定した）
 - コスト: 計画の「モジュールの doc comment」を、生成した文書に出ないコメントで代えた。`emela doc` の文書にも hover にもモジュールの説明が出ない。std も同じ書き方なので、std のモジュールの説明も生成した文書には出ない。普段のコードに基盤レベルは漏れていない
 - spec:
   `[lex.comment]`（`spec/language/02-lexical.md:14`: 「`##` is a doc comment. It attaches to the declaration, local fn, variant, field, effect operation, or handler item that immediately follows it.」。モジュールは入っていない）、`[lsp.doc]`。`emela doc` の節は `spec/tooling/commands.md` に無い（`04-modules.md:181` と `lsp.md:240` で触れているだけ）

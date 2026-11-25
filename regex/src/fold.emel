@@ -1,0 +1,24 @@
+import FoldTable.{SOURCES, TARGETS}
+import Std.Array.{Array}
+
+# The generated table as Arrays, built once, so that a lookup is a binary search over reads in
+# constant time.
+# FRICTION(010): a const of another module cannot be written `FoldTable.SOURCES`, so the table is
+# imported by name and these need names of their own.
+const SOURCE_ARRAY: Array[Int] = Array.from_list(SOURCES)
+const TARGET_ARRAY: Array[Int] = Array.from_list(TARGETS)
+
+## ECMAScript's Canonicalize with the `u` and `i` flags: the simple case folding of `c`
+## (CaseFolding.txt, status C and S), or `c` itself when simple case folding does not change it.
+## O(log n) in the size of the table.
+pub fn canonicalize(c: Int) -> Int {
+  SOURCE_ARRAY.binary_search(c) match {
+    # FRICTION(009): `i` is a position of SOURCES, and TARGETS has the same length, but
+    # `Array.get` still returns an Option.
+    Some(i) -> TARGET_ARRAY.get(i) match {
+      Some(folded) -> folded
+      None         -> panic("Fold.canonicalize: TARGETS has no entry at #{i}")
+    }
+    None -> c
+  }
+}

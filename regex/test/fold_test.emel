@@ -1,0 +1,40 @@
+import Fold
+import FoldTable.{SOURCES, TARGETS}
+
+@test
+fn canonicalize_folds_upper_case_to_lower_case() {
+  assert Fold.canonicalize(0x41) == 0x61
+  assert Fold.canonicalize(0x61) == 0x61
+  assert Fold.canonicalize(0x3A3) == 0x3C3
+}
+
+@test
+fn canonicalize_folds_the_letters_that_fold_outside_their_block() {
+  # KELVIN SIGN and LATIN SMALL LETTER LONG S fold to ASCII.
+  assert Fold.canonicalize(0x212A) == 0x6B
+  assert Fold.canonicalize(0x17F) == 0x73
+  # GREEK SMALL LETTER FINAL SIGMA folds to the other small sigma.
+  assert Fold.canonicalize(0x3C2) == 0x3C3
+}
+
+@test
+fn canonicalize_uses_the_simple_folding_of_sharp_s() {
+  # The full folding of U+1E9E and U+DF is "ss" (status F); the simple one is U+DF.
+  assert Fold.canonicalize(0x1E9E) == 0xDF
+  assert Fold.canonicalize(0xDF) == 0xDF
+}
+
+@test
+fn canonicalize_keeps_what_case_folding_does_not_change() {
+  assert Fold.canonicalize(0x1F600) == 0x1F600
+  # Just below the first entry of the table and just above the last.
+  assert Fold.canonicalize(0x40) == 0x40
+  assert Fold.canonicalize(0x1E922) == 0x1E922
+}
+
+@test
+fn canonicalize_folds_every_entry_of_the_table() {
+  List.zip(SOURCES, TARGETS).each(|(source, target)| {
+    assert Fold.canonicalize(source) == target
+  })
+}
