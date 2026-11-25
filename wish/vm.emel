@@ -1,0 +1,728 @@
+# wish-target: regex/src/vm.emel
+
+## The Pike VM: matches a compiled program against an input of code points
+## with the semantics of JavaScript's RegExp (`u` flag), in O(m·n) steps,
+## where m is the size of the unrolled program (at most Program.MAX_SIZE)
+## and n the length of the input.
+##
+## Follows Barrière and Pit-Claudel, "Linear Matching of JavaScript Regular
+## Expressions" (PLDI 2024):
+## - §3.3 Algorithm 1: threads in priority order, at most one thread per state
+##   and position.
+## - §4.1: BeginLoop/EndLoop and the `left` flag, so that an optional iteration
+##   cannot match the empty string. The state is (pc, left): the paper's two
+##   copies of the automaton.
+## - §4.2: Capture Reset with clocks. SetQuant marks each iteration; groups are
+##   filtered against their enclosing quantifiers once, for the winning thread.
+## - §4.6 List: a thread's registers are an immutable log of writes, so a Fork
+##   is O(1). The position in the log is the clock.
+## - §4.5.2: a non-nullable `e{n,}` loops on its last copy.
+##
+## Not covered: lookarounds (§4.3, §4.4) and backreferences, which the syntax
+## rejects. Counted repetition is unrolled (§3.1). A nullable `e{n,}` and
+## `e{n,}?` (n >= 1) are n copies of `e` followed by `e*` or `e*?`. For the
+## lazy one this is the only known way: the paper leaves it open (§4.5.3, §7).
+## For the greedy one, §4.5.3 (CheckNull, SetNullPlus, rebuilding the nulled
+## groups afterwards) avoids the copies; it is a candidate for a later
+## optimization.
+
+import Class.{CharSet}
+import Fold
+import Syntax.{Assertion, LineStart, LineEnd, WordBoundary, NotWordBoundary}
+
+pub enum Inst {
+  Consume(set: CharSet, negated: Bool)   # with ignore_case, `set` is canonicalized
+  Fork(first: Int, second: Int)          # `first` has the priority
+  Jump(to: Int)
+  Save(slot: Int)                        # 2g: group g starts, 2g + 1: it ends
+  SetQuant(id: Int)                      # an iteration of quantifier `id` begins
+  BeginLoop
+  EndLoop
+  Check(Assertion)
+  Accept
+}
+
+pub type Program(
+  insts: Array[Inst],
+  group_count: Int,
+  enclosing: Array[List[Int]],   # for group g (from 1), the quantifiers around it
+  ignore_case: Bool,
+  multiline: Bool,
+  word: CharSet,
+)
+
+pub type Found(start: Int, end: Int, groups: Array[Option[(Int, Int)]])   # groups[0] is group 1
+
+pub type Outcome(found: Option[Found], steps: Int)   # steps: threads the vm processed
+
+enum Write {
+  Slot(slot: Int, pos: Int)
+  Quant(id: Int)
+}
+
+# left: the thread consumed a character since its last BeginLoop.
+type Thread(pc: Int, left: Bool, start: Int, log: List[Write])
+
+type Winner(start: Int, end: Int, log: List[Write])
+
+## The first match that starts at `from` or later.
+pub fn search(prog: Program, input: Array[Int], from: Int) -> Outcome {
+  run(prog, input, from, [], None, 0)
+}
+
+fn run(prog: Program, input: Array[Int], pos: Int, carried: List[Thread], best: Option[Winner], steps: Int) -> Outcome {
+  # until something matches, a new thread starts here with the lowest priority
+  let active = match best {
+    None => carried ++ [Thread(0, True, pos, [])]
+    Some(_) => carried
+  }
+  let (next, best, steps) = step(prog, input, pos, active, Set.empty(), [], best, steps)
+  if pos >= input.length() or (next.is_empty() and best.is_some()) {
+    Outcome(best.map(fn(w) { found(prog, w) }), steps)
+  } else {
+    run(prog, input, pos + 1, next.reverse(), best, steps)
+  }
+}
+
+# `stack` is in priority order (head first). `next` collects the threads that
+# consumed input[pos], highest priority last.
+fn step(
+  prog: Program,
+  input: Array[Int],
+  pos: Int,
+  stack: List[Thread],
+  seen: Set[(Int, Bool)],
+  next: List[Thread],
+  best: Option[Winner],
+  steps: Int,
+) -> (List[Thread], Option[Winner], Int) {
+  match stack {
+    [] => (next, best, steps)
+    [t, ..rest] =>
+      if seen.contains((t.pc, t.left)) {
+        step(prog, input, pos, rest, seen, next, best, steps)
+      } else {
+        let seen = seen.insert((t.pc, t.left))
+        let steps = steps + 1
+        let go = fn(stack) { step(prog, input, pos, stack, seen, next, best, steps) }
+        let advance = Thread(..t, pc: t.pc + 1)
+        match prog.insts[t.pc] {
+          Consume(set, negated) =>
+            if pos < input.length() and accepts(prog, set, negated, input[pos]) {
+              step(prog, input, pos, rest, seen, [Thread(..advance, left: True), ..next], best, steps)
+            } else {
+              go(rest)
+            }
+          Fork(first, second) => go([Thread(..t, pc: first), Thread(..t, pc: second), ..rest])
+          Jump(to) => go([Thread(..t, pc: to), ..rest])
+          Save(slot) => go([Thread(..advance, log: [Slot(slot, pos), ..t.log]), ..rest])
+          SetQuant(id) => go([Thread(..advance, log: [Quant(id), ..t.log]), ..rest])
+          BeginLoop => go([Thread(..advance, left: False), ..rest])
+          EndLoop => if t.left { go([advance, ..rest]) } else { go(rest) }
+          Check(a) => if holds(prog, input, pos, a) { go([advance, ..rest]) } else { go(rest) }
+          # the threads below have lower priority: drop them
+          Accept => (next, Some(Winner(t.start, pos, t.log)), steps)
+        }
+      }
+  }
+}
+
+fn accepts(prog: Program, set: CharSet, negated: Bool, c: Int) -> Bool {
+  let c = if prog.ignore_case { Fold.canonicalize(c) } else { c }
+  set.contains(c) != negated
+}
+
+fn holds(prog: Program, input: Array[Int], pos: Int, a: Assertion) -> Bool {
+  match a {
+    LineStart => pos == 0 or (prog.multiline and is_line_terminator(input[pos - 1]))
+    LineEnd => pos == input.length() or (prog.multiline and is_line_terminator(input[pos]))
+    WordBoundary => is_word(prog, input, pos - 1) != is_word(prog, input, pos)
+    NotWordBoundary => is_word(prog, input, pos - 1) == is_word(prog, input, pos)
+  }
+}
+
+fn is_word(prog: Program, input: Array[Int], i: Int) -> Bool {
+  i >= 0 and i < input.length() and prog.word.contains(input[i])
+}
+
+fn is_line_terminator(c: Int) -> Bool {
+  c == '\n' or c == '\r' or c == '\u{2028}' or c == '\u{2029}'
+}
+
+# Capture Reset (§4.2): group g keeps its newest value only if it was written
+# after the newest SetQuant of every quantifier around it.
+fn found(prog: Program, w: Winner) -> Found {
+  let (slots, quants) = w.log.reverse().enumerate().fold((Map.empty(), Map.empty()), fn((slots, quants), (clock, write)) {
+    match write {
+      Slot(slot, pos) => (slots.insert(slot, (pos, clock)), quants)
+      Quant(id) => (slots, quants.insert(id, clock))
+    }
+  })
+  let groups = Array.range(1, prog.group_count + 1).map(fn(g) {
+    match (slots.get(2 * g), slots.get(2 * g + 1)) {
+      (Some((from, clock)), Some((to, _))) =>
+        if prog.enclosing[g].all(fn(q) { quants.get(q).map_or(True, fn(qc) { clock > qc }) }) {
+          Some((from, to))
+        } else {
+          None
+        }
+      _ => None
+    }
+  })
+  Found(w.start, w.end, groups)
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vm.emel:149:8 ]
+#      │
+#  149 │   c == '\n' or c == '\r' or c == '\u{2028}' or c == '\u{2029}'
+#      │        ┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/vm.emel:149:9 ]
+#      │
+#  149 │   c == '\n' or c == '\r' or c == '\u{2028}' or c == '\u{2029}'
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vm.emel:149:11 ]
+#      │
+#  149 │   c == '\n' or c == '\r' or c == '\u{2028}' or c == '\u{2029}'
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vm.emel:149:21 ]
+#      │
+#  149 │   c == '\n' or c == '\r' or c == '\u{2028}' or c == '\u{2029}'
+#      │                     ┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/vm.emel:149:22 ]
+#      │
+#  149 │   c == '\n' or c == '\r' or c == '\u{2028}' or c == '\u{2029}'
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vm.emel:149:24 ]
+#      │
+#  149 │   c == '\n' or c == '\r' or c == '\u{2028}' or c == '\u{2029}'
+#      │                        ┬  
+#      │                        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vm.emel:149:34 ]
+#      │
+#  149 │   c == '\n' or c == '\r' or c == '\u{2028}' or c == '\u{2029}'
+#      │                                  ┬  
+#      │                                  ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/vm.emel:149:35 ]
+#      │
+#  149 │   c == '\n' or c == '\r' or c == '\u{2028}' or c == '\u{2029}'
+#      │                                   ┬  
+#      │                                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vm.emel:149:43 ]
+#      │
+#  149 │   c == '\n' or c == '\r' or c == '\u{2028}' or c == '\u{2029}'
+#      │                                           ┬  
+#      │                                           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vm.emel:149:53 ]
+#      │
+#  149 │   c == '\n' or c == '\r' or c == '\u{2028}' or c == '\u{2029}'
+#      │                                                     ┬  
+#      │                                                     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/vm.emel:149:54 ]
+#      │
+#  149 │   c == '\n' or c == '\r' or c == '\u{2028}' or c == '\u{2029}'
+#      │                                                      ┬  
+#      │                                                      ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vm.emel:149:62 ]
+#      │
+#  149 │   c == '\n' or c == '\r' or c == '\u{2028}' or c == '\u{2029}'
+#      │                                                              ┬  
+#      │                                                              ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vm.emel:75:3 ]
+#     │
+#  75 │   let active = match best {
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vm.emel:75:7 ]
+#     │
+#  75 │   let active = match best {
+#     │       ───┬──  
+#     │          ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vm.emel:79:3 ]
+#     │
+#  79 │   let (next, best, steps) = step(prog, input, pos, active, Set.empty(), [], best, steps)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vm.emel:79:7 ]
+#     │
+#  79 │   let (next, best, steps) = step(prog, input, pos, active, Set.empty(), [], best, steps)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0110]: expected `{`
+#     ╭─[ src/vm.emel:80:28 ]
+#     │
+#  80 │   if pos >= input.length() or (next.is_empty() and best.is_some()) {
+#     │                            ─┬  
+#     │                             ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vm.emel:80:48 ]
+#     │
+#  80 │   if pos >= input.length() or (next.is_empty() and best.is_some()) {
+#     │                                                ─┬─  
+#     │                                                 ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vm.emel:80:48 ]
+#     │
+#  80 │   if pos >= input.length() or (next.is_empty() and best.is_some()) {
+#     │                                                ─┬─  
+#     │                                                 ╰─── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/vm.emel:99:3 ]
+#     │
+#  99 │   match stack {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vm.emel:100:8 ]
+#      │
+#  100 │     [] => (next, best, steps)
+#      │        ┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vm.emel:100:8 ]
+#      │
+#  100 │     [] => (next, best, steps)
+#      │        ┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vm.emel:100:8 ]
+#      │
+#  100 │     [] => (next, best, steps)
+#      │        ┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vm.emel:101:17 ]
+#      │
+#  101 │     [t, ..rest] =>
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vm.emel:101:17 ]
+#      │
+#  101 │     [t, ..rest] =>
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vm.emel:101:17 ]
+#      │
+#  101 │     [t, ..rest] =>
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vm.emel:102:7 ]
+#      │
+#  102 │       if seen.contains((t.pc, t.left)) {
+#      │       ─┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vm.emel:102:40 ]
+#      │
+#  102 │       if seen.contains((t.pc, t.left)) {
+#      │                                        ┬  
+#      │                                        ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vm.emel:104:9 ]
+#      │
+#  104 │       } else {
+#      │         ──┬─  
+#      │           ╰─── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vm.emel:131:3 ]
+#      │
+#  131 │   let c = if prog.ignore_case { Fold.canonicalize(c) } else { c }
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vm.emel:131:7 ]
+#      │
+#  131 │   let c = if prog.ignore_case { Fold.canonicalize(c) } else { c }
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/vm.emel:136:3 ]
+#      │
+#  136 │   match a {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vm.emel:137:15 ]
+#      │
+#  137 │     LineStart => pos == 0 or (prog.multiline and is_line_terminator(input[pos - 1]))
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vm.emel:137:15 ]
+#      │
+#  137 │     LineStart => pos == 0 or (prog.multiline and is_line_terminator(input[pos - 1]))
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vm.emel:137:15 ]
+#      │
+#  137 │     LineStart => pos == 0 or (prog.multiline and is_line_terminator(input[pos - 1]))
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vm.emel:138:13 ]
+#      │
+#  138 │     LineEnd => pos == input.length() or (prog.multiline and is_line_terminator(input[pos]))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vm.emel:138:13 ]
+#      │
+#  138 │     LineEnd => pos == input.length() or (prog.multiline and is_line_terminator(input[pos]))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vm.emel:138:13 ]
+#      │
+#  138 │     LineEnd => pos == input.length() or (prog.multiline and is_line_terminator(input[pos]))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vm.emel:139:18 ]
+#      │
+#  139 │     WordBoundary => is_word(prog, input, pos - 1) != is_word(prog, input, pos)
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vm.emel:139:18 ]
+#      │
+#  139 │     WordBoundary => is_word(prog, input, pos - 1) != is_word(prog, input, pos)
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vm.emel:139:18 ]
+#      │
+#  139 │     WordBoundary => is_word(prog, input, pos - 1) != is_word(prog, input, pos)
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vm.emel:140:21 ]
+#      │
+#  140 │     NotWordBoundary => is_word(prog, input, pos - 1) == is_word(prog, input, pos)
+#      │                     ┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vm.emel:140:21 ]
+#      │
+#  140 │     NotWordBoundary => is_word(prog, input, pos - 1) == is_word(prog, input, pos)
+#      │                     ┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vm.emel:140:21 ]
+#      │
+#  140 │     NotWordBoundary => is_word(prog, input, pos - 1) == is_word(prog, input, pos)
+#      │                     ┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vm.emel:145:10 ]
+#      │
+#  145 │   i >= 0 and i < input.length() and prog.word.contains(input[i])
+#      │          ─┬─  
+#      │           ╰─── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vm.emel:149:8 ]
+#      │
+#  149 │   c == '\n' or c == '\r' or c == '\u{2028}' or c == '\u{2029}'
+#      │        ┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vm.emel:149:9 ]
+#      │
+#  149 │   c == '\n' or c == '\r' or c == '\u{2028}' or c == '\u{2029}'
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vm.emel:155:3 ]
+#      │
+#  155 │   let (slots, quants) = w.log.reverse().enumerate().fold((Map.empty(), Map.empty()), fn((slots, quants), (clock, write)) {
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vm.emel:155:7 ]
+#      │
+#  155 │   let (slots, quants) = w.log.reverse().enumerate().fold((Map.empty(), Map.empty()), fn((slots, quants), (clock, write)) {
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vm.emel:161:3 ]
+#      │
+#  161 │   let groups = Array.range(1, prog.group_count + 1).map(fn(g) {
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vm.emel:161:7 ]
+#      │
+#  161 │   let groups = Array.range(1, prog.group_count + 1).map(fn(g) {
+#      │       ───┬──  
+#      │          ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#     ╭─[ src/vm.emel:46:10 ]
+#     │
+#  46 │   insts: Array[Inst],
+#     │          ──┬──  
+#     │            ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#     ╭─[ src/vm.emel:48:14 ]
+#     │
+#  48 │   enclosing: Array[List[Int]],   # for group g (from 1), the quantifiers around it
+#     │              ──┬──  
+#     │                ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#     ╭─[ src/vm.emel:54:46 ]
+#     │
+#  54 │ pub type Found(start: Int, end: Int, groups: Array[Option[(Int, Int)]])   # groups[0] is group 1
+#     │                                              ──┬──  
+#     │                                                ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#     ╭─[ src/vm.emel:69:37 ]
+#     │
+#  69 │ pub fn search(prog: Program, input: Array[Int], from: Int) -> Outcome {
+#     │                                     ──┬──  
+#     │                                       ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#     ╭─[ src/vm.emel:73:30 ]
+#     │
+#  73 │ fn run(prog: Program, input: Array[Int], pos: Int, carried: List[Thread], best: Option[Winner], steps: Int) -> Outcome {
+#     │                              ──┬──  
+#     │                                ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `or` in this scope
+#     ╭─[ src/vm.emel:80:28 ]
+#     │
+#  80 │   if pos >= input.length() or (next.is_empty() and best.is_some()) {
+#     │                            ─┬  
+#     │                             ╰── 
+# ────╯
+#
+# error[E0211]: cannot find value `next` in this scope
+#     ╭─[ src/vm.emel:80:32 ]
+#     │
+#  80 │   if pos >= input.length() or (next.is_empty() and best.is_some()) {
+#     │                                ──┬─  
+#     │                                  ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#     ╭─[ src/vm.emel:91:10 ]
+#     │
+#  91 │   input: Array[Int],
+#     │          ──┬──  
+#     │            ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Set` in this scope
+#     ╭─[ src/vm.emel:94:9 ]
+#     │
+#  94 │   seen: Set[(Int, Bool)],
+#     │         ─┬─  
+#     │          ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `t` in this scope
+#      ╭─[ src/vm.emel:102:25 ]
+#      │
+#  102 │       if seen.contains((t.pc, t.left)) {
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0211]: cannot find value `t` in this scope
+#      ╭─[ src/vm.emel:102:31 ]
+#      │
+#  102 │       if seen.contains((t.pc, t.left)) {
+#      │                               ┬  
+#      │                               ╰── 
+# ─────╯
+#
+# error[E0211]: cannot find value `rest` in this scope
+#      ╭─[ src/vm.emel:103:32 ]
+#      │
+#  103 │         step(prog, input, pos, rest, seen, next, best, steps)
+#      │                                ──┬─  
+#      │                                  ╰─── 
+# ─────╯
+#    = help: did you mean `best`?
+#
+# error[E0211]: cannot find type `Array` in this scope
+#      ╭─[ src/vm.emel:135:32 ]
+#      │
+#  135 │ fn holds(prog: Program, input: Array[Int], pos: Int, a: Assertion) -> Bool {
+#      │                                ──┬──  
+#      │                                  ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#      ╭─[ src/vm.emel:144:34 ]
+#      │
+#  144 │ fn is_word(prog: Program, input: Array[Int], i: Int) -> Bool {
+#      │                                  ──┬──  
+#      │                                    ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find value `groups` in this scope
+#      ╭─[ src/vm.emel:172:25 ]
+#      │
+#  172 │   Found(w.start, w.end, groups)
+#      │                         ───┬──  
+#      │                            ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `Outcome`, found `()`
+#     ╭─[ src/vm.emel:80:3 ]
+#     │
+#  80 │   if pos >= input.length() or (next.is_empty() and best.is_some()) {
+#     │   ──────────────────────┬─────────────────────  
+#     │                         ╰─────────────────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vm.emel:102:7 ]
+#      │
+#  102 │ ╭─▶       if seen.contains((t.pc, t.left)) {
+#      ┆ ┆   
+#  104 │ ├─▶       } else {
+#      │ │                    
+#      │ ╰──────────────────── 
+# ─────╯
+#
+# 67 errors, 2 warnings
+# --- end wish check ---
