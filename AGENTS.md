@@ -28,7 +28,7 @@ kbdcast は、端末アプリのデモ GIF を、操作を書いた tape から�
 新しい単位（モジュール、effect、主要な関数）を書くときは:
 
 1. spec を調べる前に、推測の文法で「こう書きたい」コードを `wish/<name>.emel` に書く。先頭に `# wish-target: <置く予定の repo からの相対パス>` を書く。
-2. `mise exec -- bun tools/wish.ts check wish/<name>.emel` を走らせる。診断がファイルの末尾に貼られる。
+2. `mise exec -- bun tools/wish.ts check wish/<name>.emel` を走らせる。診断がファイルの末尾に貼られる。Pome がまだ無ければ、wish check が仮の Pome.toml を置く。
 3. wish だけを commit する。
 4. それから spec を調べ、`src/` に実装する。wish と実装が違ったら、その差が回り道かどうかを判断する。
 

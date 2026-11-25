@@ -1,10 +1,11 @@
 #!/usr/bin/env bun
 // `mise exec -- bun tools/wish.ts check wish/<name>.emel`: checks a wish in place of the module it describes, in a copy of the repo,
 // and writes the diagnostics into a block at the end of the wish.
+// When no Pome.toml is above the wish-target yet, the copy gets a provisional one (see provisionalManifest).
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { parseEmelaVersion, runEmela } from "./lib/emela";
+import { parseEmelaVersion, pinnedEmelaVersion, runEmela } from "./lib/emela";
 
 const ROOT = resolve(import.meta.dir, "..");
 const SKIP: Record<string, true> = { ".git": true, target: true, tmp: true, node_modules: true };
@@ -23,9 +24,31 @@ export function stripDiagnostics(text: string): string {
   return `${[...lines.slice(0, begin), ...(end === -1 ? [] : lines.slice(end + 1))].join("\n").trimEnd()}\n`;
 }
 
-export function withDiagnostics(body: string, version: string, output: string): string {
+// `provisional` is the repo-relative path of a Pome.toml that the check placed in the copy, reported on the first line of the block.
+export function withDiagnostics(body: string, version: string, output: string, provisional?: string): string {
   const diagnostics = output.trim() === "" ? ["# (診断なし)"] : output.trimEnd().split("\n").map((l) => (l === "" ? "#" : `# ${l}`));
-  return `${body.trimEnd()}\n\n${BEGIN} (emela ${version}) ---\n${diagnostics.join("\n")}\n${END}\n`;
+  const note = provisional === undefined ? [] : [`# (Pome.toml は wish check が仮に置いた: ${provisional})`];
+  return `${body.trimEnd()}\n\n${BEGIN} (emela ${version}) ---\n${[...note, ...diagnostics].join("\n")}\n${END}\n`;
+}
+
+// The Pome of a wish whose Pome does not exist yet: the directory before the first `src` or `test` segment of the target.
+// Undefined when the target has neither segment.
+export function provisionalManifest(target: string, emelaVersion: string): { path: string; text: string } | undefined {
+  const segments = target.split("/");
+  const at = segments.findIndex((s) => s === "src" || s === "test");
+  if (at === -1) return undefined;
+  const dir = segments.slice(0, at);
+  const name = ["github.com/kisepichu/kbdcast", ...dir].join("/");
+  return { path: [...dir, "Pome.toml"].join("/"), text: `[pome]\nname = "${name}"\nversion = "0.1.0"\nemela = "${emelaVersion}"\n` };
+}
+
+// The nearest directory from `from` up to `copy` that holds a Pome.toml.
+function findPome(copy: string, from: string): string | undefined {
+  for (let dir = from; ; dir = dirname(dir)) {
+    if (existsSync(join(dir, "Pome.toml"))) return dir;
+    // Stop at the filesystem root as well, in case the walk never meets `copy`.
+    if (dir === copy || dirname(dir) === dir) return undefined;
+  }
 }
 
 export function checkWish(root: string, wishPath: string): string {
@@ -42,17 +65,23 @@ export function checkWish(root: string, wishPath: string): string {
     if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) throw new Error(`${target} が repo の外を指している`);
     mkdirSync(dirname(placed), { recursive: true });
     writeFileSync(placed, body);
-    let pome = dirname(placed);
-    while (!existsSync(join(pome, "Pome.toml"))) {
-      // Stop at the filesystem root as well, in case the walk never meets `copy`.
-      if (pome === copy || dirname(pome) === pome) throw new Error(`${target} を含む Pome（Pome.toml）が無い`);
-      pome = dirname(pome);
+    let pome = findPome(copy, dirname(placed));
+    let provisional: string | undefined;
+    if (pome === undefined) {
+      const pinned = pinnedEmelaVersion(readFileSync(join(root, "mise.toml"), "utf8"));
+      if (!pinned) throw new Error('mise.toml に "github:emela-lang/emela" の版が書かれていない');
+      // `rel` is the target normalized, so `./text/src/a.emel` still names the Pome `text`.
+      const manifest = provisionalManifest(rel, pinned);
+      if (!manifest) throw new Error(`${target} を含む Pome（Pome.toml）が無い`);
+      writeFileSync(join(copy, manifest.path), manifest.text);
+      pome = dirname(join(copy, manifest.path));
+      provisional = manifest.path;
     }
     const install = runEmela(["pome", "install"], pome);
     const check = runEmela(["check", "."], pome);
     const output = `${install.code === 0 ? "" : install.stdout + install.stderr}${check.stdout}${check.stderr}`.replaceAll(copy, "<repo>");
     const version = parseEmelaVersion(runEmela(["--version"], root).stdout) ?? "unknown";
-    writeFileSync(file, withDiagnostics(body, version, output));
+    writeFileSync(file, withDiagnostics(body, version, output, provisional));
     return output;
   } finally {
     rmSync(copy, { recursive: true, force: true });
