@@ -22,7 +22,7 @@
   - std の `Std.Bytes.hex_value` と `Std.Http.is_token`: `0x30`、`0x61`、`0x41` などを素の 16 進で書く
   - std の `Std.Json`: code point を 1 文字の String にしてから（`s.code_points().filter_map(String.from_code_point)`）string の literal のパターンで比べ、数に戻すのに `c.code_points().fold(0, |_, p| p)` を書く
   class（`regex/src/class.emel` の `DIGIT`、`ASCII_WORD`、`LINE_TERMINATOR`、`FRICTION(013)` の印）: 範囲の表なので const の名前は付けず、16 進の literal に文字を書いた行末のコメントを添えた（`Span(0x41, 0x5A), # A-Z`）。`regex/test/class_test.emel` も同じ書き方（`regex/test/fold_test.emel` と同じく印は付けない）
-  vm（`regex/src/vm.emel` の `is_line_terminator`、`FRICTION(013)` の印）: `c == 0x0A || c == 0x0D || c == 0x2028 || c == 0x2029 # \n \r LS PS`。`Class` の `LINE_TERMINATOR` は private なので、同じ 4 つを書き直した
+  vm（`regex/src/vm.emel` の `is_line_terminator`、`FRICTION(013)` の印）: `c == 0x0A || c == 0x0D || c == 0x2028 || c == 0x2029 # \n \r LS PS`。`Class` の `LINE_TERMINATOR` は private なので、同じ 4 つを書き直した。`regex/test/linear_test.emel` も同じ書き方（`Array.repeat(0x61, n) # a`。`class_test` と `fold_test` と同じく印は付けない）
 - コスト:
   const の宣言が 51 行（ファイルの 570 行のうち）。読むときに名前と文字を対応させる必要がある。const の名前は大文字、数字、`_` だけ（`[lex.name]`）なので、`d` と `D` は `SMALL_D` と `CAPITAL_D` に書き分けた。性能のコストは無い。普段のコードに基盤レベルは漏れていない
   class では、9 つの文字を 16 進で書き、行末のコメントで文字を示した（7 行）

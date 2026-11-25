@@ -1,6 +1,9 @@
 # The Pike VM: runs a Program over an input of code points with the semantics of JavaScript's
 # RegExp with the `u` flag, in O(m·n) steps for a program of m instructions and an input of n code
-# points. m is the size of the unrolled program, which `Program.MAX_SIZE` bounds to 100_000.
+# points, each step O(log m): on JS there is no array with an O(1) update (`Array.set` copies), so
+# the set of the states already visited at a position, which drops duplicate threads, is a
+# `Std.Set` (friction 024). m is the size of the unrolled program, which `Program.MAX_SIZE` bounds
+# to 100_000.
 #
 # It follows Barrière and Pit-Claudel, "Linear Matching of JavaScript Regular Expressions" (PLDI
 # 2024, https://arxiv.org/abs/2311.17620):

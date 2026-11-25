@@ -30,7 +30,10 @@ fn a_star_over_alternatives_that_match_the_same_is_linear() {
   assert steps("(a|a)*b", 4000) * 2 <= steps("(a|a)*b", 2000) * 5
 }
 
+# `b` is not in the input, so the search cannot stop at an early match: the work must grow, and
+# this test also checks that it takes at least 1.5 times as much.
 @test
 fn optional_copies_before_mandatory_ones_are_linear() {
-  assert steps("(a?){30}a{30}", 4000) * 2 <= steps("(a?){30}a{30}", 2000) * 5
+  assert steps("(a?){30}a{30}b", 4000) * 2 <= steps("(a?){30}a{30}b", 2000) * 5
+  assert steps("(a?){30}a{30}b", 4000) * 2 >= steps("(a?){30}a{30}b", 2000) * 3
 }
