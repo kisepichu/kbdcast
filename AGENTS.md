@@ -55,6 +55,8 @@ kbdcast は、端末アプリのデモ GIF を、操作を書いた tape から�
 
 core、text、regex、cli の `src/` で基盤レベルのキーワードを書けるのは、`tools/lint/foundation.allow` に理由と一緒に登録したモジュールだけ。登録するのは、設計として選んだもの（ドメインの port にする effect など）。登録の理由と実際の使い方がずれたら、それも回り道として記録する。
 
+各 Pome の `test/` はこの規則の外にある（lint の対象でもない）。Test 用の handler、正解役を呼ぶ `@external`、テストする library の error を伝える `fails`（`fails RegexSyntax` を書いた補助関数など）は、回り道として記録しなくてよい。ただし、テストを書くために library の側に回り道が要ったなら、それは記録する。
+
 ### 4. 検査
 
 - clone したら一度 `mise install` と `mise exec -- prek install` を走らせる。
