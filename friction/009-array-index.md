@@ -12,7 +12,7 @@
   ```
   regex の class（`wish/class.emel`、計画の Task 5）でも、`:70` の `hits[i]` と `TARGETS[i]`（`canonicalize` で、set に入る source の印と target を、target の順に並べた表の位置で読む）、`:105` の `spans[mid]`（`contains` の手書きの二分探索）に添字を書いた
   regex の vm（`wish/vm.emel`、計画の Task 6）でも、`:109` の `prog.insts[t.pc]`（スレッドの命令を読む）、`:111`、`:137`、`:138`、`:145` の `input[pos]`、`input[pos - 1]`、`input[i]`（入力の code point を読む）、`:164` の `prog.enclosing[g]` に添字を書いた
-  regex の時間のテスト（`regex/test/linear_test.emel` の `replace_builds_its_result_in_time_proportional_to_the_matches`、friction-review の後の修正）でも、10 回の時間を並べ替えた List の中央値を `(sorted[4] + sorted[5]) / 2` と読みたかった。テストの中の 1 行で新しい単位ではないので、wish は書いていない
+  regex の時間のテスト（`regex/test/linear_test.emel` の `replace_builds_its_result_in_time_proportional_to_the_matches` と、それが使う `took`、friction-review の後の修正）でも、10 回の時間を並べ替えた List の中央値を `(sorted[4] + sorted[5]) / 2` と読みたかった。テストの中の 1 行で新しい単位ではないので、wish は書いていない
 - 診断:
   wish check（emela 0.28.2）の 14 行目の診断は `=>` のもの（``error[E0110]: expected `->` `` ほか 2 つ）だけで、`TARGETS[i]` には何も出なかった。`[grammar.expr]` の `postfix` に添字の形は無く、位置で読むのは `Array.get(a, index) -> Option[A]` だけ
   class の wish check（v0.28.2）では、`:75` の `sort_by(fn(i) { TARGETS[i] })` に E0148 と ``error[E0301]: type mismatch: expected `fn(Int, Int) -> Ordering`, found `fn(?5) -> List[Int]` `` が出た（本体の値が `[i]` の List と読まれている）。添字が無いとは言わない。`:70` と `:105` には届かなかった（`let` の 004 と、`=` で書いた関数の本体の 020）
@@ -32,9 +32,9 @@
 - コスト:
   起きない分岐 1 つ（3 行）。普段のコードに基盤レベルは漏れていない。std も同じ形を書いている: `Std.Array` の `bisect` と `binary_search`（`crates/emela-core/lib/std/array.emel:154-174`）は、範囲内と分かっている `get(a, mid)` の `None` を `_` の腕に混ぜる。`proposals/array.md:76` の例は `Array.get(counts, b) |> Option.or(0)` で既定値にする
   class でも vm でも、起きない分岐 1 つ（印のコメントを含めて 3 行）
-  テストでは、`Assert.some(...)` で包むだけで行は増えない（印のコメント 1 行）
+  テストでは、`Assert.some(...)` で包むだけで式の行は増えない（印のコメント 1 行と、`Assert` のための `import Brix.Assert` 1 行）
 - spec:
-  `[api.std.array]`（`get` は範囲外で `None`、`set` は範囲外で defect）、`[lib.api-rules]`（「Not found, or out of range: return an Option」と「A precondition of the caller is broken: it is a defect」）、`proposals/array.md:100`（読み出しの範囲外は not found、書き込みの範囲外は defect）と `:226`（`set` を Option にしなかった理由）、`[grammar.expr]`
+  `[api.std.array]`（`get` は範囲外で `None`、`set` は範囲外で defect）、`[api.list]`（テストの List の所。`List.get` も範囲外と負の位置で `None`）、`[lib.api-rules]`（「Not found, or out of range: return an Option」と「A precondition of the caller is broken: it is a defect」）、`proposals/array.md:100`（読み出しの範囲外は not found、書き込みの範囲外は defect）と `:226`（`set` を Option にしなかった理由）、`[grammar.expr]`
 - 既存:
   emela の issue に無い（「Array get index」「unchecked」で検索、2026-11-25。#855 は compiler が範囲を誤って証明する bug で、API の話ではない）。`proposals/` と `spec/open-questions.md` にも無い。003（scalar value と分かっている code point の String）と同じく、呼ぶ側が前提を知っているのに Option が返る形
 - 行き先: 前提の範囲内で spec に足りない → proposal の下書きの材料。`set` と同じく範囲外を defect にする読み出し（仮に `Array.at(a, index) -> A`）があれば、wish の形に近く書ける。regex の class（Task 5）で 2 か所目、vm（Task 6）で 3 か所目（命令の Array を位置で読む所）が出たので、下書きにする。未提出。出すのは user

@@ -43,6 +43,7 @@ check("a(?<=b)") # "lookbehind is not supported at 1"
 - `Flags(ignore_case: Bool, multiline: Bool, dot_all: Bool)` は JS の `i`，`m`，`s`．`NO_FLAGS` はどれも立てない値で，`Flags(ignore_case: True, ..NO_FLAGS)` のように一部だけを立てる
 - `RegexSyntax(message: String, offset: Int)` の `offset` は pattern の先頭からのコードポイントの数で，断った構文の始まり（閉じていない group と class は，開きの `(` と `[`）を指す．`pattern too large` だけは 0
 - `Regex` と `Match` は opaque．`Match` の関数は `m.text()` のように呼べる
+- `Match` は入力の全体をコードポイントの Array で持つ．`Match` を持ち続けると，それが一致した入力の全体も残る
 
 ## 受け付けるもの
 
