@@ -2,7 +2,7 @@
 
 - 状態: open
 - Emela: v0.28.2
-- 意図: regex で一致した範囲（code point の offset）の文字列を取り出す．code point の List から文字列を組み立てる
+- 意図: regex で一致した範囲（code point の offset）の文字列を取り出す．code point の List から文字列を組み立てる．kbdcast の regex の spec（`docs/superpowers/specs/2026-11-25-kbdcast-R-regex-design.md` §4，§10）が「String の部分文字列の関数が無い」として予想していた friction
 - こう書きたかった:
   std の関数として `String.slice(s, from, to)` と `String.from_code_points(cps)` を呼ぶ．std の外で書くなら `wish/text.emel` の形（`String.code_points` を `List.drop` と `List.take` で切り，`String.from_scalars` で戻す）
 - 診断:

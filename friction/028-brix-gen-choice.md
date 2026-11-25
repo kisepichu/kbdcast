@@ -2,7 +2,7 @@
 
 - 状態: open
 - Emela: v0.28.2（brix v0.4.0）
-- 意図: regex の差分テスト（`regex/test/differential_test.emel`、計画の Task 8）で、受け付ける文法（spec §6）の AST をランダムに作り、pattern の文字列に書き出す生成器を brix の `Gen` で書く。AST の種類（文字、`.`、class、連接、選択、繰り返し、group など）から 1 つを選び、深さ 4 までで再帰し、連接の項（2〜3）、class の item（1〜3）、繰り返しの回数（0〜3）、入力の長さ（0〜8）に上限と下限を付ける
+- 意図: regex の差分テスト（`regex/test/differential_test.emel`、計画の Task 8）で、受け付ける文法（spec §6）の AST をランダムに作り、pattern の文字列に書き出す生成器を brix の `Gen` で書く。AST の種類（文字、`.`、class、連接、選択、繰り返し、group など）から 1 つを選び、深さ 4 までで再帰し、連接の項（2〜3）、class の item（1〜3）、繰り返しの回数（0〜3）、入力の長さ（0〜8）に上限と下限を付ける。kbdcast の regex の spec（`docs/superpowers/specs/2026-11-25-kbdcast-R-regex-design.md` §9、§10）が「brix の pbt の組み合わせの関数」として予想していた friction
 - こう書きたかった:
   `wish/pattern_gen.emel`（brix を読む前に書いた）。候補から選ぶ `gen.element(ALPHABET)`（`:29`、`:36`、`:45`、`:62`）、生成器から選ぶ `gen.one_of([...])`（`:33`、`:41`、`:50`）と重み付きの `gen.frequency([(3, leaf()), ...])`（`:70`）、値から次の生成器を作る `gen.int(0, 3).flat_map(|n| gen.int(n, 3)...)`（`:54`）、長さに上下限のある `gen.list(sub, 2, 3)`（`:44`、`:62`、`:72`、`:90`）、`gen.bool()`（`:44`、`:74`、`:86`）、`gen.option(name_prefix())`（`:75`）。QuickCheck の `elements`、`oneof`、`frequency`、`>>=`、Hedgehog の `Gen.element`、`Gen.choice`、`Gen.frequency`、`Gen.list (Range.linear 0 8)` のつもり
   ```emela

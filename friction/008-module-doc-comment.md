@@ -14,7 +14,7 @@
   - regex（計画の Task 3 の Step 2、「モジュールの doc comment だけの骨組み」）: `regex/src/lib.emel` の先頭も同じ形（`FRICTION(008)` の印）。wish は書いていない（計画が `#` の形を指定した）
   - regex の syntax（計画の Task 4）: wish（`wish/syntax.emel:3-5`）はモジュールの説明をファイルの先頭の `##` の 3 行に書いた（`##` は次の宣言に付くので、モジュールの doc にはならない）。`regex/src/syntax.emel` の先頭は `#` のコメントにした（`FRICTION(008)` の印）
   - regex の class（計画の Task 5）: wish（`wish/class.emel:3-5`）も、モジュールの説明をファイルの先頭の `##` の 3 行に書いた（wish check は何も言わない）。`regex/src/class.emel` の先頭は `#` のコメントにした（`FRICTION(008)` の印）
-  - regex の vm と公開 API（計画の Task 6）: wish（`wish/vm.emel:3-27`、`wish/lib.emel:3-5`）も、モジュールの説明をファイルの先頭の `##` に書いた（wish check は何も言わない）。計画は「論文のどの節に従うかを、`vm.emel` の doc comment に書く」と求めるが、`regex/src/vm.emel` の先頭は `#` のコメントにした。`regex/src/program.emel` と `regex/src/lib.emel` の先頭も同じ（3 つとも `FRICTION(008)` の印）。`vm.emel` の説明（論文の節、扱う範囲の違い、O(m·n) の m）は印を含めて 36 行あり、`emela doc` にも hover にも出ない
+  - regex の vm と公開 API（計画の Task 6）: wish（`wish/vm.emel:3-27`、`wish/lib.emel:3-5`）も、モジュールの説明をファイルの先頭の `##` に書いた（wish check は何も言わない）。計画は「論文のどの節に従うかを、`vm.emel` の doc comment に書く」と求めるが、`regex/src/vm.emel` の先頭は `#` のコメントにした。`regex/src/program.emel` と `regex/src/lib.emel` の先頭も同じ（3 つとも `FRICTION(008)` の印）。`vm.emel` の説明（論文の節、扱う範囲の違い、O(m·n) の m と 1 歩の O(log m)）は印を含めて 39 行あり、`emela doc` にも hover にも出ない
 - コスト: 計画の「モジュールの doc comment」を、生成した文書に出ないコメントで代えた。`emela doc` の文書にも hover にもモジュールの説明が出ない。std も同じ書き方なので、std のモジュールの説明も生成した文書には出ない。普段のコードに基盤レベルは漏れていない
 - spec:
   `[lex.comment]`（`spec/language/02-lexical.md:14`: 「`##` is a doc comment. It attaches to the declaration, local fn, variant, field, effect operation, or handler item that immediately follows it.」。モジュールは入っていない）、`[lsp.doc]`。`emela doc` の節は `spec/tooling/commands.md` に無い（`04-modules.md:181` と `lsp.md:240` で触れているだけ）
