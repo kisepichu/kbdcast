@@ -19,7 +19,9 @@
   4 行で 8 つ。そのあと、束縛されなかった名前を使う `wish/text.emel:43` に ``error[E0211]: cannot find value `cps` in this scope`` と同じ形のものが 4 つ（`cps`、`start`、`stop`、`start`）続く。wish check の 14 の診断のうち 12 がこの 1 つの誤りから出ている。どれにも help も note も付かず、「Emela に `let` は無い、`x = value` と書く」とは言わない
 
   regex の wish（`wish/syntax.emel`、計画の Task 4）でも、31 行に `let` を書いた。`let` を指す E0118 が 20（残りは同じ行の他の構文エラーに埋もれた）、束縛されなかった名前の E0211 が 20 以上（`s1` が 9、`open` が 4 など）。char literal の診断（013）と混ざり、780 の診断の中で `let` が原因のものを見分けにくかった
-- 回避策: `let` を消して `start = Int.max(from, 0)` と書いた（`text/src/lib.emel` の `slice`）。regex の `regex/src/syntax.emel` も同じく `let` を消した。正しい構文に直しただけなので、コードに印は付けない
+
+  regex の class の wish（`wish/class.emel`、計画の Task 5）でも、11 行に `let` を書いた（`:40`、`:68-70`、`:104-105`、`:115`、`:118`、`:121-123`）。診断が届いたのは `:40` と `:68-70` の 4 行で、1 行ごとに E0118 と E0122 が 1 つずつ（8 つ）と、束縛されなかった名前の E0211 が 4（`ascii` が 2、`kept`、`folded`）。残りの 7 行は、`=` で書いた関数の本体（020）の中にあり、本体ごと読まれなかった
+- 回避策: `let` を消して `start = Int.max(from, 0)` と書いた（`text/src/lib.emel` の `slice`）。regex の `regex/src/syntax.emel` と `regex/src/class.emel` も同じく `let` を消した。正しい構文に直しただけなので、コードに印は付けない
 - コスト:
   コードのコストは無い。直すには spec を引く必要があった。診断から分かるのは `let` が式として読めないことだけで、wish-first（AGENTS.md 規則 1）では spec を読む前に wish を書くので、そのときの手がかりは診断しかない。後に続く 4 つの E0211 は束縛の失敗の後追いで、wish の本当の診断（`String.from_scalars` の E0212、003）を埋もれさせる
 - spec:

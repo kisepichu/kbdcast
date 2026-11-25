@@ -1,0 +1,142 @@
+import Class.{CharSet, EMPTY, DIGIT, SPACE}
+import Fold
+import FoldTable.{SOURCES, TARGETS}
+
+@test
+fn range_is_empty_when_from_is_greater_than_to() {
+  assert Class.range(0x62, 0x61) == EMPTY
+  assert !Class.range(0x62, 0x61).contains(0x61)
+  assert Class.range(0x61, 0x61) == Class.single(0x61)
+}
+
+@test
+fn union_contains_what_either_contains() {
+  both = Class.range(0x61, 0x63).union(Class.range(0x62, 0x65)) # [a-c] and [b-e]
+  assert both.contains(0x61)
+  assert both.contains(0x65)
+  assert !both.contains(0x66)
+}
+
+@test
+fn union_joins_spans_that_touch_so_that_equal_sets_are_equal() {
+  assert Class.range(0x61, 0x63).union(Class.range(0x64, 0x66)) == Class.range(0x61, 0x66)
+  assert Class.range(0x64, 0x66).union(Class.single(0x61)) != Class.range(0x61, 0x66)
+  assert EMPTY.union(Class.single(0x61)) == Class.single(0x61)
+}
+
+@test
+fn complement_is_taken_in_all_code_points() {
+  assert !Class.range(0, 0x10FFFF).complement().contains(0x61)
+  assert Class.range(0, 0x10FFFF).complement() == EMPTY
+  assert EMPTY.complement() == Class.range(0, 0x10FFFF)
+  gaps = Class.range(0x10, 0x20).union(Class.single(0x10FFFF)).complement()
+  assert gaps.contains(0)
+  assert gaps.contains(0xF)
+  assert !gaps.contains(0x10)
+  assert !gaps.contains(0x20)
+  assert gaps.contains(0x21)
+  assert gaps.contains(0x10FFFE)
+  assert !gaps.contains(0x10FFFF)
+}
+
+@test
+fn digit_is_the_ascii_digits() {
+  assert DIGIT.contains(0x30) # 0
+  assert DIGIT.contains(0x39) # 9
+  assert !DIGIT.contains(0x61) # a
+  assert !DIGIT.contains(0x660) # ARABIC-INDIC DIGIT ZERO
+}
+
+@test
+fn word_is_the_ascii_word_characters() {
+  word = Class.word(ignore_case: False)
+  assert word.contains(0x61) # a
+  assert word.contains(0x5A) # Z
+  assert word.contains(0x5F) # _
+  assert word.contains(0x30) # 0
+  assert !word.contains(0x17F) # LATIN SMALL LETTER LONG S
+  assert !word.contains(0x212A) # KELVIN SIGN
+  assert !word.contains(0x2D) # -
+}
+
+@test
+fn word_with_ignore_case_adds_what_folds_to_an_ascii_word_character() {
+  word = Class.word(ignore_case: True)
+  assert word.contains(0x17F) # LATIN SMALL LETTER LONG S
+  assert word.contains(0x212A) # KELVIN SIGN
+  assert !word.contains(0x2D) # -
+}
+
+@test
+fn word_with_ignore_case_is_every_character_that_folds_into_word() {
+  ascii = Class.word(ignore_case: False)
+  folded = Class.word(ignore_case: True)
+  List.zip(SOURCES, TARGETS).each(|(source, target)| {
+    assert folded.contains(source) == (ascii.contains(source) || ascii.contains(target))
+  })
+}
+
+@test
+fn space_is_white_space_and_line_terminators() {
+  assert SPACE.contains(0x20) # SPACE
+  assert SPACE.contains(0x9) # TAB
+  assert SPACE.contains(0xA) # LF
+  assert SPACE.contains(0x3000) # IDEOGRAPHIC SPACE
+  assert SPACE.contains(0xFEFF) # ZWNBSP
+  assert SPACE.contains(0x2028) # LS
+  assert !SPACE.contains(0x61) # a
+  # Just outside its spans.
+  assert !SPACE.contains(0x8)
+  assert !SPACE.contains(0xE)
+  assert !SPACE.contains(0x200B) # ZERO WIDTH SPACE is not Zs
+  assert !SPACE.contains(0x180E) # MONGOLIAN VOWEL SEPARATOR left Zs in Unicode 6.3
+}
+
+@test
+fn dot_leaves_out_line_terminators_unless_dot_all() {
+  dot = Class.dot(dot_all: False)
+  assert dot.contains(0x61) # a
+  assert dot.contains(0x1F600)
+  assert !dot.contains(0xA) # \n
+  assert !dot.contains(0xD) # \r
+  assert !dot.contains(0x2028)
+  assert !dot.contains(0x2029)
+}
+
+@test
+fn dot_with_dot_all_is_every_code_point() {
+  assert Class.dot(dot_all: True).contains(0xA) # \n
+  assert Class.dot(dot_all: True) == Class.range(0, 0x10FFFF)
+}
+
+@test
+fn canonicalize_maps_a_set_to_the_canonical_forms_of_its_members() {
+  lower = Class.range(0x61, 0x7A).canonicalize() # [a-z]
+  assert lower.contains(0x6B) # k
+  assert lower.contains(Fold.canonicalize(0x212A)) # KELVIN SIGN folds to k
+  assert !lower.contains(0x4B) # K, compared without canonicalizing it
+}
+
+@test
+fn canonicalize_replaces_the_sources_of_the_table_with_their_targets() {
+  assert Class.range(0x41, 0x5A).canonicalize() == Class.range(0x61, 0x7A) # [A-Z] is [a-z]
+  assert Class.single(0x212A).canonicalize() == Class.single(0x6B)
+  # A span that starts and ends just outside the sources it holds.
+  assert Class.range(0x40, 0x5B).canonicalize()
+    == Class.single(0x40).union(Class.single(0x5B)).union(Class.range(0x61, 0x7A))
+  # SPACE holds no source.
+  assert SPACE.canonicalize() == SPACE
+}
+
+@test
+fn canonicalize_of_every_code_point_leaves_out_every_source() {
+  all: CharSet = Class.dot(dot_all: True).canonicalize()
+  SOURCES.each(|source| {
+    assert !all.contains(source)
+  })
+  TARGETS.each(|target| {
+    assert all.contains(target)
+  })
+  assert all.contains(0)
+  assert all.contains(0x10FFFF)
+}
