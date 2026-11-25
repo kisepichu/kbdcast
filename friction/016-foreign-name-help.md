@@ -2,9 +2,9 @@
 
 - 状態: open
 - Emela: v0.28.2
-- 意図: regex の parser（`wish/syntax.emel`）で、error で失敗する、Bool の値を書く、Option の中身を既定値つきで取り出す、という他の言語にもある操作を書く
+- 意図: regex の wish（parser の `wish/syntax.emel`、class の `wish/class.emel`、vm と公開 API の `wish/vm.emel` と `wish/lib.emel`、find_all、replace、split の `wish/find_all.emel`、差分テストの `wish/pattern_gen.emel` と `wish/differential.emel`。計画の Task 4〜8）で、他の言語にもある操作を書く: error で失敗する、error を受ける、Bool の値と演算を書く、Option の中身を既定値つきで取り出す・写す・平らにする・条件で残す、List を Array にする、List と String をつなぐ、Array の長さと範囲を取る、2 つの Int の大きい方を取る、match の腕を 1 行に並べる、テストを宣言する
 - こう書きたかった:
-  他の言語の名前で書いた（Python、Ruby、Kotlin の `raise`、多くの言語の `false`、Rust の `unwrap_or`）
+  他の言語の名前と構文で書いた（Python、Ruby、Kotlin の `raise`、多くの言語の `false`、Rust の `unwrap_or`、Haskell の `++`、Python の `or` と `and`、Kotlin の `catch`、Zig の `test "name"` など）。wish ごとの内訳:
   - `raise RegexSyntax(...)`: `wish/syntax.emel` の 29 行（`:60`、`:115`、`:234` など）
   - `false`: `:155`、`:158`、`:162`、`:359`
   - `.unwrap_or(...)`: `:155`、`:158`、`:192`、`:336`
@@ -28,7 +28,7 @@
   - 差分テストの wish check（v0.28.2、Task 8）: String の `++` に ``E0310: expected a number (`Int`, `Int64` or `Float`), found `String` `` が 9 と、2 つ目の `+` を指す E0118 と E0110。`;` に ``E0105: unrecognized character `;` `` が 2。`test "..." {` に ``E0126: expected declaration`` の 1 つ。repo の外の使い捨ての Pome での最小の形（2026-11-25）: `x match { 0 -> 0; _ -> 1 }` は ``E0105: unrecognized character `;` ``、``E0122: expected newline or `}` after match arm``、``E0303: non-exhaustive match: pattern `_` not covered`` の 3 つ（`;` の後ろを捨てたので `_` の腕が無いと言う）。`test "id returns its argument" { assert id(1) == 1 }` は E0126 の 1 つ。どれにも help が付かず、補間の `"#{a}#{b}"`、改行で区切る腕、`@test fn name() { ... }` を示さない
   どれにも help が付かず、`fail`、`False`、`Option.or`、`Array.from_list`、`List.append`、`Int.max` を示さない
 - 回避策: 正しい名前に直した（`fail`、`False`、`.or`。`regex/src/syntax.emel`。`Array.from_list(xs)`、`Int.max(a, b)`、List をつなぐ所は `xs.append(ys)`。`regex/src/class.emel`）。`before ++ kept` の行そのものは、021 の書き換え（`before` を逆順の accumulator に cons する）で消えた。vm と公開 API（Task 6）は `||`、`&&`、`escape`、Array の `.size()`、`List.range(1, n)` の結果を `Array.from_list`、`.append` に直し、`.flatten()` の所は `get(index - 1) match { Some(Some((from, to))) -> ...; _ -> None }` と入れ子のパターンで書いた（Option に `flatten` は無い。`and_then(|g| g)` でも書けるが、パターンの方が短い）。`.map_or` の所は、量指定子を番号で引く表をやめる設計の変更で要らなくなった。正しい書き方に直しただけなので、コードに印は付けない
-  find_all、replace、split（Task 7、`regex/src/lib.emel`）は、Array の `.size()` と `.is_empty()` に直した。`replace` の `pieces ++ [...]` は、`fold` の中で `append` すると一致の数 k に対して O(k²) になるので、std の `List.map` と同じく逆順に cons して最後に `reverse` した（`[f(m), Text.slice(s, at, m.start()), ..pieces]`）。wish の `++` の形も O(k²) だったので、ここは回り道に数えない。Option の `filter` は名前を直すだけでは済まない（Option に `filter` は無い）ので、`split_from` で、検索の結果を `Some(found) if found.start < input.size() -> Some(found)` と `_ -> None` の 2 つの腕の match で `cut` に束ね、その `cut` を wish の腕で分けた。この 1 か所は書き方が変わったので、`FRICTION(016)` の印を付けた
+  find_all、replace、split（Task 7、`regex/src/lib.emel`）は、Array の `.size()` と `.is_empty()` に直した。`replace` の `pieces ++ [...]` は、`fold` の中で `append` すると一致の数 k に対して O(k²) になるので、std の `List.map` と同じく逆順に cons して最後に `reverse` した（`[f(m), string_of(input, at, m.start()), ..pieces]`。Task 7 では `string_of` の所が `Text.slice(s, at, m.start())` だった。002）。wish の `++` の形も O(k²) だったので、ここは回り道に数えない。Option の `filter` は名前を直すだけでは済まない（Option に `filter` は無い）ので、`split_from` で、検索の結果を `Some(found) if found.start < input.size() -> Some(found)` と `_ -> None` の 2 つの腕の match で `cut` に束ね、その `cut` を wish の腕で分けた。この 1 か所は書き方が変わったので、`FRICTION(016)` の印を付けた
   差分テストの生成器（Task 8、`regex/test/pattern_gen.emel`）は、String をつなぐ所を補間の `"#{a}#{b}"` と `List.join` にし、腕を 1 行に 1 つにした。テスト（`regex/test/differential_test.emel`）は `@test fn find_agrees_with_javascript()` にした。正しい書き方に直しただけなので、コードに印は付けない
 - コスト:
   コードのコストは無い（Task 7 の Option の `filter` の所だけは、束縛 1 つと 2 つの腕の match の 4 行が増えた）。直すには spec を引く必要があった（`[error.fail]`、`[lex.literal]` の「Boolean values are not literals. They are `True` and `False`」、`[api.option]`、`[fn.operator]` の演算子の表（`++` は無い）、`[lib.api-rules]` の「A function that joins two values is `append`」、`[api.int]` の `min` / `max`）。004（`let`）と同じく、wish-first（spec を読む前に wish を書く）では、そのときの手がかりは診断だけ

@@ -20,9 +20,9 @@
 - 診断:
   wish check（v0.28.2）: ``error[E0212]: module `List` has no `unfold` `` に ``= help: did you mean `fold`?`` が付く。`fold` は List を畳む関数で、List を作る `unfold` とは向きが逆なので、この help に従っても書けない（同じ closure の中の Array の `.length()` は 016）
 - 回避策:
-  private の再帰の関数 `matches_from(re, s, input, from, done)` を足し、closure の本体をその本体にした（`regex/src/lib.emel`。印は関数の直前のコメントの行）。closure が捕まえていた `re`、`s`、`input` を引数で渡す。自分への末尾呼び出しにするため、作りかけの結果を逆順で `done` に持ち、終わりの 2 か所で `reverse()` する（021）
+  private の再帰の関数 `matches_from(re, input, from, done)` を足し、closure の本体をその本体にした（`regex/src/lib.emel`。印は関数の直前のコメントの行）。closure が捕まえていた `re` と `input` を引数で渡す（Task 7 では `s` も渡していた。最終レビューのあとで `Match` が String でなく code point の Array を持つようにしたので要らなくなった。002）。自分への末尾呼び出しにするため、作りかけの結果を逆順で `done` に持ち、終わりの 2 か所で `reverse()` する（021）
   ```emela
-  fn matches_from(re: Regex, s: String, input: Array[Int], from: Int, done: List[Match]) -> List[Match] {
+  fn matches_from(re: Regex, input: Array[Int], from: Int, done: List[Match]) -> List[Match] {
     if from > input.size() {
       done.reverse()
     } else {
@@ -30,7 +30,7 @@
         None        -> done.reverse()
         Some(found) -> {
           next = if found.end == found.start { found.end + 1 } else { found.end }
-          matches_from(re, s, input, next, [Match(input: s, found:, names: re.names), ..done])
+          matches_from(re, input, next, [Match(input:, found:, names: re.names), ..done])
         }
       }
     }
@@ -38,7 +38,7 @@
   ```
   `replace` も、同じ code point の Array を使い回すため、`find_all` でなく `matches_from` を呼ぶ
 - コスト:
-  - 行数: wish の 12 行（`find_all` の本体）が、`find_all` の 1 行と、関数 1 つの 19 行（fmt が引数を 1 行に 1 つずつ折る）とその説明のコメント 2 行になった。終わりの 2 つの腕は同じ `done.reverse()`
+  - 行数: wish の 12 行（`find_all` の本体）が、`find_all` の 1 行と、関数 1 つの 13 行とその説明のコメント 2 行になった（Task 7 では引数が 5 つで、fmt が 1 行に 1 つずつ折って 19 行だった）。終わりの 2 つの腕は同じ `done.reverse()`
   - 性能: 一致の List をもう 1 回 `reverse` で作る。どちらも一致の数に比例するのは変わらない
   - 基盤レベルは漏れていない
 - spec:

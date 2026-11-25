@@ -11,7 +11,7 @@ kbdcast は、端末アプリのデモ GIF を、操作を書いた tape から�
 |---|---|---|
 | `/`（`src/`） | core。純粋な部分と effect を使う部分 | 置かない |
 | `text/` | std に足りない String の関数（std に入ったら消す） | 置かない |
-| `regex/` | 汎用の正規表現の Pome | 置かない |
+| `regex/` | 汎用の正規表現の Pome | 置かない（`test/` の正解役を除く） |
 | `pty/` | effect Pty の宣言だけ | 置かない |
 | `pty-bun/` | handler BunPty | ここだけ |
 | `cli/` | main | 置かない |
@@ -53,7 +53,7 @@ kbdcast は、端末アプリのデモ GIF を、操作を書いた tape から�
 
 ### 3. 基盤レベル
 
-core、regex、cli の `src/` で基盤レベルのキーワードを書けるのは、`tools/lint/foundation.allow` に理由と一緒に登録したモジュールだけ。登録するのは、設計として選んだもの（ドメインの port にする effect など）。登録の理由と実際の使い方がずれたら、それも回り道として記録する。
+core、text、regex、cli の `src/` で基盤レベルのキーワードを書けるのは、`tools/lint/foundation.allow` に理由と一緒に登録したモジュールだけ。登録するのは、設計として選んだもの（ドメインの port にする effect など）。登録の理由と実際の使い方がずれたら、それも回り道として記録する。
 
 ### 4. 検査
 

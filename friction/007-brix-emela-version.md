@@ -16,4 +16,4 @@
 - spec: `[module.pome]`（「A dependency for an older minor version is built with a warning」、`spec/language/04-modules.md:238-239`）、`spec/diagnostics.md` の W0203
 - 既存:
   brix の最新の tag は v0.4.0（a685c98b、2026-11-08「chore: emela 0.27.0 に上げる（v0.4.0）」）で、main の先頭も同じ commit。main の `Pome.toml` も `emela = "0.27.0"`。brix の issue は無く、PR は Renovate の設定（#1）だけ（`gh api repos/emela-lang/brix/tags` などで確認、2026-11-25）
-- 行き先: emela ではなく brix の版の追従 → brix への issue。下書き（未提出。出すのは user）: brix v0.4.0 の `Pome.toml` は `emela = "0.27.0"` なので、emela 0.28.x で brix を dev-dependencies に入れた Pome は `emela check` と `emela test` のたびに W0203 を出す。kbdcast の text Pome は 0.28.2 で `Property.check` と `Gen` を使い、brix の中でエラーは出ていない。`[pome].emela` を 0.28 に上げた版を tag してほしい
+- 行き先: ecosystem の Pome（brix、x）に足りない、または版が遅れている（emela ではなく brix の版の追従）→ brix への issue の下書き（未提出。出すのは user）: brix v0.4.0 の `Pome.toml` は `emela = "0.27.0"` なので、emela 0.28.x で brix を dev-dependencies に入れた Pome は `emela check` と `emela test` のたびに W0203 を出す。kbdcast の text Pome は 0.28.2 で `Property.check` と `Gen` を使い、brix の中でエラーは出ていない。`[pome].emela` を 0.28 に上げた版を tag してほしい

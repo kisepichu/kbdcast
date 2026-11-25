@@ -7,8 +7,10 @@ import Regex
 import Regex.{Flags, NO_FLAGS, RegexSyntax}
 
 re = Regex.compile("(?<y>\\d{4})-(?<m>\\d\\d)", NO_FLAGS)
-Regex.find(re, "on 2026-11")                          # Some(m)．m.start() は 3，m.text() は "2026-11"，m.named("m") は Some("11")
-Regex.replace(re, "on 2026-11", |m| "[#{m.text()}]") # "on [2026-11]"
+Regex.find(re, "on 2026-11").map(|m| m.start())         # Some(3)
+Regex.find(re, "on 2026-11").map(|m| m.text())          # Some("2026-11")
+Regex.find(re, "on 2026-11").and_then(|m| m.named("m")) # Some("11")
+Regex.replace(re, "on 2026-11", |m| "[#{m.text()}]")    # "on [2026-11]"
 
 Regex.is_match(Regex.compile("straße", Flags(ignore_case: True, ..NO_FLAGS)), "STRAẞE") # True
 
