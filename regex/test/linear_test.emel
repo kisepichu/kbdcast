@@ -1,5 +1,7 @@
+import Lib.{NO_FLAGS}
 import Program
 import Std.Array.{Array}
+import Std.Clock.{Clock, SystemClock}
 import Syntax.{RegexSyntax}
 import Vm
 
@@ -23,8 +25,8 @@ fn bound(pattern: String, n: Int) -> Int fails RegexSyntax {
   2 * program(pattern).insts.size() * (n + 1)
 }
 
-# Each test checks that the work stays within the bound, and that twice the input takes at most 2.5
-# times the work.
+# Each of the next three tests checks that the work stays within the bound, and that twice the
+# input takes at most 2.5 times the work.
 
 @test
 fn a_nested_star_is_linear() {
@@ -45,4 +47,30 @@ fn optional_copies_before_mandatory_ones_are_linear() {
   assert steps("(a?){30}a{30}b", 4000) <= bound("(a?){30}a{30}b", 4000)
   assert steps("(a?){30}a{30}b", 4000) * 2 <= steps("(a?){30}a{30}b", 2000) * 5
   assert steps("(a?){30}a{30}b", 4000) * 2 >= steps("(a?){30}a{30}b", 2000) * 3
+}
+
+# The vm counts the threads it processes but not the strings that `replace` builds, so this test
+# measures time. `find_all` finds the same matches without building strings, so `replace` taking at
+# most 4 times as long shows that building the result costs at most a constant factor over finding
+# the matches.
+@test
+fn replace_builds_its_result_in_time_proportional_to_the_matches() {
+  re = Lib.compile("a", NO_FLAGS)
+  # FRICTION(022): std has no `String.repeat`.
+  input = String.concat(List.range(0, 4000).map(|_| "a"))
+  with SystemClock {
+    clock = use Clock
+    # The milliseconds that 10 runs of `f` on `input` take.
+    took = |f| {
+      start = clock.now()
+      _ = List.range(0, 10).map(|_| f(input))
+      clock.now().since(start).to_milliseconds()
+    }
+    finding = |s| Lib.find_all(re, s).length()
+    replacing = |s| Lib.replace(re, s, |m| m.text()).code_points().length()
+    _ = [took(replacing), took(finding)] # warms up the JIT
+    replacing_ms = took(replacing)
+    finding_ms = took(finding)
+    assert replacing_ms <= finding_ms * 4
+  }
 }
