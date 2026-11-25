@@ -50,35 +50,38 @@ fn optional_copies_before_mandatory_ones_are_linear() {
   assert steps("(a?){30}a{30}b", 4000) * 2 >= steps("(a?){30}a{30}b", 2000) * 3
 }
 
+# The median of the milliseconds that each of 10 runs of `f` on `input` takes.
+fn took[A](input: String, f: fn(String) -> A) -> Int64 {
+  clock = use Clock
+  # FRICTION(032): std's Clock reads only the wall clock, which now and then steps forward, so each
+  # run is timed on its own and the median is taken.
+  times = List.range(0, 10).map(|_| {
+    start = clock.now()
+    _ = f(input)
+    clock.now().since(start).to_milliseconds()
+  })
+  sorted = times.sort()
+  # FRICTION(009): the positions are in range, but `List.get` returns an Option.
+  (Assert.some(sorted.get(4)) + Assert.some(sorted.get(5))) / 2
+}
+
 # The vm counts the threads it processes but not the strings that `replace` builds, so this test
 # measures time. `find_all` finds the same matches without building strings, so `replace` taking at
 # most 4 times as long shows that building the result costs at most a constant factor over finding
-# the matches. Each of the 10 runs is timed on its own and the medians are compared, because now and
-# then a single call stalls for about 3 s (in `find_all` as often as in `replace`): such a run moves
-# a sum of the 10 runs past the bound, but not their median.
+# the matches. Each of the 10 runs is timed on its own and the medians are compared, because the
+# wall clock that `SystemClock` reads (`Date.now()`) now and then steps forward by about 3 s: such a
+# step moves a sum of the 10 runs past the bound, but not their median.
 @test
 fn replace_builds_its_result_in_time_proportional_to_the_matches() {
   re = Lib.compile("a", NO_FLAGS)
   # FRICTION(022): std has no `String.repeat`.
   input = String.concat(List.range(0, 4000).map(|_| "a"))
   with SystemClock {
-    clock = use Clock
-    # The median of the milliseconds that each of 10 runs of `f` on `input` takes.
-    took = |f| {
-      times = List.range(0, 10).map(|_| {
-        start = clock.now()
-        _ = f(input)
-        clock.now().since(start).to_milliseconds()
-      })
-      sorted = times.sort()
-      # FRICTION(009): the positions are in range, but `List.get` returns an Option.
-      (Assert.some(sorted.get(4)) + Assert.some(sorted.get(5))) / 2
-    }
-    finding = |s| Lib.find_all(re, s).length()
-    replacing = |s| Lib.replace(re, s, |m| m.text()).code_points().length()
-    _ = [took(replacing), took(finding)] # warms up the JIT
-    replacing_ms = took(replacing)
-    finding_ms = took(finding)
+    finding = |s| Lib.find_all(re, s)
+    replacing = |s| Lib.replace(re, s, |m| m.text())
+    _ = [took(input, replacing), took(input, finding)] # warms up the JIT
+    replacing_ms = took(input, replacing)
+    finding_ms = took(input, finding)
     assert replacing_ms <= finding_ms * 4
   }
 }
