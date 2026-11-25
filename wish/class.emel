@@ -1,0 +1,841 @@
+# wish-target: regex/src/class.emel
+
+## code point の範囲の集合。
+## 範囲は小さい順に並び、重ならず、隣り合わない（[a-c] と [d-f] は [a-f] の 1 つにまとめる）。
+## program は、AST の class、class escape、`.`、文字をこれにして、照合のときに O(log 範囲の数) で引く。
+
+import FoldTable.{SOURCES, TARGETS}
+
+## Unicode の code point の最大値。
+const MAX: Int = 0x10FFFF
+
+## from 以上 to 以下の code point。from <= to。
+type Span(from: Int, to: Int) derive Eq, Show
+
+pub opaque type CharSet(spans: Array[Span]) derive Eq, Show
+
+pub const EMPTY: CharSet = CharSet([])
+
+const ALL: CharSet = CharSet([Span(0, MAX)])
+
+pub fn single(c: Int) -> CharSet = CharSet([Span(c, c)])
+
+## from 以上 to 以下。from <= to。
+pub fn range(from: Int, to: Int) -> CharSet = CharSet([Span(from, to)])
+
+pub fn union(a: CharSet, b: CharSet) -> CharSet =
+  CharSet(coalesce(merge(a.spans.to_list(), b.spans.to_list())).to_array())
+
+## 0 から 0x10FFFF の中での補集合。
+pub fn complement(set: CharSet) -> CharSet = CharSet(gaps(0, set.spans.to_list()).to_array())
+
+## 範囲の二分探索。O(log 範囲の数)。
+pub fn contains(set: CharSet, c: Int) -> Bool = search(set.spans, c, 0, set.spans.length())
+
+## \d
+pub const DIGIT: CharSet = range('0', '9')
+
+## \w。ignore_case では、正規化すると ASCII の word 文字になる U+017F（ſ）と U+212A（K）も含む（ECMAScript の WordCharacters）。
+pub fn word(ignore_case: Bool) -> CharSet {
+  let ascii = of_spans([Span('0', '9'), Span('A', 'Z'), Span('_', '_'), Span('a', 'z')])
+  if ignore_case { ascii.union(of_spans([Span(0x017F, 0x017F), Span(0x212A, 0x212A)])) } else { ascii }
+}
+
+## \s。ECMAScript の WhiteSpace（TAB、VT、FF、ZWNBSP、Zs）と LineTerminator（LF、CR、LS、PS）。
+pub const SPACE: CharSet = of_spans([
+  Span(0x0009, 0x000D),  # TAB LF VT FF CR
+  Span(0x0020, 0x0020),
+  Span(0x00A0, 0x00A0),
+  Span(0x1680, 0x1680),
+  Span(0x2000, 0x200A),
+  Span(0x2028, 0x2029),  # LS PS
+  Span(0x202F, 0x202F),
+  Span(0x205F, 0x205F),
+  Span(0x3000, 0x3000),
+  Span(0xFEFF, 0xFEFF),
+])
+
+## 行末の文字。
+const LINE_TERMINATOR: CharSet = of_spans([Span('\n', '\n'), Span('\r', '\r'), Span(0x2028, 0x2029)])
+
+## `.`。dot_all でなければ行末の文字を除く。
+pub fn dot(dot_all: Bool) -> CharSet = if dot_all { ALL } else { LINE_TERMINATOR.complement() }
+
+## ignore_case のための正規化: { Fold.canonicalize(a) | a ∈ set }。
+## 表に無い code point は自分自身に写る。そこで、set から表の source を除いた残りに、set に入る source の target を足す。
+## set の範囲と表を並べて歩き、set の要素を 1 つずつは回さない。O(範囲の数 + 表の大きさ)。
+pub fn canonicalize(set: CharSet) -> CharSet {
+  let (kept, hit) = remove_sources(set.spans.to_list(), SOURCES.to_list())
+  let hits = hit.to_array()  # hits[i]: SOURCES[i] が set に入るか
+  let folded = BY_TARGET.to_list().filter(fn(i) { hits[i] }).map(fn(i) { Span(TARGETS[i], TARGETS[i]) })
+  union(CharSet(kept.to_array()), CharSet(coalesce(folded).to_array()))
+}
+
+## 表の番号を target の順に並べたもの。
+const BY_TARGET: Array[Int] = List.range(0, SOURCES.length()).sort_by(fn(i) { TARGETS[i] }).to_array()
+
+## 範囲を順不同で受け取り、並べてまとめる。
+fn of_spans(spans: List[Span]) -> CharSet = CharSet(coalesce(spans.sort_by(fn(s) { s.from })).to_array())
+
+## from の順に並んだ 2 つの範囲の列を、from の順の 1 つの列にする。
+fn merge(a: List[Span], b: List[Span]) -> List[Span] = match (a, b) {
+  ([], _) => b
+  (_, []) => a
+  ([x, ..xs], [y, ..ys]) => if x.from <= y.from { [x, ..merge(xs, b)] } else { [y, ..merge(a, ys)] }
+}
+
+## from の順に並んだ範囲の列の、重なるか隣り合う範囲をまとめる。
+fn coalesce(spans: List[Span]) -> List[Span] = match spans {
+  [a, b, ..rest] if b.from <= a.to + 1 => coalesce([Span(a.from, max(a.to, b.to)), ..rest])
+  [a, ..rest] => [a, ..coalesce(rest)]
+  [] => []
+}
+
+## next 以上の、spans に入らない範囲。
+fn gaps(next: Int, spans: List[Span]) -> List[Span] = match spans {
+  [] => if next <= MAX { [Span(next, MAX)] } else { [] }
+  [s, ..rest] => if next < s.from { [Span(next, s.from - 1), ..gaps(s.to + 1, rest)] } else { gaps(s.to + 1, rest) }
+}
+
+fn search(spans: Array[Span], c: Int, lo: Int, hi: Int) -> Bool =
+  if lo >= hi {
+    False
+  } else {
+    let mid = (lo + hi) / 2
+    let s = spans[mid]
+    if c < s.from { search(spans, c, lo, mid) } else if c > s.to { search(spans, c, mid + 1, hi) } else { True }
+  }
+
+## spans から sources を除いた範囲と、sources のそれぞれが spans に入るか。どちらの列も小さい順。
+fn remove_sources(spans: List[Span], sources: List[Int]) -> (List[Span], List[Bool]) = match (spans, sources) {
+  ([], _) => ([], sources.map(fn(_) { False }))
+  (_, []) => (spans, [])
+  ([s, ..rest], [c, ..more]) =>
+    if c < s.from {
+      let (kept, hit) = remove_sources(spans, more)
+      (kept, [False, ..hit])
+    } else if c > s.to {
+      let (kept, hit) = remove_sources(rest, sources)
+      ([s, ..kept], hit)
+    } else {
+      let before = if s.from < c { [Span(s.from, c - 1)] } else { [] }
+      let after = if c < s.to { [Span(c + 1, s.to), ..rest] } else { rest }
+      let (kept, hit) = remove_sources(after, more)
+      (before ++ kept, [True, ..hit])
+    }
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:36:34 ]
+#     │
+#  36 │ pub const DIGIT: CharSet = range('0', '9')
+#     │                                  ┬  
+#     │                                  ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:36:36 ]
+#     │
+#  36 │ pub const DIGIT: CharSet = range('0', '9')
+#     │                                    ┬  
+#     │                                    ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:36:39 ]
+#     │
+#  36 │ pub const DIGIT: CharSet = range('0', '9')
+#     │                                       ┬  
+#     │                                       ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:36:41 ]
+#     │
+#  36 │ pub const DIGIT: CharSet = range('0', '9')
+#     │                                         ┬  
+#     │                                         ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:40:30 ]
+#     │
+#  40 │   let ascii = of_spans([Span('0', '9'), Span('A', 'Z'), Span('_', '_'), Span('a', 'z')])
+#     │                              ┬  
+#     │                              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:40:32 ]
+#     │
+#  40 │   let ascii = of_spans([Span('0', '9'), Span('A', 'Z'), Span('_', '_'), Span('a', 'z')])
+#     │                                ┬  
+#     │                                ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:40:35 ]
+#     │
+#  40 │   let ascii = of_spans([Span('0', '9'), Span('A', 'Z'), Span('_', '_'), Span('a', 'z')])
+#     │                                   ┬  
+#     │                                   ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:40:37 ]
+#     │
+#  40 │   let ascii = of_spans([Span('0', '9'), Span('A', 'Z'), Span('_', '_'), Span('a', 'z')])
+#     │                                     ┬  
+#     │                                     ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:40:46 ]
+#     │
+#  40 │   let ascii = of_spans([Span('0', '9'), Span('A', 'Z'), Span('_', '_'), Span('a', 'z')])
+#     │                                              ┬  
+#     │                                              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:40:48 ]
+#     │
+#  40 │   let ascii = of_spans([Span('0', '9'), Span('A', 'Z'), Span('_', '_'), Span('a', 'z')])
+#     │                                                ┬  
+#     │                                                ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:40:51 ]
+#     │
+#  40 │   let ascii = of_spans([Span('0', '9'), Span('A', 'Z'), Span('_', '_'), Span('a', 'z')])
+#     │                                                   ┬  
+#     │                                                   ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:40:53 ]
+#     │
+#  40 │   let ascii = of_spans([Span('0', '9'), Span('A', 'Z'), Span('_', '_'), Span('a', 'z')])
+#     │                                                     ┬  
+#     │                                                     ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:40:62 ]
+#     │
+#  40 │   let ascii = of_spans([Span('0', '9'), Span('A', 'Z'), Span('_', '_'), Span('a', 'z')])
+#     │                                                              ┬  
+#     │                                                              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:40:64 ]
+#     │
+#  40 │   let ascii = of_spans([Span('0', '9'), Span('A', 'Z'), Span('_', '_'), Span('a', 'z')])
+#     │                                                                ┬  
+#     │                                                                ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:40:67 ]
+#     │
+#  40 │   let ascii = of_spans([Span('0', '9'), Span('A', 'Z'), Span('_', '_'), Span('a', 'z')])
+#     │                                                                   ┬  
+#     │                                                                   ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:40:69 ]
+#     │
+#  40 │   let ascii = of_spans([Span('0', '9'), Span('A', 'Z'), Span('_', '_'), Span('a', 'z')])
+#     │                                                                     ┬  
+#     │                                                                     ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:40:78 ]
+#     │
+#  40 │   let ascii = of_spans([Span('0', '9'), Span('A', 'Z'), Span('_', '_'), Span('a', 'z')])
+#     │                                                                              ┬  
+#     │                                                                              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:40:80 ]
+#     │
+#  40 │   let ascii = of_spans([Span('0', '9'), Span('A', 'Z'), Span('_', '_'), Span('a', 'z')])
+#     │                                                                                ┬  
+#     │                                                                                ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:40:83 ]
+#     │
+#  40 │   let ascii = of_spans([Span('0', '9'), Span('A', 'Z'), Span('_', '_'), Span('a', 'z')])
+#     │                                                                                   ┬  
+#     │                                                                                   ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:40:85 ]
+#     │
+#  40 │   let ascii = of_spans([Span('0', '9'), Span('A', 'Z'), Span('_', '_'), Span('a', 'z')])
+#     │                                                                                     ┬  
+#     │                                                                                     ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:59:49 ]
+#     │
+#  59 │ const LINE_TERMINATOR: CharSet = of_spans([Span('\n', '\n'), Span('\r', '\r'), Span(0x2028, 0x2029)])
+#     │                                                 ┬  
+#     │                                                 ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\\`
+#     ╭─[ src/class.emel:59:50 ]
+#     │
+#  59 │ const LINE_TERMINATOR: CharSet = of_spans([Span('\n', '\n'), Span('\r', '\r'), Span(0x2028, 0x2029)])
+#     │                                                  ┬  
+#     │                                                  ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:59:52 ]
+#     │
+#  59 │ const LINE_TERMINATOR: CharSet = of_spans([Span('\n', '\n'), Span('\r', '\r'), Span(0x2028, 0x2029)])
+#     │                                                    ┬  
+#     │                                                    ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:59:55 ]
+#     │
+#  59 │ const LINE_TERMINATOR: CharSet = of_spans([Span('\n', '\n'), Span('\r', '\r'), Span(0x2028, 0x2029)])
+#     │                                                       ┬  
+#     │                                                       ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\\`
+#     ╭─[ src/class.emel:59:56 ]
+#     │
+#  59 │ const LINE_TERMINATOR: CharSet = of_spans([Span('\n', '\n'), Span('\r', '\r'), Span(0x2028, 0x2029)])
+#     │                                                        ┬  
+#     │                                                        ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:59:58 ]
+#     │
+#  59 │ const LINE_TERMINATOR: CharSet = of_spans([Span('\n', '\n'), Span('\r', '\r'), Span(0x2028, 0x2029)])
+#     │                                                          ┬  
+#     │                                                          ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:59:67 ]
+#     │
+#  59 │ const LINE_TERMINATOR: CharSet = of_spans([Span('\n', '\n'), Span('\r', '\r'), Span(0x2028, 0x2029)])
+#     │                                                                   ┬  
+#     │                                                                   ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\\`
+#     ╭─[ src/class.emel:59:68 ]
+#     │
+#  59 │ const LINE_TERMINATOR: CharSet = of_spans([Span('\n', '\n'), Span('\r', '\r'), Span(0x2028, 0x2029)])
+#     │                                                                    ┬  
+#     │                                                                    ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:59:70 ]
+#     │
+#  59 │ const LINE_TERMINATOR: CharSet = of_spans([Span('\n', '\n'), Span('\r', '\r'), Span(0x2028, 0x2029)])
+#     │                                                                      ┬  
+#     │                                                                      ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:59:73 ]
+#     │
+#  59 │ const LINE_TERMINATOR: CharSet = of_spans([Span('\n', '\n'), Span('\r', '\r'), Span(0x2028, 0x2029)])
+#     │                                                                         ┬  
+#     │                                                                         ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\\`
+#     ╭─[ src/class.emel:59:74 ]
+#     │
+#  59 │ const LINE_TERMINATOR: CharSet = of_spans([Span('\n', '\n'), Span('\r', '\r'), Span(0x2028, 0x2029)])
+#     │                                                                          ┬  
+#     │                                                                          ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/class.emel:59:76 ]
+#     │
+#  59 │ const LINE_TERMINATOR: CharSet = of_spans([Span('\n', '\n'), Span('\r', '\r'), Span(0x2028, 0x2029)])
+#     │                                                                            ┬  
+#     │                                                                            ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/class.emel:21:8 ]
+#     │
+#  21 │ pub fn single(c: Int) -> CharSet = CharSet([Span(c, c)])
+#     │        ───┬──  
+#     │           ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/class.emel:21:34 ]
+#     │
+#  21 │ pub fn single(c: Int) -> CharSet = CharSet([Span(c, c)])
+#     │                                  ┬  
+#     │                                  ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/class.emel:24:8 ]
+#     │
+#  24 │ pub fn range(from: Int, to: Int) -> CharSet = CharSet([Span(from, to)])
+#     │        ──┬──  
+#     │          ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/class.emel:24:45 ]
+#     │
+#  24 │ pub fn range(from: Int, to: Int) -> CharSet = CharSet([Span(from, to)])
+#     │                                             ┬  
+#     │                                             ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/class.emel:26:8 ]
+#     │
+#  26 │ pub fn union(a: CharSet, b: CharSet) -> CharSet =
+#     │        ──┬──  
+#     │          ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/class.emel:26:49 ]
+#     │
+#  26 │ pub fn union(a: CharSet, b: CharSet) -> CharSet =
+#     │                                                 ┬  
+#     │                                                 ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/class.emel:30:8 ]
+#     │
+#  30 │ pub fn complement(set: CharSet) -> CharSet = CharSet(gaps(0, set.spans.to_list()).to_array())
+#     │        ─────┬────  
+#     │             ╰────── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/class.emel:30:44 ]
+#     │
+#  30 │ pub fn complement(set: CharSet) -> CharSet = CharSet(gaps(0, set.spans.to_list()).to_array())
+#     │                                            ┬  
+#     │                                            ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/class.emel:33:8 ]
+#     │
+#  33 │ pub fn contains(set: CharSet, c: Int) -> Bool = search(set.spans, c, 0, set.spans.length())
+#     │        ────┬───  
+#     │            ╰───── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/class.emel:33:47 ]
+#     │
+#  33 │ pub fn contains(set: CharSet, c: Int) -> Bool = search(set.spans, c, 0, set.spans.length())
+#     │                                               ┬  
+#     │                                               ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/class.emel:36:34 ]
+#     │
+#  36 │ pub const DIGIT: CharSet = range('0', '9')
+#     │                                  ┬  
+#     │                                  ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/class.emel:36:35 ]
+#     │
+#  36 │ pub const DIGIT: CharSet = range('0', '9')
+#     │                                   ┬  
+#     │                                   ╰── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/class.emel:36:35 ]
+#     │
+#  36 │ pub const DIGIT: CharSet = range('0', '9')
+#     │                                   ┬  
+#     │                                   ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/class.emel:40:3 ]
+#     │
+#  40 │   let ascii = of_spans([Span('0', '9'), Span('A', 'Z'), Span('_', '_'), Span('a', 'z')])
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/class.emel:40:7 ]
+#     │
+#  40 │   let ascii = of_spans([Span('0', '9'), Span('A', 'Z'), Span('_', '_'), Span('a', 'z')])
+#     │       ──┬──  
+#     │         ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/class.emel:59:49 ]
+#     │
+#  59 │ const LINE_TERMINATOR: CharSet = of_spans([Span('\n', '\n'), Span('\r', '\r'), Span(0x2028, 0x2029)])
+#     │                                                 ┬  
+#     │                                                 ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/class.emel:59:50 ]
+#     │
+#  59 │ const LINE_TERMINATOR: CharSet = of_spans([Span('\n', '\n'), Span('\r', '\r'), Span(0x2028, 0x2029)])
+#     │                                                  ┬  
+#     │                                                  ╰── 
+# ────╯
+#
+# error[E0110]: expected `]`
+#     ╭─[ src/class.emel:59:50 ]
+#     │
+#  59 │ const LINE_TERMINATOR: CharSet = of_spans([Span('\n', '\n'), Span('\r', '\r'), Span(0x2028, 0x2029)])
+#     │                                                  ┬  
+#     │                                                  ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/class.emel:59:50 ]
+#     │
+#  59 │ const LINE_TERMINATOR: CharSet = of_spans([Span('\n', '\n'), Span('\r', '\r'), Span(0x2028, 0x2029)])
+#     │                                                  ┬  
+#     │                                                  ╰── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/class.emel:59:50 ]
+#     │
+#  59 │ const LINE_TERMINATOR: CharSet = of_spans([Span('\n', '\n'), Span('\r', '\r'), Span(0x2028, 0x2029)])
+#     │                                                  ┬  
+#     │                                                  ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/class.emel:62:8 ]
+#     │
+#  62 │ pub fn dot(dot_all: Bool) -> CharSet = if dot_all { ALL } else { LINE_TERMINATOR.complement() }
+#     │        ─┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/class.emel:62:38 ]
+#     │
+#  62 │ pub fn dot(dot_all: Bool) -> CharSet = if dot_all { ALL } else { LINE_TERMINATOR.complement() }
+#     │                                      ┬  
+#     │                                      ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/class.emel:68:3 ]
+#     │
+#  68 │   let (kept, hit) = remove_sources(set.spans.to_list(), SOURCES.to_list())
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/class.emel:68:7 ]
+#     │
+#  68 │   let (kept, hit) = remove_sources(set.spans.to_list(), SOURCES.to_list())
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/class.emel:69:3 ]
+#     │
+#  69 │   let hits = hit.to_array()  # hits[i]: SOURCES[i] が set に入るか
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/class.emel:69:7 ]
+#     │
+#  69 │   let hits = hit.to_array()  # hits[i]: SOURCES[i] が set に入るか
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/class.emel:70:3 ]
+#     │
+#  70 │   let folded = BY_TARGET.to_list().filter(fn(i) { hits[i] }).map(fn(i) { Span(TARGETS[i], TARGETS[i]) })
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/class.emel:70:7 ]
+#     │
+#  70 │   let folded = BY_TARGET.to_list().filter(fn(i) { hits[i] }).map(fn(i) { Span(TARGETS[i], TARGETS[i]) })
+#     │       ───┬──  
+#     │          ╰──── 
+# ────╯
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#     ╭─[ src/class.emel:75:71 ]
+#     │
+#  75 │ const BY_TARGET: Array[Int] = List.range(0, SOURCES.length()).sort_by(fn(i) { TARGETS[i] }).to_array()
+#     │                                                                       ──┬──  
+#     │                                                                         ╰──── 
+# ────╯
+#    = help: write `|i| { TARGETS[i] }`
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/class.emel:75:86 ]
+#     │
+#  75 │ const BY_TARGET: Array[Int] = List.range(0, SOURCES.length()).sort_by(fn(i) { TARGETS[i] }).to_array()
+#     │                                                                                      ┬  
+#     │                                                                                      ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/class.emel:78:4 ]
+#     │
+#  78 │ fn of_spans(spans: List[Span]) -> CharSet = CharSet(coalesce(spans.sort_by(fn(s) { s.from })).to_array())
+#     │    ────┬───  
+#     │        ╰───── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/class.emel:78:43 ]
+#     │
+#  78 │ fn of_spans(spans: List[Span]) -> CharSet = CharSet(coalesce(spans.sort_by(fn(s) { s.from })).to_array())
+#     │                                           ┬  
+#     │                                           ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/class.emel:81:4 ]
+#     │
+#  81 │ fn merge(a: List[Span], b: List[Span]) -> List[Span] = match (a, b) {
+#     │    ──┬──  
+#     │      ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/class.emel:81:54 ]
+#     │
+#  81 │ fn merge(a: List[Span], b: List[Span]) -> List[Span] = match (a, b) {
+#     │                                                      ┬  
+#     │                                                      ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/class.emel:88:4 ]
+#     │
+#  88 │ fn coalesce(spans: List[Span]) -> List[Span] = match spans {
+#     │    ────┬───  
+#     │        ╰───── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/class.emel:88:46 ]
+#     │
+#  88 │ fn coalesce(spans: List[Span]) -> List[Span] = match spans {
+#     │                                              ┬  
+#     │                                              ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/class.emel:95:4 ]
+#     │
+#  95 │ fn gaps(next: Int, spans: List[Span]) -> List[Span] = match spans {
+#     │    ──┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/class.emel:95:53 ]
+#     │
+#  95 │ fn gaps(next: Int, spans: List[Span]) -> List[Span] = match spans {
+#     │                                                     ┬  
+#     │                                                     ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#      ╭─[ src/class.emel:100:4 ]
+#      │
+#  100 │ fn search(spans: Array[Span], c: Int, lo: Int, hi: Int) -> Bool =
+#      │    ───┬──  
+#      │       ╰──── 
+# ─────╯
+#
+# error[E0122]: expected newline after declaration
+#      ╭─[ src/class.emel:100:65 ]
+#      │
+#  100 │ fn search(spans: Array[Span], c: Int, lo: Int, hi: Int) -> Bool =
+#      │                                                                 ┬  
+#      │                                                                 ╰── 
+# ─────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#      ╭─[ src/class.emel:110:4 ]
+#      │
+#  110 │ fn remove_sources(spans: List[Span], sources: List[Int]) -> (List[Span], List[Bool]) = match (spans, sources) {
+#      │    ───────┬──────  
+#      │           ╰──────── 
+# ─────╯
+#
+# error[E0122]: expected newline after declaration
+#      ╭─[ src/class.emel:110:86 ]
+#      │
+#  110 │ fn remove_sources(spans: List[Span], sources: List[Int]) -> (List[Span], List[Bool]) = match (spans, sources) {
+#      │                                                                                      ┬  
+#      │                                                                                      ╰── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#     ╭─[ src/class.emel:15:32 ]
+#     │
+#  15 │ pub opaque type CharSet(spans: Array[Span]) derive Eq, Show
+#     │                                ──┬──  
+#     │                                  ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `ascii` in this scope
+#     ╭─[ src/class.emel:41:20 ]
+#     │
+#  41 │   if ignore_case { ascii.union(of_spans([Span(0x017F, 0x017F), Span(0x212A, 0x212A)])) } else { ascii }
+#     │                    ──┬──  
+#     │                      ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `ascii` in this scope
+#     ╭─[ src/class.emel:41:97 ]
+#     │
+#  41 │   if ignore_case { ascii.union(of_spans([Span(0x017F, 0x017F), Span(0x212A, 0x212A)])) } else { ascii }
+#     │                                                                                                 ──┬──  
+#     │                                                                                                   ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `kept` in this scope
+#     ╭─[ src/class.emel:71:17 ]
+#     │
+#  71 │   union(CharSet(kept.to_array()), CharSet(coalesce(folded).to_array()))
+#     │                 ──┬─  
+#     │                   ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `folded` in this scope
+#     ╭─[ src/class.emel:71:52 ]
+#     │
+#  71 │   union(CharSet(kept.to_array()), CharSet(coalesce(folded).to_array()))
+#     │                                                    ───┬──  
+#     │                                                       ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#     ╭─[ src/class.emel:75:18 ]
+#     │
+#  75 │ const BY_TARGET: Array[Int] = List.range(0, SOURCES.length()).sort_by(fn(i) { TARGETS[i] }).to_array()
+#     │                  ──┬──  
+#     │                    ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#      ╭─[ src/class.emel:100:18 ]
+#      │
+#  100 │ fn search(spans: Array[Span], c: Int, lo: Int, hi: Int) -> Bool =
+#      │                  ──┬──  
+#      │                    ╰──── 
+# ─────╯
+#
+# warning[W0303]: derived `Eq` for `Span` is never used
+#     ╭─[ src/class.emel:13:38 ]
+#     │
+#  13 │ type Span(from: Int, to: Int) derive Eq, Show
+#     │                                      ─┬  
+#     │                                       ╰── 
+# ────╯
+#    = help: remove it from `derive`
+#
+# warning[W0303]: derived `Show` for `Span` is never used
+#     ╭─[ src/class.emel:13:42 ]
+#     │
+#  13 │ type Span(from: Int, to: Int) derive Eq, Show
+#     │                                          ──┬─  
+#     │                                            ╰─── 
+# ────╯
+#    = help: remove it from `derive`; `dbg` then shows `Span` as constructed, and a failed `assert` no longer shows its values
+#
+# error[E0305]: wrong number of arguments: `range` takes 2, found 0
+#     ╭─[ src/class.emel:36:28 ]
+#     │
+#  36 │ pub const DIGIT: CharSet = range('0', '9')
+#     │                            ───┬───  
+#     │                               ╰───── 
+# ────╯
+#
+# error[E0305]: wrong number of arguments: `Span` takes 2, found 0
+#     ╭─[ src/class.emel:59:44 ]
+#     │
+#  59 │ const LINE_TERMINATOR: CharSet = of_spans([Span('\n', '\n'), Span('\r', '\r'), Span(0x2028, 0x2029)])
+#     │                                            ───┬──  
+#     │                                               ╰──── 
+# ────╯
+#
+# error[E0313]: type `List[Span]` has no field or function `to_array`
+#     ╭─[ src/class.emel:71:60 ]
+#     │
+#  71 │   union(CharSet(kept.to_array()), CharSet(coalesce(folded).to_array()))
+#     │                                                            ────┬───  
+#     │                                                                ╰───── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `fn(Int, Int) -> Ordering`, found `fn(?5) -> List[Int]`
+#     ╭─[ src/class.emel:75:71 ]
+#     │
+#  75 │ const BY_TARGET: Array[Int] = List.range(0, SOURCES.length()).sort_by(fn(i) { TARGETS[i] }).to_array()
+#     │                                                                       ──────────┬─────────  
+#     │                                                                                 ╰─────────── 
+# ────╯
+#
+# error[E0313]: type `List[Int]` has no field or function `to_array`
+#     ╭─[ src/class.emel:75:93 ]
+#     │
+#  75 │ const BY_TARGET: Array[Int] = List.range(0, SOURCES.length()).sort_by(fn(i) { TARGETS[i] }).to_array()
+#     │                                                                                             ────┬───  
+#     │                                                                                                 ╰───── 
+# ────╯
+#
+# 86 errors, 3 warnings
+# --- end wish check ---
