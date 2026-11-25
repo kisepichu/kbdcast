@@ -11,6 +11,7 @@
   `text` Pome（`text/src/lib.emel`）に `Text.slice` と `Text.from_code_points` を std に入れるならこうなる形で置いた．印はモジュールの先頭のコメント（Emela にモジュールの doc comment は無い．008）の `FRICTION(002)`．中身は `String.code_points` の List を `List.drop` と `List.take` で切り，`String.from_code_point` で 1 つずつ戻して `List.join` する（戻すときに起きない `None` を扱う回り道は 003）
 - コスト:
   Pome が 1 つ（実装 20 行ほど，テスト 70 行ほど）．`slice` は呼ぶたびに `s` 全体を code point の List にするので O(`s` の code point の数)．`Bytes.slice` と `Array.slice` は O(`to - from`) 以下と書かれている．regex の `find_all` のように同じ文字列から k 回切り出すと O(k × n) になる．普段のコードに基盤レベルは漏れていない
+  regex の `replace` と `split`（`regex/src/lib.emel`，計画の Task 7）は，一致の数 k に対して `Text.slice` を k + 1 回呼ぶので O(k × n) になった（`find_all` の一致の `text()` も 1 つごとに O(n)）．印は `regex/src/lib.emel` の先頭のコメントの `FRICTION(002)`．使い捨ての Pome で，`a1` を並べた入力を `\d` で `split` した時間（bun，compile を含む，2026-11-25）は，10000 code point（5001 個の piece）で 2.5 秒，20000 code point（10001 個の piece）で 10.2 秒で，n と k を 2 倍にすると 4 倍になる．`regex` の中で code point の Array から切れば O(piece の長さ) で済むが，それには `Text.from_code_points` の起きない `None`（003）をもう一度 `panic` で扱うことになり，`Text.slice` と同じ回り道を regex に複製するので，しなかった
 - spec:
   `[target.string]`（「There is no API that takes a position as a number」），`[api.string]`，`[lib.api-rules]`，`[api.std.bytes]` と `[api.std.array]` の `slice`，`[api.std.json]` の `SyntaxError` の `offset`
 - 既存:

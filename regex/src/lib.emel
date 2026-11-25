@@ -8,12 +8,17 @@
 #
 # re = Regex.compile("(?<y>\\d{4})-(?<m>\\d\\d)", NO_FLAGS)
 # Regex.find(re, "on 2026-11") # Some(m): m.start() is 3, m.text() is "2026-11", m.named("m") is Some("11")
+# Regex.find_all(re, "2026-11, 2027-01").map(|m| m.text()) # ["2026-11", "2027-01"]
+# Regex.replace(re, "on 2026-11", |m| "[#{m.text()}]") # "on [2026-11]"
+# Regex.split(Regex.compile(",\\s*", NO_FLAGS), "a, b,c") # ["a", "b", "c"]
 # ```
 #
 # FRICTION(010): a const of another module cannot be written `Regex.NO_FLAGS`, so it is imported
 # by name.
 #
-# `find_all`, `replace` and `split` are not written yet.
+# FRICTION(002): std cannot take the part of a String between two positions, so the text of a
+# match, of a group, and of each piece that `replace` and `split` keep goes through every code
+# point of the input: O(n) each, O(k × n) for k matches.
 #
 # FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
 # is a plain comment, and `emela doc` does not show it.
@@ -74,6 +79,91 @@ pub fn is_match(re: Regex, s: String) -> Bool {
 pub fn find(re: Regex, s: String) -> Option[Match] {
   input = Array.from_list(s.code_points())
   Vm.search(re.program, input, 0).found.map(|found| Match(input: s, found:, names: re.names))
+}
+
+## Every match of `re` in `s`, in order, as JavaScript's `s.matchAll(re)` finds them with the `g`
+## and `u` flags: each search starts where the previous match ends, or one code point after it if
+## that match is empty.
+pub fn find_all(re: Regex, s: String) -> List[Match] {
+  matches_from(re, s, Array.from_list(s.code_points()), 0, [])
+}
+
+# The matches of `re` in `s` from `from` on, after the reverse of `done`. `input` holds the code
+# points of `s`.
+# FRICTION(027): std has no `List.unfold`, so the search loop is this recursive function.
+# FRICTION(021): only a self tail call is guaranteed not to use the stack, so the result is built
+# in reverse in `done`.
+fn matches_from(
+  re: Regex,
+  s: String,
+  input: Array[Int],
+  from: Int,
+  done: List[Match],
+) -> List[Match] {
+  if from > input.size() {
+    done.reverse()
+  } else {
+    Vm.search(re.program, input, from).found match {
+      None -> done.reverse()
+      Some(found) -> {
+        next = if found.end == found.start { found.end + 1 } else { found.end }
+        matches_from(re, s, input, next, [Match(input: s, found:, names: re.names), ..done])
+      }
+    }
+  }
+}
+
+## `s` with each match `m` of `re` that `find_all` finds replaced with `f(m)`, as JavaScript's
+## `s.replace(re, f)` does with the `g` and `u` flags. `f` is called on the matches in order.
+pub fn replace(re: Regex, s: String, f: fn(Match) -> String) -> String {
+  input = Array.from_list(s.code_points())
+  # The pieces of the result in reverse, and where the text after the last match starts.
+  (pieces, rest) = matches_from(re, s, input, 0, []).fold(
+    ([], 0),
+    |(pieces, at), m| ([f(m), Text.slice(s, at, m.start()), ..pieces], m.end()),
+  )
+  [Text.slice(s, rest, input.size()), ..pieces].reverse().join("")
+}
+
+## `s` cut at the matches of `re`, as JavaScript's `s.split(re)` with the `u` flag, without the
+## captures that it puts between the pieces. A match that starts at the end of `s` does not cut,
+## and neither does an empty match where the previous cut ends or at the start of `s`. The empty
+## string gives `[""]`, or `[]` if `re` matches it.
+pub fn split(re: Regex, s: String) -> List[String] {
+  input = Array.from_list(s.code_points())
+  if input.is_empty() {
+    if Vm.search(re.program, input, 0).found.is_some() { [] } else { [""] }
+  } else {
+    split_from(re, s, input, 0, 0, [])
+  }
+}
+
+# The pieces of `s` from `last`, where the previous cut ends, on, after the reverse of `done`, with
+# the next cut at a match that starts at `at` or later. `input` holds the code points of `s`.
+# FRICTION(021): only a self tail call is guaranteed not to use the stack, so the result is built
+# in reverse in `done` instead of as `[piece, ..split_from(...)]`.
+fn split_from(
+  re: Regex,
+  s: String,
+  input: Array[Int],
+  last: Int,
+  at: Int,
+  done: List[String],
+) -> List[String] {
+  # FRICTION(016): Option has no `filter`, so this match drops a match that starts at the end of
+  # `s`, where JavaScript stops trying.
+  cut = Vm.search(re.program, input, at).found match {
+    Some(found) if found.start < input.size() -> Some(found)
+    _                                         -> None
+  }
+  cut match {
+    None                             -> [Text.slice(s, last, input.size()), ..done].reverse()
+    # The previous cut and this empty match would leave an empty piece: try one code point later.
+    Some(found) if found.end == last -> split_from(re, s, input, last, found.start + 1, done)
+    Some(found) -> {
+      split_from(re, s, input, found.end, found.end, [Text.slice(s, last, found.start), ..done])
+    }
+  }
 }
 
 ## Where `m` starts, in code points.
