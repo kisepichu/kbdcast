@@ -1,0 +1,165 @@
+# wish-target: text/src/lib.emel
+
+#! String functions that std does not have yet, written in the shape they
+#! would take if they were added to std. Positions count Unicode code points.
+
+import String
+import List
+import Int
+
+## Builds a string from a list of Unicode code points.
+##
+## Returns `None` when any element is not a Unicode scalar value: a negative
+## number, a surrogate (`0xD800` to `0xDFFF`), or a number above `0x10FFFF`.
+##
+## ```
+## from_code_points([0x61, 0x1F600]) == Some("a\u{1F600}")
+## from_code_points([0xD800]) == None
+## ```
+pub fn from_code_points(cps: List[Int]) -> Option[String] {
+  if List.all(cps, is_scalar_value) {
+    Some(String.from_scalars(cps))
+  } else {
+    None
+  }
+}
+
+## Returns the part of `s` from code point `from` (inclusive) to code point
+## `to` (exclusive).
+##
+## Both positions are clamped to `0..length`, where `length` is the number of
+## code points in `s`. When `to` is not after `from`, the result is `""`.
+##
+## ```
+## slice("a\u{1F600}b", 1, 2) == "\u{1F600}"
+## slice("abc", -1, 2) == "ab"
+## slice("abc", 2, 1) == ""
+## ```
+pub fn slice(s: String, from: Int, to: Int) -> String {
+  let cps = String.code_points(s)
+  let len = List.length(cps)
+  let start = Int.clamp(from, 0, len)
+  let stop = Int.clamp(to, start, len)
+  cps |> List.drop(start) |> List.take(stop - start) |> String.from_scalars
+}
+
+fn is_scalar_value(cp: Int) -> Bool {
+  cp >= 0 && cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF)
+}
+
+# --- wish check (emela 0.28.2) ---
+# (Pome.toml は wish check が仮に置いた: text/Pome.toml)
+# error[E0118]: expected expression
+#     ╭─[ src/lib.emel:39:3 ]
+#     │
+#  39 │   let cps = String.code_points(s)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/lib.emel:39:7 ]
+#     │
+#  39 │   let cps = String.code_points(s)
+#     │       ─┬─  
+#     │        ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/lib.emel:40:3 ]
+#     │
+#  40 │   let len = List.length(cps)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/lib.emel:40:7 ]
+#     │
+#  40 │   let len = List.length(cps)
+#     │       ─┬─  
+#     │        ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/lib.emel:41:3 ]
+#     │
+#  41 │   let start = Int.clamp(from, 0, len)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/lib.emel:41:7 ]
+#     │
+#  41 │   let start = Int.clamp(from, 0, len)
+#     │       ──┬──  
+#     │         ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/lib.emel:42:3 ]
+#     │
+#  42 │   let stop = Int.clamp(to, start, len)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/lib.emel:42:7 ]
+#     │
+#  42 │   let stop = Int.clamp(to, start, len)
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0212]: module `String` has no `from_scalars`
+#     ╭─[ src/lib.emel:21:17 ]
+#     │
+#  21 │     Some(String.from_scalars(cps))
+#     │                 ──────┬─────  
+#     │                       ╰─────── 
+# ────╯
+#
+# error[E0211]: cannot find value `cps` in this scope
+#     ╭─[ src/lib.emel:43:3 ]
+#     │
+#  43 │   cps |> List.drop(start) |> List.take(stop - start) |> String.from_scalars
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `start` in this scope
+#     ╭─[ src/lib.emel:43:20 ]
+#     │
+#  43 │   cps |> List.drop(start) |> List.take(stop - start) |> String.from_scalars
+#     │                    ──┬──  
+#     │                      ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `stop` in this scope
+#     ╭─[ src/lib.emel:43:40 ]
+#     │
+#  43 │   cps |> List.drop(start) |> List.take(stop - start) |> String.from_scalars
+#     │                                        ──┬─  
+#     │                                          ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `start` in this scope
+#     ╭─[ src/lib.emel:43:47 ]
+#     │
+#  43 │   cps |> List.drop(start) |> List.take(stop - start) |> String.from_scalars
+#     │                                               ──┬──  
+#     │                                                 ╰──── 
+# ────╯
+#
+# error[E0212]: module `String` has no `from_scalars`
+#     ╭─[ src/lib.emel:43:64 ]
+#     │
+#  43 │   cps |> List.drop(start) |> List.take(stop - start) |> String.from_scalars
+#     │                                                                ──────┬─────  
+#     │                                                                      ╰─────── 
+# ────╯
+#
+# 14 errors
+# --- end wish check ---
