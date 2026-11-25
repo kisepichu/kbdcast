@@ -1,3 +1,5 @@
 # core、regex、cli の src/ で基盤レベル（effect handler layer suspend trait impl fails uses @external @export）を使ってよいモジュール。
 # 設計として選んだもの（ドメインの port にする effect など）だけを登録する。回り道は FRICTION(NNN) とメモで記録する。
 # 形式: <repo からの相対パス>  # <理由>
+regex/src/syntax.emel  # library の公開 API の parse が RegexSyntax を宣言する。parser の関数はその RegexSyntax を parse まで伝える
+regex/src/lib.emel  # library の公開 API（compile など）が RegexSyntax を宣言する。Syntax.RegexSyntax を詰め替えて返す（FRICTION(012)）

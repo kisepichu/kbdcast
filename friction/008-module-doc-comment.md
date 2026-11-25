@@ -12,6 +12,7 @@
 - 回避策:
   std の `core/string.emel:1-2` と x の `base64/src/lib.emel` に揃え、ふつうの `#` のコメントで書いた（`text/src/lib.emel` の先頭、`FRICTION(008)` の印）
   - regex（計画の Task 3 の Step 2、「モジュールの doc comment だけの骨組み」）: `regex/src/lib.emel` の先頭も同じ形（`FRICTION(008)` の印）。wish は書いていない（計画が `#` の形を指定した）
+  - regex の syntax（計画の Task 4）: wish（`wish/syntax.emel:3-5`）はモジュールの説明をファイルの先頭の `##` の 3 行に書いた（`##` は次の宣言に付くので、モジュールの doc にはならない）。`regex/src/syntax.emel` の先頭は `#` のコメントにした（`FRICTION(008)` の印）
 - コスト: 計画の「モジュールの doc comment」を、生成した文書に出ないコメントで代えた。`emela doc` の文書にも hover にもモジュールの説明が出ない。std も同じ書き方なので、std のモジュールの説明も生成した文書には出ない。普段のコードに基盤レベルは漏れていない
 - spec:
   `[lex.comment]`（`spec/language/02-lexical.md:14`: 「`##` is a doc comment. It attaches to the declaration, local fn, variant, field, effect operation, or handler item that immediately follows it.」。モジュールは入っていない）、`[lsp.doc]`。`emela doc` の節は `spec/tooling/commands.md` に無い（`04-modules.md:181` と `lsp.md:240` で触れているだけ）

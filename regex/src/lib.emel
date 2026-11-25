@@ -2,7 +2,14 @@
 # time linear in the input by a Pike VM. Positions count code points.
 #
 # The public API (`compile`, `is_match`, `find`, `find_all`, `replace`, `split`) is not written
-# yet.
+# yet. Only the error of `compile` is.
 #
 # FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
 # is a plain comment, and `emela doc` does not show it.
+
+## Why a pattern was rejected, at `offset`: where the construct it rejected starts (the `[` or `(`
+## of a class or group that is not closed). Offsets count code points from the start of the
+## pattern.
+# FRICTION(012): Emela has no re-export, so this is a second declaration of the error that
+# `Syntax.parse` fails with, for `import Regex.{RegexSyntax}`.
+pub error RegexSyntax(message: String, offset: Int)

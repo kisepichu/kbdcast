@@ -8,8 +8,9 @@
   wish check（emela 0.28.2、`wish/fold.emel` の末尾）。どちらも help が付かず、在るモジュールの名前を示さない
   - ``error[E0205]: undefined module `Regex.FoldTable` ``
   - ``error[E0211]: cannot find type `Array` in this scope`` と ``error[E0211]: cannot find module or trait `Array` in this scope``（3 行で 5 つ）
+  - regex の syntax の wish（`wish/syntax.emel:50`、`:52`、計画の Task 4）でも、import なしの `Map[String, Int]` と `Array[Int]` に ``error[E0211]: cannot find type `Map` in this scope``（2 つ）と ``error[E0211]: cannot find type `Array` in this scope`` が出た。help は付かない
 - 回避策:
-  `import FoldTable.{SOURCES, TARGETS}` と `import Std.Array.{Array}`（`regex/src/fold.emel`）。正しい書き方に直しただけなので、コードに印は付けない。テストも Pome の中の名前で `import Fold` と書く（text のテストの `import Lib` と同じ）
+  `import FoldTable.{SOURCES, TARGETS}` と `import Std.Array.{Array}`（`regex/src/fold.emel`）、`import Std.Map.{Map}`（`regex/src/syntax.emel`。Array は使わない形にした）。正しい書き方に直しただけなので、コードに印は付けない。テストも Pome の中の名前で `import Fold` と書く（text のテストの `import Lib` と同じ）
 - コスト:
   コードのコストは無い。直すには spec を引く必要があった。同じモジュールが、Pome の中では `FoldTable`、依存する側からは `Regex.FoldTable` と、書く場所で名前が変わる。Array は std の値の層にあり（`[lib.layers]`、`proposals/array.md:233` が core に置かない理由を書く）、組み込みの扱いは core の 1 つの segment の名前のモジュールだけ（`[module.resolution]`）
 - spec:
