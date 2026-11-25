@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkUntracked } from "../check";
+import { pomeInputs } from "../lib/pomes";
 import type { Problem } from "../lib/report";
 
 // prek runs this suite from git's pre-commit hook, which exports GIT_INDEX_FILE (an absolute path for `git commit <paths>`).
@@ -50,6 +51,24 @@ describe("checkUntracked", () => {
     try {
       writeFileSync(join(root, "a.emel"), "fn f() { 1 }\n");
       expect(lines(checkUntracked(root, ["a.emel"]))).toEqual(["untracked .: git ls-files が失敗した。commit に入っていない検査対象を確かめられない"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("pomeInputs", () => {
+  test("lists the manifest, the lock and every file under src and test", () => {
+    const root = mkdtempSync(join(tmpdir(), "kbdcast-check-test-"));
+    try {
+      mkdirSync(join(root, "regex", "src"), { recursive: true });
+      mkdirSync(join(root, "regex", "test"), { recursive: true });
+      writeFileSync(join(root, "regex", "Pome.toml"), "");
+      writeFileSync(join(root, "regex", "Pome.lock"), "");
+      writeFileSync(join(root, "regex", "README.md"), "");
+      writeFileSync(join(root, "regex", "src", "lib.emel"), "");
+      writeFileSync(join(root, "regex", "test", "oracle.mjs"), "");
+      expect(pomeInputs(root, "regex")).toEqual(["regex/Pome.toml", "regex/Pome.lock", "regex/src/lib.emel", "regex/test/oracle.mjs"]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

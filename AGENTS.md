@@ -10,6 +10,7 @@ kbdcast は、端末アプリのデモ GIF を、操作を書いた tape から�
 | 場所 | 中身 | `@external` |
 |---|---|---|
 | `/`（`src/`） | core。純粋な部分と effect を使う部分 | 置かない |
+| `text/` | std に足りない String の関数（std に入ったら消す） | 置かない |
 | `regex/` | 汎用の正規表現の Pome | 置かない |
 | `pty/` | effect Pty の宣言だけ | 置かない |
 | `pty-bun/` | handler BunPty | ここだけ |
@@ -58,6 +59,7 @@ core、regex、cli の `src/` で基盤レベルのキーワードを書ける�
 
 - clone したら一度 `mise install` と `mise exec -- prek install` を走らせる。
 - ターンを終える前と commit の前に `mise exec -- bun tools/check.ts` を通す。
+- commit のときの prek は `--test` も付け、各 Pome の `emela test` を走らせる。編集のたびとターンの終わりの hook は走らせない（時間がかかるため）。
 - Claude Code と omp の hook は、対象のファイル（`.emel`、`Pome.toml`、`friction/`、`wish/`、`tools/lint/foundation.allow`）を編集したときとターンの終わりに検査を走らせる。prek は commit のたびに `--commit` を付けて走らせ、検査するファイルが commit に入っていないときも止める。hook や prek を止めたり飛ばしたりして通さない。
 - `tools/` を変えたら `mise exec -- bun test tools/test` も通す。
 

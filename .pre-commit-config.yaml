@@ -3,7 +3,7 @@ repos:
     hooks:
       - id: tools-check
         name: tools/check.ts
-        entry: mise exec -- bun tools/check.ts --commit
+        entry: mise exec -- bun tools/check.ts --commit --test
         language: system
         pass_filenames: false
         always_run: true
