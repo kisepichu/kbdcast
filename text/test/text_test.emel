@@ -1,0 +1,68 @@
+import Brix.Pbt.Gen.{Gen}
+import Brix.Pbt.Property
+import Lib
+
+@test
+fn slice_counts_code_points() {
+  assert Lib.slice("a\u{1F600}b", 1, 2) == "\u{1F600}"
+}
+
+@test
+fn slice_clamps_the_positions_to_the_string() {
+  assert Lib.slice("abc", -1, 2) == "ab"
+  assert Lib.slice("abc", 2, 10) == "c"
+}
+
+@test
+fn slice_is_empty_when_to_is_not_after_from() {
+  assert Lib.slice("abc", 2, 1) == ""
+  assert Lib.slice("", 0, 1) == ""
+  # `to - from` would wrap around to a large length here.
+  assert Lib.slice("abc", 1, -2147483647 - 1) == ""
+}
+
+@test
+fn from_code_points_builds_the_string() {
+  assert Lib.from_code_points([0x61, 0x1F600]) == Some("a\u{1F600}")
+  assert Lib.from_code_points([]) == Some("")
+}
+
+@test
+fn from_code_points_rejects_what_is_not_a_scalar_value() {
+  assert Lib.from_code_points([0xD800]) == None
+  assert Lib.from_code_points([0x110000]) == None
+  assert Lib.from_code_points([-1]) == None
+}
+
+@test
+fn from_code_points_reads_back_the_code_points_of_a_string() {
+  Property.check(text(), |s| {
+    assert Lib.from_code_points(s.code_points()) == Some(s)
+  })
+}
+
+@test
+fn slice_splits_a_string_into_two_parts_at_any_position() {
+  Property.check(Gen.pair(text(), Gen.int_between(-5, 105)), |(s, n)| {
+    length = s.code_points().length()
+    assert Lib.slice(s, 0, n).append(Lib.slice(s, n, length)) == s
+  })
+}
+
+# A Unicode scalar value: 0 to 0x10FFFF, skipping the surrogates 0xD800 to 0xDFFF.
+fn scalar_value() -> Gen[Int] {
+  Gen.int_between(0, 0x10FFFF - 0x800) |> Gen.map(|n| if n < 0xD800 { n } else { n + 0x800 })
+}
+
+# Built with std one code point at a time, so that the generator does not go through `Lib`.
+fn text() -> Gen[String] {
+  Gen.list(scalar_value()) |> Gen.map(|cps| cps.map(code_point).join(""))
+}
+
+# FRICTION(003): `n` is always a scalar value here, but `from_code_point` still returns an Option.
+fn code_point(n: Int) -> String {
+  String.from_code_point(n) match {
+    Some(c) -> c
+    None    -> panic("not a scalar value: #{n}")
+  }
+}
