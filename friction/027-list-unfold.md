@@ -4,7 +4,7 @@
 - Emela: v0.28.2
 - 意図: regex の公開 API の `find_all`（`regex/src/lib.emel`、計画の Task 7）で、JavaScript の `matchAll` と同じく、位置 0 から「その位置以降の最初の一致を探し、次に探す位置を決める」を、一致が無くなるか位置が入力の終わりを越えるまで繰り返し、一致の List を作る。次の位置は一致の終わりで、空の一致なら 1 code point 先
 - こう書きたかった:
-  `wish/find_all.emel:81-95`。状態（次に探す位置）から「要素と次の状態」か「終わり」を返す関数で List を作る（Haskell の `Data.List.unfoldr`、Scala、F#、Elixir の `unfold`、Rust の `iter::from_fn` のつもり）
+  `wish/find_all.emel:81-93`。状態（次に探す位置）から「要素と次の状態」か「終わり」を返す関数で List を作る（Haskell の `Data.List.unfoldr`、Scala、F#、Elixir の `unfold`、Rust の `iter::from_fn` のつもり）
   ```emela
   List.unfold(0, |from| {
     if from > input.length() {

@@ -22,7 +22,7 @@
   `TARGET_ARRAY.get(i) match { Some(folded) -> folded; None -> panic(...) }`（`regex/src/fold.emel`、`FRICTION(009)` の印）。`None` は表が壊れたときだけ起きるので、`Option.or(c)` で探索の失敗と混ぜずに defect にした
   class（`regex/src/class.emel`）:
   - `canonicalize`: `hit.get(index) match { Some(in_set) -> in_set; None -> panic(...) }`（`FRICTION(009)` の印）。`hit` は source ごとの印を `Array.from_list` にしたもので、`index` はその source の位置なので `None` は起きない
-  - `contains`: wish の手書きの二分探索をやめ、範囲を始まりと終わりの 2 つの Array（`starts`、`ends`）で持ち、`ends.lower_bound(c)` の位置の `starts.get(i)` を見る形にした。ここの `None` は「`c` 以降で終わる範囲が無い」という本当の結果なので、起きない分岐は残らない。印は付けない（std の二分探索を使っただけで、wish より短い）
+  - `contains`: wish の手書きの二分探索をやめ、範囲を始まりと終わりの 2 つの Array（`starts`、`ends`）で持ち、`ends.lower_bound(c)` の位置の `starts.get(i)` を見る形にした。ここの `None` は「`c` 以降で終わる範囲が無い」という本当の結果なので、起きない分岐は残らず、009 の印は付けない。ただし、表し方を wish の 1 本の `Array[Span]` から 2 本の Array に変えたのは、std の `lower_bound` と `binary_search` が要素と同じ型の値しか受けず、`Span` の `to` を key にして引けないからで、その回り道は 031 に書いた（`class.emel` の `CharSet` の宣言に `FRICTION(031)` の印）
   vm（`regex/src/vm.emel`）:
   - `instruction`: `prog.insts.get(pc) match { Some(inst) -> inst; None -> panic(...) }`（`FRICTION(009)` の印）。`Program` の最後の命令は Accept で、どの jump も中に収まるので `None` は起きない。vm はスレッドを 1 つ処理するたびにこれを呼ぶ
   - 入力の code point: `input.get(pos)` と `input.get(pos - 1)` の `None` は「入力の前か後ろ」という本当の結果（`^ $ \b \B` の判定と、最後の位置で何も消費しないこと）なので、起きない分岐は残らない。印は付けない
@@ -31,7 +31,7 @@
   - 中央値: `(Assert.some(sorted.get(4)) + Assert.some(sorted.get(5))) / 2`（`FRICTION(009)` の印）。`sorted` は 10 回の時間を `List.sort` したもので、4 と 5 は範囲内なので `None` は起きない。brix の `Assert.some` が `None` で panic する match を持つので、起きない分岐は自分では書いていない。読むのは Array ではなく List なので `Array.at` の提案の直接の例にはならないが、範囲内と分かっている位置を読むのに Option が返る形は同じ
 - コスト:
   起きない分岐 1 つ（3 行）。普段のコードに基盤レベルは漏れていない。std も同じ形を書いている: `Std.Array` の `bisect` と `binary_search`（`crates/emela-core/lib/std/array.emel:154-174`）は、範囲内と分かっている `get(a, mid)` の `None` を `_` の腕に混ぜる。`proposals/array.md:76` の例は `Array.get(counts, b) |> Option.or(0)` で既定値にする
-  class では起きない分岐 1 つ（印のコメントを含めて 3 行）。vm でも 1 つ（印のコメントを含めて 4 行）
+  class でも vm でも、起きない分岐 1 つ（印のコメントを含めて 3 行）
   テストでは、`Assert.some(...)` で包むだけで行は増えない（印のコメント 1 行）
 - spec:
   `[api.std.array]`（`get` は範囲外で `None`、`set` は範囲外で defect）、`[lib.api-rules]`（「Not found, or out of range: return an Option」と「A precondition of the caller is broken: it is a defect」）、`proposals/array.md:100`（読み出しの範囲外は not found、書き込みの範囲外は defect）と `:226`（`set` を Option にしなかった理由）、`[grammar.expr]`

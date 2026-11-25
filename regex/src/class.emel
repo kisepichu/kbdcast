@@ -21,6 +21,8 @@ type Span(from: Int, to: Int)
 
 ## A set of code points. `starts` and `ends` hold the first and the last code point of each span,
 ## in increasing order.
+# FRICTION(031): std's `lower_bound` takes a value of the element type, not a key, so the spans
+# are two Arrays, searched by `ends`, instead of one `Array[Span]` searched by `to`.
 pub opaque type CharSet(starts: Array[Int], ends: Array[Int]) derive Eq, Show
 
 ## The set of no code points: `[]`.
