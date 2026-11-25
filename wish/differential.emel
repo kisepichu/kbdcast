@@ -1,0 +1,163 @@
+# wish-target: regex/test/differential_test.emel
+# Differential test: `find` agrees with JS RegExp (flags `u` and `d`) on random patterns, flags, and inputs.
+import brix/pbt
+import brix/assert
+import regex as Lib
+import regex.{Flags, Match}
+import pattern_gen
+
+# Test-only oracle (regex/test/oracle.mjs). `[]` when there is no match, otherwise [start, end] of the whole match and of each group
+# in code points, with [-1, -1] for a group that did not take part.
+@external(js, "./oracle.mjs", "find")
+fn oracle_find(pattern: String, flags: String, input: String) -> Array[Int] uses {}
+
+# The same shape as the oracle's result, from our `find`.
+fn spans(m: Option[Match]) -> List[Int] {
+  match m {
+    None -> []
+    Some(m) -> [m.start, m.end] ++ m.group_spans().flat_map(fn(span) {
+      match span {
+        None -> [-1, -1]
+        Some((s, e)) -> [s, e]
+      }
+    })
+  }
+}
+
+test "find agrees with JS RegExp" {
+  pbt.check(pbt.tuple3(pattern_gen.pattern(), pattern_gen.flags(), pattern_gen.input()), fn((node, flags, input)) {
+    let pattern = pattern_gen.render(node)
+    match Lib.compile(pattern, flags) {
+      Err(e) -> assert.fail("generated pattern ${pattern} was rejected: ${e.message} at ${e.offset}")
+      Ok(re) -> assert.eq(spans(Lib.find(re, input)), oracle_find(pattern, pattern_gen.flag_letters(flags), input).to_list())
+    }
+  })
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0110]: expected module path
+#    ╭─[ test/differential_test.emel:3:8 ]
+#    │
+#  3 │ import brix/pbt
+#    │        ──┬─  
+#    │          ╰─── 
+# ───╯
+#
+# error[E0122]: expected newline after declaration
+#    ╭─[ test/differential_test.emel:3:12 ]
+#    │
+#  3 │ import brix/pbt
+#    │            ┬  
+#    │            ╰── 
+# ───╯
+#
+# error[E0110]: expected module path
+#    ╭─[ test/differential_test.emel:4:8 ]
+#    │
+#  4 │ import brix/assert
+#    │        ──┬─  
+#    │          ╰─── 
+# ───╯
+#
+# error[E0122]: expected newline after declaration
+#    ╭─[ test/differential_test.emel:4:12 ]
+#    │
+#  4 │ import brix/assert
+#    │            ┬  
+#    │            ╰── 
+# ───╯
+#
+# error[E0110]: expected module path
+#    ╭─[ test/differential_test.emel:5:8 ]
+#    │
+#  5 │ import regex as Lib
+#    │        ──┬──  
+#    │          ╰──── 
+# ───╯
+#
+# error[E0122]: expected newline after declaration
+#    ╭─[ test/differential_test.emel:5:14 ]
+#    │
+#  5 │ import regex as Lib
+#    │              ─┬  
+#    │               ╰── 
+# ───╯
+#
+# error[E0110]: expected module path
+#    ╭─[ test/differential_test.emel:6:8 ]
+#    │
+#  6 │ import regex.{Flags, Match}
+#    │        ──┬──  
+#    │          ╰──── 
+# ───╯
+#
+# error[E0110]: expected module path
+#    ╭─[ test/differential_test.emel:7:8 ]
+#    │
+#  7 │ import pattern_gen
+#    │        ─────┬─────  
+#    │             ╰─────── 
+# ───╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ test/differential_test.emel:16:3 ]
+#     │
+#  16 │   match m {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ test/differential_test.emel:18:34 ]
+#     │
+#  18 │     Some(m) -> [m.start, m.end] ++ m.group_spans().flat_map(fn(span) {
+#     │                                  ┬  
+#     │                                  ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ test/differential_test.emel:18:36 ]
+#     │
+#  18 │     Some(m) -> [m.start, m.end] ++ m.group_spans().flat_map(fn(span) {
+#     │                                    ┬  
+#     │                                    ╰── 
+# ────╯
+#
+# error[E0126]: expected declaration
+#     ╭─[ test/differential_test.emel:27:1 ]
+#     │
+#  27 │ test "find agrees with JS RegExp" {
+#     │ ──┬─  
+#     │   ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#     ╭─[ test/differential_test.emel:12:66 ]
+#     │
+#  12 │ fn oracle_find(pattern: String, flags: String, input: String) -> Array[Int] uses {}
+#     │                                                                  ──┬──  
+#     │                                                                    ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Match` in this scope
+#     ╭─[ test/differential_test.emel:15:20 ]
+#     │
+#  15 │ fn spans(m: Option[Match]) -> List[Int] {
+#     │                    ──┬──  
+#     │                      ╰──── 
+# ────╯
+#
+# error[E0310]: expected a number (`Int`, `Int64` or `Float`), found `List[{unknown}]`
+#     ╭─[ test/differential_test.emel:18:16 ]
+#     │
+#  18 │     Some(m) -> [m.start, m.end] ++ m.group_spans().flat_map(fn(span) {
+#     │                ─────────┬─────────  
+#     │                         ╰─────────── 
+# ────╯
+#
+# 15 errors, 1 warning
+# --- end wish check ---
