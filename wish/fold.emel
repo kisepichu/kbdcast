@@ -1,0 +1,193 @@
+# wish-target: regex/src/fold.emel
+import Regex.FoldTable
+
+# The generated table as Arrays, built once, so that a lookup is a binary search over reads in
+# constant time.
+const SOURCES: Array[Int] = Array.from_list(FoldTable.SOURCES)
+const TARGETS: Array[Int] = Array.from_list(FoldTable.TARGETS)
+
+## ECMAScript's Canonicalize with the `u` and `i` flags: the simple case folding of `c`
+## (CaseFolding.txt, status C and S), or `c` itself when simple case folding does not change it.
+## O(log n) in the size of the table.
+pub fn canonicalize(c: Int) -> Int {
+  match Array.binary_search(SOURCES, c) {
+    Some(i) => TARGETS[i]
+    None => c
+  }
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0110]: expected lower name
+#    ╭─[ src/fold.emel:6:55 ]
+#    │
+#  6 │ const SOURCES: Array[Int] = Array.from_list(FoldTable.SOURCES)
+#    │                                                       ───┬───  
+#    │                                                          ╰───── 
+# ───╯
+#
+# error[E0110]: expected `)`
+#    ╭─[ src/fold.emel:6:55 ]
+#    │
+#  6 │ const SOURCES: Array[Int] = Array.from_list(FoldTable.SOURCES)
+#    │                                                       ───┬───  
+#    │                                                          ╰───── 
+# ───╯
+#
+# error[E0122]: expected newline after declaration
+#    ╭─[ src/fold.emel:6:55 ]
+#    │
+#  6 │ const SOURCES: Array[Int] = Array.from_list(FoldTable.SOURCES)
+#    │                                                       ───┬───  
+#    │                                                          ╰───── 
+# ───╯
+#
+# error[E0110]: expected lower name
+#    ╭─[ src/fold.emel:7:55 ]
+#    │
+#  7 │ const TARGETS: Array[Int] = Array.from_list(FoldTable.TARGETS)
+#    │                                                       ───┬───  
+#    │                                                          ╰───── 
+# ───╯
+#
+# error[E0110]: expected `)`
+#    ╭─[ src/fold.emel:7:55 ]
+#    │
+#  7 │ const TARGETS: Array[Int] = Array.from_list(FoldTable.TARGETS)
+#    │                                                       ───┬───  
+#    │                                                          ╰───── 
+# ───╯
+#
+# error[E0122]: expected newline after declaration
+#    ╭─[ src/fold.emel:7:55 ]
+#    │
+#  7 │ const TARGETS: Array[Int] = Array.from_list(FoldTable.TARGETS)
+#    │                                                       ───┬───  
+#    │                                                          ╰───── 
+# ───╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/fold.emel:13:3 ]
+#     │
+#  13 │   match Array.binary_search(SOURCES, c) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/fold.emel:14:13 ]
+#     │
+#  14 │     Some(i) => TARGETS[i]
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/fold.emel:14:13 ]
+#     │
+#  14 │     Some(i) => TARGETS[i]
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/fold.emel:14:13 ]
+#     │
+#  14 │     Some(i) => TARGETS[i]
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/fold.emel:15:10 ]
+#     │
+#  15 │     None => c
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/fold.emel:15:10 ]
+#     │
+#  15 │     None => c
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/fold.emel:15:10 ]
+#     │
+#  15 │     None => c
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0205]: undefined module `Regex.FoldTable`
+#    ╭─[ src/fold.emel:2:8 ]
+#    │
+#  2 │ import Regex.FoldTable
+#    │        ───────┬───────  
+#    │               ╰───────── 
+# ───╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#    ╭─[ src/fold.emel:6:16 ]
+#    │
+#  6 │ const SOURCES: Array[Int] = Array.from_list(FoldTable.SOURCES)
+#    │                ──┬──  
+#    │                  ╰──── 
+# ───╯
+#
+# error[E0211]: cannot find module or trait `Array` in this scope
+#    ╭─[ src/fold.emel:6:29 ]
+#    │
+#  6 │ const SOURCES: Array[Int] = Array.from_list(FoldTable.SOURCES)
+#    │                             ──┬──  
+#    │                               ╰──── 
+# ───╯
+#
+# error[E0211]: cannot find constructor `FoldTable` in this scope
+#    ╭─[ src/fold.emel:6:45 ]
+#    │
+#  6 │ const SOURCES: Array[Int] = Array.from_list(FoldTable.SOURCES)
+#    │                                             ────┬────  
+#    │                                                 ╰────── 
+# ───╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#    ╭─[ src/fold.emel:7:16 ]
+#    │
+#  7 │ const TARGETS: Array[Int] = Array.from_list(FoldTable.TARGETS)
+#    │                ──┬──  
+#    │                  ╰──── 
+# ───╯
+#
+# error[E0211]: cannot find module or trait `Array` in this scope
+#    ╭─[ src/fold.emel:7:29 ]
+#    │
+#  7 │ const TARGETS: Array[Int] = Array.from_list(FoldTable.TARGETS)
+#    │                             ──┬──  
+#    │                               ╰──── 
+# ───╯
+#
+# error[E0211]: cannot find constructor `FoldTable` in this scope
+#    ╭─[ src/fold.emel:7:45 ]
+#    │
+#  7 │ const TARGETS: Array[Int] = Array.from_list(FoldTable.TARGETS)
+#    │                                             ────┬────  
+#    │                                                 ╰────── 
+# ───╯
+#
+# error[E0211]: cannot find module or trait `Array` in this scope
+#     ╭─[ src/fold.emel:13:9 ]
+#     │
+#  13 │   match Array.binary_search(SOURCES, c) {
+#     │         ──┬──  
+#     │           ╰──── 
+# ────╯
+#
+# 21 errors, 1 warning
+# --- end wish check ---
