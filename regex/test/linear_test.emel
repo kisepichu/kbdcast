@@ -3,30 +3,38 @@ import Std.Array.{Array}
 import Syntax.{RegexSyntax}
 import Vm
 
-# The threads the vm processes while it searches `pattern` in `n` copies of `a`. It counts work,
-# not time, so the comparison is the same on every run.
-fn steps(pattern: String, n: Int) -> Int fails RegexSyntax {
-  program = Program.build(
-    Syntax.parse(pattern),
-    ignore_case: False,
-    multiline: False,
-    dot_all: False,
-  ) match {
+# The program of `pattern`, without flags.
+fn program(pattern: String) -> Vm.Program fails RegexSyntax {
+  Program.build(Syntax.parse(pattern), ignore_case: False, multiline: False, dot_all: False) match {
     Some(program) -> program
     None          -> panic("#{pattern} is too large")
   }
-  Vm.search(program, Array.repeat(0x61, n), 0).steps # a
 }
 
-# Each test checks that twice the input takes at most 2.5 times the work.
+# The threads the vm processes while it searches `pattern` in `n` copies of `a`. It counts work,
+# not time, so the comparison is the same on every run.
+fn steps(pattern: String, n: Int) -> Int fails RegexSyntax {
+  Vm.search(program(pattern), Array.repeat(0x61, n), 0).steps # a
+}
+
+# The most threads that `Vm.search` processes for `pattern` on `n` code points: twice the
+# instructions of its program at each of the n + 1 positions.
+fn bound(pattern: String, n: Int) -> Int fails RegexSyntax {
+  2 * program(pattern).insts.size() * (n + 1)
+}
+
+# Each test checks that the work stays within the bound, and that twice the input takes at most 2.5
+# times the work.
 
 @test
 fn a_nested_star_is_linear() {
+  assert steps("(a*)*b", 4000) <= bound("(a*)*b", 4000)
   assert steps("(a*)*b", 4000) * 2 <= steps("(a*)*b", 2000) * 5
 }
 
 @test
 fn a_star_over_alternatives_that_match_the_same_is_linear() {
+  assert steps("(a|a)*b", 4000) <= bound("(a|a)*b", 4000)
   assert steps("(a|a)*b", 4000) * 2 <= steps("(a|a)*b", 2000) * 5
 }
 
@@ -34,6 +42,7 @@ fn a_star_over_alternatives_that_match_the_same_is_linear() {
 # this test also checks that it takes at least 1.5 times as much.
 @test
 fn optional_copies_before_mandatory_ones_are_linear() {
+  assert steps("(a?){30}a{30}b", 4000) <= bound("(a?){30}a{30}b", 4000)
   assert steps("(a?){30}a{30}b", 4000) * 2 <= steps("(a?){30}a{30}b", 2000) * 5
   assert steps("(a?){30}a{30}b", 4000) * 2 >= steps("(a?){30}a{30}b", 2000) * 3
 }

@@ -71,8 +71,8 @@ check("a(?<=b)") # "lookbehind is not supported at 1"
 
 `find` と `is_match` は O(m·n) 歩．1 歩は O(log m)（JS で O(1) の更新ができる配列が無いため．friction 024）．m は回数付きの繰り返しを展開した命令列の大きさ（100_000 まで），n は入力のコードポイントの数．backtracking の engine が指数時間をかける `(a*)*b` や `(a|a)*b` も，入力の長さに線形に収まる．
 
-- `find_all`，`replace`，`split` は探索を繰り返すので，最悪で O(m·n²) 歩（Rust regex が `find_iter` について書くのと同じ）
-- `replace`，`split`，`Match` の `text`，`group`，`named` は，文字列を `Text.slice` で切り出す．切り出す 1 つにつき O(n) かかる（friction 002）
+- `find_all`，`replace`，`split` は探索を繰り返す．1 回の探索は，一致を見つけても，それより優先する thread が残るうちは先へ進むので，探索の全体は最悪で O(m·n²) 歩（Rust regex が `find_iter` について書くのと同じ）．`b` の無い入力で `a*b|a` を探すと，どの探索も `a*b` の thread が入力の終わりまで残る
+- 文字列を作る手間は，探索とは別に O(n + 作る文字列の長さ)．入力をコードポイントの Array にするのは 1 回の呼び出しにつき 1 回で，`replace` と `split` の部分と，`Match` の `text`，`group`，`named` は，その Array の範囲から作る（std に部分文字列を取る関数が無く，依存する Pome の `Text.slice` は呼ぶたびに文字列の全体をたどるため．friction 002）
 
 ## JS と違う点
 

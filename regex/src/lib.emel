@@ -16,9 +16,11 @@
 # FRICTION(010): a const of another module cannot be written `Regex.NO_FLAGS`, so it is imported
 # by name.
 #
-# FRICTION(002): std cannot take the part of a String between two positions, so the text of a
-# match, of a group, and of each piece that `replace` and `split` keep goes through every code
-# point of the input: O(n) each, O(k × n) for k matches.
+# FRICTION(002): std cannot take the part of a String between two positions, and `Text.slice` goes
+# through every code point of the String on each call. So each call here turns the input into an
+# Array of code points once, and builds the text of a match, of a group, and of each piece that
+# `replace` and `split` keep from a range of that Array: O(n) for the Array, then the length of
+# each part.
 #
 # FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
 # is a plain comment, and `emela doc` does not show it.
@@ -49,7 +51,7 @@ pub error RegexSyntax(message: String, offset: Int)
 pub opaque type Regex(program: Vm.Program, names: Map[String, Int])
 
 ## A match of a Regex in a string.
-pub opaque type Match(input: String, found: Found, names: Map[String, Int])
+pub opaque type Match(input: Array[Int], found: Found, names: Map[String, Int])
 
 ## Compiles `pattern`, written in ECMAScript's syntax with the `u` flag. Fails with RegexSyntax
 ## for what the syntax or this engine rejects, including a pattern whose counted repetitions
@@ -78,28 +80,22 @@ pub fn is_match(re: Regex, s: String) -> Bool {
 ## The first match of `re` in `s`, as JavaScript's `re.exec(s)` finds it.
 pub fn find(re: Regex, s: String) -> Option[Match] {
   input = Array.from_list(s.code_points())
-  Vm.search(re.program, input, 0).found.map(|found| Match(input: s, found:, names: re.names))
+  Vm.search(re.program, input, 0).found.map(|found| Match(input:, found:, names: re.names))
 }
 
 ## Every match of `re` in `s`, in order, as JavaScript's `s.matchAll(re)` finds them with the `g`
 ## and `u` flags: each search starts where the previous match ends, or one code point after it if
 ## that match is empty.
 pub fn find_all(re: Regex, s: String) -> List[Match] {
-  matches_from(re, s, Array.from_list(s.code_points()), 0, [])
+  matches_from(re, Array.from_list(s.code_points()), 0, [])
 }
 
-# The matches of `re` in `s` from `from` on, after the reverse of `done`. `input` holds the code
-# points of `s`.
+# The matches of `re` in `input`, the code points of a string, from `from` on, after the reverse of
+# `done`.
 # FRICTION(027): std has no `List.unfold`, so the search loop is this recursive function.
 # FRICTION(021): only a self tail call is guaranteed not to use the stack, so the result is built
 # in reverse in `done`.
-fn matches_from(
-  re: Regex,
-  s: String,
-  input: Array[Int],
-  from: Int,
-  done: List[Match],
-) -> List[Match] {
+fn matches_from(re: Regex, input: Array[Int], from: Int, done: List[Match]) -> List[Match] {
   if from > input.size() {
     done.reverse()
   } else {
@@ -107,7 +103,7 @@ fn matches_from(
       None -> done.reverse()
       Some(found) -> {
         next = if found.end == found.start { found.end + 1 } else { found.end }
-        matches_from(re, s, input, next, [Match(input: s, found:, names: re.names), ..done])
+        matches_from(re, input, next, [Match(input:, found:, names: re.names), ..done])
       }
     }
   }
@@ -118,11 +114,11 @@ fn matches_from(
 pub fn replace(re: Regex, s: String, f: fn(Match) -> String) -> String {
   input = Array.from_list(s.code_points())
   # The pieces of the result in reverse, and where the text after the last match starts.
-  (pieces, rest) = matches_from(re, s, input, 0, []).fold(
+  (pieces, rest) = matches_from(re, input, 0, []).fold(
     ([], 0),
-    |(pieces, at), m| ([f(m), Text.slice(s, at, m.start()), ..pieces], m.end()),
+    |(pieces, at), m| ([f(m), string_of(input, at, m.start()), ..pieces], m.end()),
   )
-  [Text.slice(s, rest, input.size()), ..pieces].reverse().join("")
+  [string_of(input, rest, input.size()), ..pieces].reverse().join("")
 }
 
 ## `s` cut at the matches of `re`, as JavaScript's `s.split(re)` with the `u` flag, without the
@@ -134,34 +130,33 @@ pub fn split(re: Regex, s: String) -> List[String] {
   if input.is_empty() {
     if Vm.search(re.program, input, 0).found.is_some() { [] } else { [""] }
   } else {
-    split_from(re, s, input, 0, 0, [])
+    split_from(re, input, 0, 0, [])
   }
 }
 
-# The pieces of `s` from `last`, where the previous cut ends, on, after the reverse of `done`, with
-# the next cut at a match that starts at `at` or later. `input` holds the code points of `s`.
+# The pieces of `input`, the code points of a string, from `last`, where the previous cut ends, on,
+# after the reverse of `done`, with the next cut at a match that starts at `at` or later.
 # FRICTION(021): only a self tail call is guaranteed not to use the stack, so the result is built
 # in reverse in `done` instead of as `[piece, ..split_from(...)]`.
 fn split_from(
   re: Regex,
-  s: String,
   input: Array[Int],
   last: Int,
   at: Int,
   done: List[String],
 ) -> List[String] {
   # FRICTION(016): Option has no `filter`, so this match drops a match that starts at the end of
-  # `s`, where JavaScript stops trying.
+  # `input`, where JavaScript stops trying.
   cut = Vm.search(re.program, input, at).found match {
     Some(found) if found.start < input.size() -> Some(found)
     _                                         -> None
   }
   cut match {
-    None                             -> [Text.slice(s, last, input.size()), ..done].reverse()
+    None                             -> [string_of(input, last, input.size()), ..done].reverse()
     # The previous cut and this empty match would leave an empty piece: try one code point later.
-    Some(found) if found.end == last -> split_from(re, s, input, last, found.start + 1, done)
+    Some(found) if found.end == last -> split_from(re, input, last, found.start + 1, done)
     Some(found) -> {
-      split_from(re, s, input, found.end, found.end, [Text.slice(s, last, found.start), ..done])
+      split_from(re, input, found.end, found.end, [string_of(input, last, found.start), ..done])
     }
   }
 }
@@ -178,7 +173,7 @@ pub fn end(m: Match) -> Int {
 
 ## The matched text.
 pub fn text(m: Match) -> String {
-  Text.slice(m.input, m.found.start, m.found.end)
+  string_of(m.input, m.found.start, m.found.end)
 }
 
 ## The text of group `index`: 0 is the whole match. `None` for a group that did not take part in
@@ -188,7 +183,7 @@ pub fn group(m: Match, index: Int) -> Option[String] {
     Some(m.text())
   } else {
     m.found.groups.get(index - 1) match {
-      Some(Some((from, to))) -> Some(Text.slice(m.input, from, to))
+      Some(Some((from, to))) -> Some(string_of(m.input, from, to))
       _                      -> None
     }
   }
@@ -198,4 +193,15 @@ pub fn group(m: Match, index: Int) -> Option[String] {
 ## that did not take part in the match.
 pub fn named(m: Match, name: String) -> Option[String] {
   m.names.get(name).and_then(|index| m.group(index))
+}
+
+# The string of the code points of `input` from `from` inclusive to `to` exclusive, in time
+# proportional to `to - from`.
+fn string_of(input: Array[Int], from: Int, to: Int) -> String {
+  # FRICTION(003): the code points come from a String, so they are scalar values and `None` cannot
+  # happen.
+  Text.from_code_points(input.slice(from, to).to_list()) match {
+    Some(part) -> part
+    None       -> panic("Regex: a code point of a String is not a scalar value")
+  }
 }
