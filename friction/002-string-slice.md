@@ -6,15 +6,15 @@
 - こう書きたかった:
   std の関数として `String.slice(s, from, to)` と `String.from_code_points(cps)` を呼ぶ．std の外で書くなら `wish/text.emel` の形（`String.code_points` を `List.drop` と `List.take` で切り，`String.from_scalars` で戻す）
 - 診断:
-  `String.slice` と `String.from_code_points` を呼ぶと `error[E0212]: module String has no slice`（`from_code_points` も同じ）．wish check では `error[E0212]: module String has no from_scalars`
+  repo の外の使い捨ての Pome で `String.slice(s, 1, 2)` と `String.from_code_points(cps)` を `emela check` した結果（v0.28.2，2026-11-25）: ``error[E0212]: module `String` has no `slice` `` と ``error[E0212]: module `String` has no `from_code_points` ``（こちらには ``= help: did you mean `from_code_point`?`` が付く）．wish check では ``error[E0212]: module `String` has no `from_scalars` ``
 - 回避策:
-  `text` Pome（`text/src/lib.emel`）に `Text.slice` と `Text.from_code_points` を std に入れるならこうなる形で置いた．印はモジュールの doc comment の `FRICTION(002)`．中身は `String.code_points` の List を `List.drop` と `List.take` で切り，`String.from_code_point` で 1 つずつ戻して `List.join` する（戻すときに起きない `None` を扱う回り道は 003）
+  `text` Pome（`text/src/lib.emel`）に `Text.slice` と `Text.from_code_points` を std に入れるならこうなる形で置いた．印はモジュールの先頭のコメント（Emela にモジュールの doc comment は無い．008）の `FRICTION(002)`．中身は `String.code_points` の List を `List.drop` と `List.take` で切り，`String.from_code_point` で 1 つずつ戻して `List.join` する（戻すときに起きない `None` を扱う回り道は 003）
 - コスト:
   Pome が 1 つ（実装 20 行ほど，テスト 70 行ほど）．`slice` は呼ぶたびに `s` 全体を code point の List にするので O(`s` の code point の数)．`Bytes.slice` と `Array.slice` は O(`to - from`) 以下と書かれている．regex の `find_all` のように同じ文字列から k 回切り出すと O(k × n) になる．普段のコードに基盤レベルは漏れていない
 - spec:
   `[target.string]`（「There is no API that takes a position as a number」），`[api.string]`，`[lib.api-rules]`，`[api.std.bytes]` と `[api.std.array]` の `slice`，`[api.std.json]` の `SyntaxError` の `offset`
 - 既存:
-  emela の issue に無い（`slice`，`substring`，`from_code_point` で検索，2026-11-25）．`proposals/` にも無い．`[target.string]` の「位置を数で取る API は無い」は，spec/ を作った #388 からある記述で，理由は書かれていない
+  emela の issue に無い（`slice`，`substring`，`from_code_point` で検索，2026-11-25）．`proposals/` にも無い．`[target.string]` の「There is no API that takes a position as a number」は，v0.20.0 の spec（#114，c7e1e557，2026-10-13）の 16.2 に日本語で「位置を数値で指定する API は持たない。」としてあり，#388（spec/ を作った PR）はそれを英語にして移した．理由は当時の spec にも history にも書かれていない
 - 行き先: 前提の範囲内で spec に足りない → proposal の下書き（下の節．未提出．出すのは user）
 
 ## proposal の下書き

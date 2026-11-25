@@ -17,12 +17,15 @@
 #
 # FRICTION(002): std has no API that takes a position in a String as a number
 # (`[target.string]`), so these live here. Delete this Pome when std has them.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment, and `emela doc` does not show it.
 
 ## The string of the code points `cps`, in order. `None` if one of them is not a Unicode scalar
 ## value (0 to 10FFFF, excluding surrogates).
 pub fn from_code_points(cps: List[Int]) -> Option[String] {
-  # FRICTION(003): there is no String from scalar values that cannot fail, so `from_code_point`
-  # checks each one, and the count tells whether any was dropped.
+  # FRICTION(006): there is no function that turns a List of Options into an Option of a List, so
+  # `from_code_point` checks each one, and the count tells whether any was dropped.
   parts = cps.filter_map(String.from_code_point)
   if parts.length() == cps.length() { Some(parts.join("")) } else { None }
 }
@@ -30,6 +33,8 @@ pub fn from_code_points(cps: List[Int]) -> Option[String] {
 ## The code points of `s` from `from` inclusive to `to` exclusive. Both are clamped to 0 to the
 ## number of code points in `s`; empty if `from` is not less than `to`.
 pub fn slice(s: String, from: Int, to: Int) -> String {
+  # FRICTION(005): there is no `Int.clamp`. `drop` and `take` clamp the upper end, so only the
+  # lower one is clamped here, and `to <= start` keeps `to - start` from wrapping.
   start = Int.max(from, 0)
   if to <= start {
     ""
