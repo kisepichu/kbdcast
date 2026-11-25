@@ -1,0 +1,270 @@
+# The Pike VM: runs a Program over an input of code points with the semantics of JavaScript's
+# RegExp with the `u` flag, in O(m·n) steps for a program of m instructions and an input of n code
+# points. m is the size of the unrolled program, which `Program.MAX_SIZE` bounds to 100_000.
+#
+# It follows Barrière and Pit-Claudel, "Linear Matching of JavaScript Regular Expressions" (PLDI
+# 2024, https://arxiv.org/abs/2311.17620):
+# - §3.3, Algorithm 1: the threads at a position are kept in priority order, and at most one of
+#   them goes on from each state (the uniform futures of §2). The earliest start wins, so until a
+#   thread has matched, a new thread starts at each position with the lowest priority (the `.*?`
+#   of §3.2).
+# - §4.1: BeginLoop and EndLoop around each optional iteration of a body that can match the empty
+#   string, with the `left` flag in each thread, so that an optional iteration that matches the
+#   empty string fails (ECMA-262 RepeatMatcher step 2.b). A state is the pair of the position of
+#   the instruction and `left`: the paper's two copies of the automaton.
+# - §4.2: Capture Reset with clocks. An Iterate at the start of each iteration records when the
+#   iteration began, and the groups are filtered against it once, for the winning thread. The
+#   quantifier is named by the range of the groups it clears (ECMA-262 RepeatMatcher step 4), so
+#   two quantifiers that clear the same groups share their clock, which gives the same filter.
+# - §4.6, List: the registers of a thread are an immutable log of its writes, so that a Fork takes
+#   O(1). The position of a write in the log is its clock.
+# - §4.5.2: a `e{n,}` whose `e` cannot match the empty string loops on its last copy.
+#
+# What this engine covers differently from the paper:
+# - No lookarounds (§4.3, §4.4) and no backreferences: `Syntax` rejects them.
+# - Counted repetition is unrolled, as in §3.1 and RegElk: `e{n,m}` is n copies of `e` followed
+#   by m - n nested optional copies. Nested counts multiply, hence `Program.MAX_SIZE`.
+# - A `e{n,}?` or `e+?` (n >= 1) whose `e` can match the empty string is n copies of `e` followed
+#   by `e*?`. The paper has no linear algorithm for this lazy plus: it is an open problem (§4.5.3,
+#   §7).
+# - A greedy `e{n,}` or `e+` whose `e` can match the empty string is copied the same way, to n
+#   copies of `e` followed by `e*`. §4.5.3 matches it without copies (CheckNull, SetNullPlus, and
+#   rebuilding the groups of the nulled plus after the match); that is a candidate for a later
+#   optimization.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment, and `emela doc` does not show it.
+
+import Class.{CharSet}
+import Fold
+import Std.Array.{Array}
+import Std.Map.{Map}
+import Std.Set.{Set}
+import Syntax.{Assertion, LineStart, LineEnd, WordBoundary, NotWordBoundary}
+
+## One instruction of a Program. Jumps are relative to the position of the instruction, so that
+## `Program` can copy the code of a repeated body anywhere.
+pub enum Inst {
+  ## Consumes one character that is in `set`, or that is not in it if `negated`. With
+  ## `ignore_case`, `set` holds canonical forms, and the character is canonicalized before it is
+  ## looked up.
+  Consume(set: CharSet, negated: Bool)
+  ## Goes on at `first` and at `second` ahead. `first` has the higher priority.
+  Fork(first: Int, second: Int)
+  Jump(by: Int)
+  ## Writes the position to slot `slot`: slot 2g where group g starts, slot 2g + 1 where it ends.
+  Save(slot: Int)
+  ## An iteration of a quantifier begins. Its body holds the groups `first` to `last`, which the
+  ## iteration clears.
+  Iterate(first: Int, last: Int)
+  ## An optional iteration begins: it may not end before it consumes a character.
+  BeginLoop
+  ## An optional iteration ends. A thread that has not consumed a character since its BeginLoop
+  ## dies here.
+  EndLoop
+  Check(Assertion)
+  Accept
+}
+
+## A compiled pattern: its instructions (the last one is Accept, and every jump stays inside), the
+## number of its capture groups, and the flags that change what an instruction matches.
+pub type Program(insts: Array[Inst], group_count: Int, ignore_case: Bool, multiline: Bool)
+
+## A match: where it starts and ends, and where each group from 1 does (`None` for a group that did
+## not take part). Positions are indices into the input.
+pub type Found(start: Int, end: Int, groups: Array[Option[(Int, Int)]])
+
+## What `search` found, and the number of threads it ran: its work, which is at most twice the
+## number of instructions at each position.
+pub type Outcome(found: Option[Found], steps: Int)
+
+# A write to the registers of a thread.
+enum Write {
+  Saved(slot: Int, pos: Int)
+  Iterated(first: Int, last: Int)
+}
+
+# `left`: the thread has consumed a character since its last BeginLoop. `log` holds its writes,
+# the newest first.
+type Thread(pc: Int, left: Bool, start: Int, log: List[Write])
+
+type Winner(start: Int, end: Int, log: List[Write])
+
+# What the threads did at one position: the threads that consumed its character (the lowest
+# priority first), the thread that matched there, and the work so far.
+type Step(next: List[Thread], winner: Option[Winner], steps: Int)
+
+## The first match of `prog` in `input` that starts at `from` or later, as JavaScript's `exec`
+## finds it with `lastIndex` at `from`. The assertions still look at the code point before `from`.
+pub fn search(prog: Program, input: Array[Int], from: Int) -> Outcome {
+  run(prog, input, from, [], None, 0)
+}
+
+# `carried` holds the threads that consumed the character before `pos`, in priority order.
+fn run(
+  prog: Program,
+  input: Array[Int],
+  pos: Int,
+  carried: List[Thread],
+  winner: Option[Winner],
+  steps: Int,
+) -> Outcome {
+  active = winner match {
+    None    -> carried.append([Thread(pc: 0, left: True, start: pos, log: [])])
+    Some(_) -> carried
+  }
+  done = step(prog, input, pos, active, Set.empty(), [], steps)
+  # The threads left after a match all have a higher priority than it, so a later match wins.
+  winner = done.winner match {
+    None  -> winner
+    newer -> newer
+  }
+  if pos >= input.size() || (done.next.is_empty() && winner.is_some()) {
+    Outcome(found: winner.map(|w| found(prog, w)), steps: done.steps)
+  } else {
+    run(prog, input, pos + 1, done.next.reverse(), winner, done.steps)
+  }
+}
+
+# Runs the threads of `stack`, in priority order, at `pos` until each one consumes the character
+# there, dies or matches. `seen` holds the states that a thread of higher priority has been in
+# at `pos`.
+fn step(
+  prog: Program,
+  input: Array[Int],
+  pos: Int,
+  stack: List[Thread],
+  # FRICTION(024): a weight-balanced tree, O(log m) per state. An Array of flags can be O(1) on
+  # WASM and native, but `Array.set` always copies on JS, which makes each position O(m²).
+  seen: Set[(Int, Bool)],
+  next: List[Thread],
+  steps: Int,
+) -> Step {
+  stack match {
+    []                                           -> Step(next:, winner: None, steps:)
+    # The future of a state does not depend on how a thread got there, and the thread that was
+    # there first has the higher priority.
+    [t, ..rest] if seen.contains((t.pc, t.left)) -> step(prog, input, pos, rest, seen, next, steps)
+    [t, ..rest] -> {
+      seen = seen.insert((t.pc, t.left))
+      steps = steps + 1
+      # FRICTION(025): each arm calls `step` itself. A local fn or a closure that took the new stack
+      # and called `step` would not be a call to itself, and only those are sure not to use stack.
+      instruction(prog, t.pc) match {
+        Consume(set:, negated:) if consumes(prog, set, negated, input.get(pos)) -> {
+          step(prog, input, pos, rest, seen, [Thread(pc: t.pc + 1, left: True, ..t), ..next], steps)
+        }
+        Consume(..) -> step(prog, input, pos, rest, seen, next, steps)
+        Fork(first, second) -> {
+          forks = [Thread(pc: t.pc + first, ..t), Thread(pc: t.pc + second, ..t), ..rest]
+          step(prog, input, pos, forks, seen, next, steps)
+        }
+        Jump(by) -> step(prog, input, pos, [Thread(pc: t.pc + by, ..t), ..rest], seen, next, steps)
+        Save(slot) -> {
+          saved = Thread(pc: t.pc + 1, log: [Saved(slot:, pos:), ..t.log], ..t)
+          step(prog, input, pos, [saved, ..rest], seen, next, steps)
+        }
+        Iterate(first, last) -> {
+          iterated = Thread(pc: t.pc + 1, log: [Iterated(first:, last:), ..t.log], ..t)
+          step(prog, input, pos, [iterated, ..rest], seen, next, steps)
+        }
+        BeginLoop -> {
+          step(
+            prog,
+            input,
+            pos,
+            [Thread(pc: t.pc + 1, left: False, ..t), ..rest],
+            seen,
+            next,
+            steps,
+          )
+        }
+        EndLoop if t.left -> step(
+          prog,
+          input,
+          pos,
+          [Thread(pc: t.pc + 1, ..t), ..rest],
+          seen,
+          next,
+          steps,
+        )
+        EndLoop  -> step(prog, input, pos, rest, seen, next, steps)
+        Check(assertion) if holds(prog, input, pos, assertion) -> {
+          step(prog, input, pos, [Thread(pc: t.pc + 1, ..t), ..rest], seen, next, steps)
+        }
+        Check(_) -> step(prog, input, pos, rest, seen, next, steps)
+        # The threads below this one have a lower priority: they are dropped.
+        Accept   -> Step(next:, winner: Some(Winner(start: t.start, end: pos, log: t.log)), steps:)
+      }
+    }
+  }
+}
+
+fn instruction(prog: Program, pc: Int) -> Inst {
+  prog.insts.get(pc) match {
+    Some(inst) -> inst
+    # FRICTION(009): every jump of a Program stays inside it and its last instruction is Accept,
+    # so `pc` is a position of `insts`, but `Array.get` still returns an Option.
+    None       -> panic("Vm: no instruction at #{pc}")
+  }
+}
+
+fn consumes(prog: Program, set: CharSet, negated: Bool, c: Option[Int]) -> Bool {
+  c match {
+    Some(c) -> set.contains(if prog.ignore_case { Fold.canonicalize(c) } else { c }) != negated
+    None    -> False
+  }
+}
+
+fn holds(prog: Program, input: Array[Int], pos: Int, assertion: Assertion) -> Bool {
+  assertion match {
+    LineStart -> input.get(pos - 1) match {
+      Some(c) -> prog.multiline && is_line_terminator(c)
+      None    -> True
+    }
+    LineEnd -> input.get(pos) match {
+      Some(c) -> prog.multiline && is_line_terminator(c)
+      None    -> True
+    }
+    WordBoundary    -> is_word(prog, input.get(pos - 1)) != is_word(prog, input.get(pos))
+    NotWordBoundary -> is_word(prog, input.get(pos - 1)) == is_word(prog, input.get(pos))
+  }
+}
+
+# ECMAScript's IsWordChar: the position before the input and the one after it are not word
+# characters.
+fn is_word(prog: Program, c: Option[Int]) -> Bool {
+  c match {
+    Some(c) -> Class.word(prog.ignore_case).contains(c)
+    None    -> False
+  }
+}
+
+# FRICTION(013): Emela has no literal for the code point of a character, so these are hexadecimal.
+fn is_line_terminator(c: Int) -> Bool {
+  c == 0x0A || c == 0x0D || c == 0x2028 || c == 0x2029 # \n \r LS PS
+}
+
+# Capture Reset (§4.2): a group keeps its newest span only if no iteration that clears it began
+# after the group did. The position of a write in the log, from the oldest, is its clock.
+fn found(prog: Program, w: Winner) -> Found {
+  (saves, iterations) = w.log.reverse().enumerate().fold(
+    (Map.empty(), Map.empty()),
+    |(saves, iterations), (clock, write)| write match {
+      Saved(slot:, pos:)      -> (saves.insert(slot, (pos, clock)), iterations)
+      Iterated(first:, last:) -> (saves, iterations.insert((first, last), clock))
+    },
+  )
+  groups = List.range(1, prog.group_count + 1).map(|g| {
+    (saves.get(2 * g), saves.get(2 * g + 1)) match {
+      (Some((from, clock)), Some((to, _))) if !cleared(iterations, g, clock) -> Some((from, to))
+      _                                                                      -> None
+    }
+  })
+  Found(start: w.start, end: w.end, groups: Array.from_list(groups))
+}
+
+# Whether an iteration that clears group `g` began after `clock`.
+fn cleared(iterations: Map[(Int, Int), Int], g: Int, clock: Int) -> Bool {
+  iterations.to_list().any(|((first, last), began)| first <= g && g <= last && began > clock)
+}

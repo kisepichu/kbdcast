@@ -10,8 +10,9 @@
   - ``error[E0211]: cannot find type `Array` in this scope`` と ``error[E0211]: cannot find module or trait `Array` in this scope``（3 行で 5 つ）
   - regex の syntax の wish（`wish/syntax.emel:50`、`:52`、計画の Task 4）でも、import なしの `Map[String, Int]` と `Array[Int]` に ``error[E0211]: cannot find type `Map` in this scope``（2 つ）と ``error[E0211]: cannot find type `Array` in this scope`` が出た。help は付かない
   - regex の class の wish（`wish/class.emel:15`、`:75`、`:100`、計画の Task 5）でも、import なしの `Array[Span]` と `Array[Int]` に ``error[E0211]: cannot find type `Array` in this scope`` が 3 つ出た。help は付かない
+  - regex の vm と公開 API の wish（`wish/vm.emel`、`wish/lib.emel`、計画の Task 6）でも、import なしの `Array[...]`（vm に 8 つ）、`Set[(Int, Bool)]`（vm の `:94`）、`Map[String, Int]`（lib の `:19`、`:21`）に ``error[E0211]: cannot find type `Array` in this scope`` と同じ形のものが 11 出た。help は付かない。vm の `Set.empty()` と `Map.empty()` には届かなかった（`let` の 004 の行にあった）
 - 回避策:
-  `import FoldTable.{SOURCES, TARGETS}` と `import Std.Array.{Array}`（`regex/src/fold.emel`、`regex/src/class.emel`）、`import Std.Map.{Map}`（`regex/src/syntax.emel`。Array は使わない形にした）。正しい書き方に直しただけなので、コードに印は付けない。テストも Pome の中の名前で `import Fold` と書く（text のテストの `import Lib` と同じ）
+  `import FoldTable.{SOURCES, TARGETS}` と `import Std.Array.{Array}`（`regex/src/fold.emel`、`regex/src/class.emel`）、`import Std.Map.{Map}`（`regex/src/syntax.emel`。Array は使わない形にした）。vm と公開 API（Task 6）は `import Std.Array.{Array}`、`import Std.Map.{Map}`、`import Std.Set.{Set}`（`regex/src/vm.emel`、`regex/src/lib.emel`）。正しい書き方に直しただけなので、コードに印は付けない。テストも Pome の中の名前で `import Fold` と書く（text のテストの `import Lib` と同じ）
 - コスト:
   コードのコストは無い。直すには spec を引く必要があった。同じモジュールが、Pome の中では `FoldTable`、依存する側からは `Regex.FoldTable` と、書く場所で名前が変わる。Array は std の値の層にあり（`[lib.layers]`、`proposals/array.md:233` が core に置かない理由を書く）、組み込みの扱いは core の 1 つの segment の名前のモジュールだけ（`[module.resolution]`）
 - spec:

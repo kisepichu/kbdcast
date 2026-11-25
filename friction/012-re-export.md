@@ -26,7 +26,8 @@
 - コスト:
   再公開が無いので、公開する error を内部のモジュールと共有できない、という実例になった
   - 同じ error の宣言が 2 つ（doc comment と印を合わせて syntax が 5 行、lib が 6 行）。形を変えるときは 2 か所を揃える必要があり、compiler はずれを教えない（別の名前の型なので、どちらかだけ変えても通る）
-  - 詰め替えが 3 行（Task 6–7 で書く）
+  - 詰め替えが印のコメントを含めて 4 行（`regex/src/lib.emel` の `compile`、Task 6 で書いた）。`Syntax.parse(pattern) escape { Syntax.RegexSyntax(message:, offset:) -> fail RegexSyntax(message:, offset:) }`。escape の腕の構成子は `Syntax.RegexSyntax` とモジュール名を付けて書けた（lib の `RegexSyntax` と同じ名前なので、`import Syntax.{RegexSyntax}` はできない、E0213）。2 つの型の欄が同じなので、詰め替えは欄を写すだけで、失敗する場合も情報を落とす場合も無い。性能のコストは無い（失敗したときに 1 つ作り直すだけ）
+  - lib は `RegexSyntax` を 2 か所で作る: 詰め替えと、展開した命令列が大きすぎるときの `pattern too large`（offset 0、ESCALATION 3 の判断）。後者は lib の型を直接作るので詰め替えは要らない
   - 2 つは名前で区別される別の型（`[data.type]`）。`Regex.Syntax.parse` を直接呼ぶ人には `Regex.RegexSyntax` ではなく `Regex.Syntax.RegexSyntax` が返り、`import Regex.{RegexSyntax}` の escape の腕では受けられない。regex の Pome の中のテスト（`regex/test/syntax_test.emel`）は `import Syntax.{RegexSyntax}` で syntax の方を受ける
   - Task 4 が判断を待って一度止まった
   - 普段のコードに基盤レベルは漏れていない（`fails` は公開 API の設計として選んだもの）

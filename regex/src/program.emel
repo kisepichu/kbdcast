@@ -1,0 +1,287 @@
+# Compiles an Ast to a `Vm.Program`, in the shapes of Barrière and Pit-Claudel's paper and their
+# engine RegElk (see `Vm`). Each node becomes code whose jumps are relative, so the code of a
+# repeated body is built once and copied.
+#
+# A quantifier `e{min,max}` (`*` is `{0,}`, `+` is `{1,}`, `?` is `{0,1}`) becomes:
+# - `min` mandatory copies of `e`, each after an Iterate that clears the groups inside `e`;
+# - for `max = None` and an `e` that cannot match the empty string (`min` >= 1): a Fork back to the
+#   start of the last mandatory copy (§4.5.2);
+# - for `max = None` otherwise: a loop of optional copies;
+# - for `max = Some(max)`: `max - min` optional copies, each inside the one before it, so that
+#   skipping one skips the rest.
+# An optional copy of an `e` that can match the empty string sits between BeginLoop and EndLoop
+# (§4.1). A greedy quantifier prefers the next iteration, a lazy one prefers to stop.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment, and `emela doc` does not show it.
+
+import Class.{CharSet, EMPTY, DIGIT, SPACE}
+import Fold
+import Std.Array.{Array}
+import Syntax.{
+  Ast,
+  Node,
+  Literal,
+  Dot,
+  Class,
+  Assert,
+  Concat,
+  Alternate,
+  Group,
+  Repeat,
+  ClassItem,
+  Single,
+  Range,
+  Escape,
+  ClassEscape,
+  Digit,
+  NotDigit,
+  Word,
+  NotWord,
+  Space,
+  NotSpace,
+}
+import Vm.{Program, Inst, Consume, Fork, Jump, Save, Iterate, BeginLoop, EndLoop, Check, Accept}
+
+## The most instructions a program may have. Counted repetition is unrolled, and nested counts
+## multiply: `(?:(?:a{1000}){1000}){1000}` would take 10^9 instructions. As RE2's `max_mem` and
+## Rust regex's `size_limit` do, `build` refuses a pattern whose program would be larger, which
+## keeps a match within O(MAX_SIZE · n) steps for an input of n code points.
+pub const MAX_SIZE: Int = 100_000
+
+## The program of `ast`, with the flags that change what it matches. `None` if the program would
+## have more than MAX_SIZE instructions: the size is counted from `ast` before anything is built.
+pub fn build(ast: Ast, ignore_case: Bool, multiline: Bool, dot_all: Bool) -> Option[Program] {
+  if size(ast.root) + 1 > MAX_SIZE {
+    None
+  } else {
+    insts = code(ast.root, ignore_case, dot_all).append([Accept])
+    Some(
+      Program(
+        insts: Array.from_list(insts),
+        group_count: ast.group_count,
+        ignore_case:,
+        multiline:,
+      ),
+    )
+  }
+}
+
+# The number of instructions in the code of `node`, or MAX_SIZE + 1 if there are more (the exact
+# number of a deep nesting of counts does not fit in an Int). It follows the shapes of `code`.
+fn size(node: Node) -> Int {
+  node match {
+    # FRICTION(015): there is no or-pattern, so each node of one instruction has its own arm.
+    Literal(_)               -> 1
+    Dot                      -> 1
+    Class(..)                -> 1
+    Assert(_)                -> 1
+    Concat(nodes)            -> sum(nodes.map(size))
+    Alternate(nodes)         -> sum([2 * (nodes.length() - 1), ..nodes.map(size)])
+    Group(body:, ..)         -> capped(size(body) + 2)
+    # `e{0}` matches the empty string and has no code, whatever `e` is.
+    Repeat(max: Some(0), ..) -> 0
+    Repeat(body:, min:, max:, ..) -> {
+      nullable = can_be_empty(body)
+      iteration = clear(body).length() + size(body)
+      optional = iteration + if nullable { 2 } else { 0 }
+      (max, nullable) match {
+        (None, False) if min > 0 -> capped(min * iteration + 1)
+        (None, _)                -> capped(min * iteration + optional + 2)
+        (Some(max), _)           -> capped(min * iteration + (max - min) * (optional + 1))
+      }
+    }
+  }
+}
+
+fn sum(sizes: List[Int]) -> Int {
+  sizes.fold(0, |total, s| capped(total + s))
+}
+
+fn capped(n: Int) -> Int {
+  Int.min(n, MAX_SIZE + 1)
+}
+
+fn code(node: Node, ignore_case: Bool, dot_all: Bool) -> List[Inst] {
+  node match {
+    Literal(c) -> [
+      Consume(
+        set: Class.single(if ignore_case { Fold.canonicalize(c) } else { c }),
+        negated: False,
+      ),
+    ]
+    Dot -> [consume(Class.dot(dot_all), False, ignore_case)]
+    Class(items:, negated:) -> [
+      consume(union_all(items.map(|item| item_set(item, ignore_case))), negated, ignore_case),
+    ]
+    Assert(assertion) -> [Check(assertion)]
+    Concat(nodes) -> nodes.flat_map(|n| code(n, ignore_case, dot_all))
+    Alternate(nodes) -> alternate(nodes.map(|n| code(n, ignore_case, dot_all)))
+    Group(index:, body:, ..) -> [
+      Save(2 * index),
+      ..code(body, ignore_case, dot_all).append([Save(2 * index + 1)]),
+    ]
+    # `e{0}` matches the empty string: the code of `e` is not built, so its size does not matter.
+    Repeat(max: Some(0), ..) -> []
+    Repeat(body:, min:, max:, greedy:) -> repeat(
+      body,
+      code(body, ignore_case, dot_all),
+      min,
+      max,
+      greedy,
+    )
+  }
+}
+
+# With `ignore_case`, ECMAScript compares canonical forms (CharacterSetMatcher).
+fn consume(set: CharSet, negated: Bool, ignore_case: Bool) -> Inst {
+  Consume(set: if ignore_case { set.canonicalize() } else { set }, negated:)
+}
+
+fn item_set(item: ClassItem, ignore_case: Bool) -> CharSet {
+  item match {
+    Single(c)            -> Class.single(c)
+    Range(from, to)      -> Class.range(from, to)
+    Escape(class_escape) -> escape_set(class_escape, ignore_case)
+  }
+}
+
+# `\W`, `\D` and `\S` are the complements of `\w`, `\d` and `\s`, and `\w` with `ignore_case` has
+# U+017F and U+212A.
+fn escape_set(class_escape: ClassEscape, ignore_case: Bool) -> CharSet {
+  class_escape match {
+    Digit    -> DIGIT
+    NotDigit -> DIGIT.complement()
+    Word     -> Class.word(ignore_case)
+    NotWord  -> Class.word(ignore_case).complement()
+    Space    -> SPACE
+    NotSpace -> SPACE.complement()
+  }
+}
+
+# The union of `sets`, joined in pairs, round after round: a `union` is linear in the spans of both
+# sets, so each set takes part in O(log n) of them instead of O(n).
+fn union_all(sets: List[CharSet]) -> CharSet {
+  sets match {
+    []    -> EMPTY
+    [set] -> set
+    _     -> union_all(pairs(sets, []))
+  }
+}
+
+fn pairs(sets: List[CharSet], done: List[CharSet]) -> List[CharSet] {
+  sets match {
+    [a, b, ..rest] -> pairs(rest, [a.union(b), ..done])
+    _              -> sets.append(done)
+  }
+}
+
+# Each alternative but the last is a Fork to it or to the next one, and a Jump from its end to the
+# end of the last.
+fn alternate(alternatives: List[List[Inst]]) -> List[Inst] {
+  alternatives.reverse() match {
+    [last, ..earlier] -> {
+      (code, _) = earlier.fold((last, last.length()), |(after, size), alt| {
+        n = alt.length()
+        ([Fork(first: 1, second: n + 2), ..alt.append([Jump(by: size + 1), ..after])], n + 2 + size)
+      })
+      code
+    }
+    [] -> panic("Program: an Alternate has two or more alternatives")
+  }
+}
+
+# `body` is the code of `node`. `max` is not `Some(0)`.
+fn repeat(node: Node, body: List[Inst], min: Int, max: Option[Int], greedy: Bool) -> List[Inst] {
+  nullable = can_be_empty(node)
+  iteration = clear(node).append(body)
+  optional = if nullable {
+    clear(node).append([BeginLoop, ..body.append([EndLoop])])
+  } else {
+    iteration
+  }
+  (max, nullable) match {
+    (None, False) if min > 0 -> {
+      last = iteration.length()
+      copies(iteration, min).append([choice(greedy, into: -last, past: 1)])
+    }
+    (None, _) -> {
+      n = optional.length()
+      copies(iteration, min).append(
+        [choice(greedy, into: 1, past: n + 2), ..optional.append([Jump(by: -(n + 1))])],
+      )
+    }
+    (Some(max), _) -> copies(iteration, min).append(
+      optionals(optional, optional.length(), max - min, greedy, [], 0),
+    )
+  }
+}
+
+# `count` optional copies of `optional` (of `n` instructions), each inside the one before, before
+# `after` (of `size` instructions). Each skip goes to the end of `after`.
+fn optionals(
+  optional: List[Inst],
+  n: Int,
+  count: Int,
+  greedy: Bool,
+  after: List[Inst],
+  size: Int,
+) -> List[Inst] {
+  if count <= 0 {
+    after
+  } else {
+    copy = [choice(greedy, into: 1, past: n + size + 1), ..optional.append(after)]
+    optionals(optional, n, count - 1, greedy, copy, size + n + 1)
+  }
+}
+
+# A Fork that prefers to go `into` the next iteration if `greedy`, and `past` the quantifier if not.
+fn choice(greedy: Bool, into: Int, past: Int) -> Inst {
+  if greedy { Fork(first: into, second: past) } else { Fork(first: past, second: into) }
+}
+
+# `n` copies of `code` in a row.
+# FRICTION(022): std has no `List.repeat`.
+fn copies(code: List[Inst], n: Int) -> List[Inst] {
+  List.range(0, n).flat_map(|_| code)
+}
+
+# The Iterate at the start of each iteration of a quantifier over `node`: none if `node` holds no
+# group. The groups of a node are numbered in a row, so the first and the count give the last.
+fn clear(node: Node) -> List[Inst] {
+  groups(node) match {
+    []              -> []
+    [first, ..rest] -> [Iterate(first:, last: first + rest.length())]
+  }
+}
+
+# The indices of the groups inside `node`, in order.
+fn groups(node: Node) -> List[Int] {
+  node match {
+    Group(index:, body:, ..) -> [index, ..groups(body)]
+    Concat(nodes)            -> nodes.flat_map(groups)
+    Alternate(nodes)         -> nodes.flat_map(groups)
+    Repeat(body:, ..)        -> groups(body)
+    # FRICTION(015)
+    Literal(_)               -> []
+    Dot                      -> []
+    Class(..)                -> []
+    Assert(_)                -> []
+  }
+}
+
+# Whether `node` can match the empty string: ECMAScript's nullability, without looking at what is
+# around (`\b` can, `[]` cannot).
+fn can_be_empty(node: Node) -> Bool {
+  node match {
+    # FRICTION(015)
+    Literal(_)              -> False
+    Dot                     -> False
+    Class(..)               -> False
+    Assert(_)               -> True
+    Concat(nodes)           -> nodes.all(can_be_empty)
+    Alternate(nodes)        -> nodes.any(can_be_empty)
+    Group(body:, ..)        -> can_be_empty(body)
+    Repeat(body:, min:, ..) -> min == 0 || can_be_empty(body)
+  }
+}

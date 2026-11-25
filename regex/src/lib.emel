@@ -1,15 +1,111 @@
 # Regular expressions: the regular subset of ECMAScript's syntax with the `u` flag, matched in
-# time linear in the input by a Pike VM. Positions count code points.
+# time linear in the input by a Pike VM, with the results of JavaScript's RegExp. Positions count
+# code points.
 #
-# The public API (`compile`, `is_match`, `find`, `find_all`, `replace`, `split`) is not written
-# yet. Only the error of `compile` is.
+# ```emela
+# import Regex
+# import Regex.{NO_FLAGS}
+#
+# re = Regex.compile("(?<y>\\d{4})-(?<m>\\d\\d)", NO_FLAGS)
+# Regex.find(re, "on 2026-11") # Some(m): m.start() is 3, m.text() is "2026-11", m.named("m") is Some("11")
+# ```
+#
+# FRICTION(010): a const of another module cannot be written `Regex.NO_FLAGS`, so it is imported
+# by name.
+#
+# `find_all`, `replace` and `split` are not written yet.
 #
 # FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
 # is a plain comment, and `emela doc` does not show it.
 
+import Program
+import Std.Map.{Map}
+import Std.Array.{Array}
+import Syntax
+import Text
+import Vm.{Found}
+
+## ECMAScript's `i`, `m` and `s` flags. `ignore_case` compares characters by simple case folding,
+## `multiline` lets `^` and `$` match at line terminators, and `dot_all` lets `.` match them.
+pub type Flags(ignore_case: Bool, multiline: Bool, dot_all: Bool)
+
+## No flag set. Set some with `Flags(ignore_case: True, ..NO_FLAGS)`.
+pub const NO_FLAGS: Flags = Flags(ignore_case: False, multiline: False, dot_all: False)
+
 ## Why a pattern was rejected, at `offset`: where the construct it rejected starts (the `[` or `(`
 ## of a class or group that is not closed). Offsets count code points from the start of the
-## pattern.
+## pattern. A pattern whose unrolled program would be too large (`pattern too large`) has offset
+## 0: no single construct is at fault.
 # FRICTION(012): Emela has no re-export, so this is a second declaration of the error that
 # `Syntax.parse` fails with, for `import Regex.{RegexSyntax}`.
 pub error RegexSyntax(message: String, offset: Int)
+
+## A compiled pattern.
+pub opaque type Regex(program: Vm.Program, names: Map[String, Int])
+
+## A match of a Regex in a string.
+pub opaque type Match(input: String, found: Found, names: Map[String, Int])
+
+## Compiles `pattern`, written in ECMAScript's syntax with the `u` flag. Fails with RegexSyntax
+## for what the syntax or this engine rejects, including a pattern whose counted repetitions
+## unroll to more than `Program.MAX_SIZE` instructions.
+pub fn compile(pattern: String, flags: Flags) -> Regex fails RegexSyntax {
+  # FRICTION(012): `parse` fails with the RegexSyntax of Syntax, which is another type.
+  ast = Syntax.parse(pattern) escape {
+    Syntax.RegexSyntax(message:, offset:) -> fail RegexSyntax(message:, offset:)
+  }
+  Program.build(
+    ast,
+    ignore_case: flags.ignore_case,
+    multiline: flags.multiline,
+    dot_all: flags.dot_all,
+  ) match {
+    Some(program) -> Regex(program:, names: ast.names)
+    None          -> fail RegexSyntax(message: "pattern too large", offset: 0)
+  }
+}
+
+## Whether `re` matches somewhere in `s`.
+pub fn is_match(re: Regex, s: String) -> Bool {
+  find(re, s).is_some()
+}
+
+## The first match of `re` in `s`, as JavaScript's `re.exec(s)` finds it.
+pub fn find(re: Regex, s: String) -> Option[Match] {
+  input = Array.from_list(s.code_points())
+  Vm.search(re.program, input, 0).found.map(|found| Match(input: s, found:, names: re.names))
+}
+
+## Where `m` starts, in code points.
+pub fn start(m: Match) -> Int {
+  m.found.start
+}
+
+## Where `m` ends, in code points.
+pub fn end(m: Match) -> Int {
+  m.found.end
+}
+
+## The matched text.
+pub fn text(m: Match) -> String {
+  Text.slice(m.input, m.found.start, m.found.end)
+}
+
+## The text of group `index`: 0 is the whole match. `None` for a group that did not take part in
+## the match, and for an index out of range.
+pub fn group(m: Match, index: Int) -> Option[String] {
+  if index == 0 {
+    Some(m.text())
+  } else {
+    m.found.groups.get(index - 1) match {
+      Some(Some((from, to))) -> Some(Text.slice(m.input, from, to))
+      _                      -> None
+    }
+  }
+}
+
+## The text of the group named `name`. `None` for a name the pattern does not have, and for a group
+## that did not take part in the match.
+pub fn named(m: Match, name: String) -> Option[String] {
+  m.names.get(name).and_then(|index| m.group(index))
+}
