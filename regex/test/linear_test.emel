@@ -1,3 +1,4 @@
+import Brix.Assert
 import Lib.{NO_FLAGS}
 import Program
 import Std.Array.{Array}
@@ -52,7 +53,9 @@ fn optional_copies_before_mandatory_ones_are_linear() {
 # The vm counts the threads it processes but not the strings that `replace` builds, so this test
 # measures time. `find_all` finds the same matches without building strings, so `replace` taking at
 # most 4 times as long shows that building the result costs at most a constant factor over finding
-# the matches.
+# the matches. Each of the 10 runs is timed on its own and the medians are compared, because now and
+# then a single call stalls for about 3 s (in `find_all` as often as in `replace`): such a run moves
+# a sum of the 10 runs past the bound, but not their median.
 @test
 fn replace_builds_its_result_in_time_proportional_to_the_matches() {
   re = Lib.compile("a", NO_FLAGS)
@@ -60,11 +63,16 @@ fn replace_builds_its_result_in_time_proportional_to_the_matches() {
   input = String.concat(List.range(0, 4000).map(|_| "a"))
   with SystemClock {
     clock = use Clock
-    # The milliseconds that 10 runs of `f` on `input` take.
+    # The median of the milliseconds that each of 10 runs of `f` on `input` takes.
     took = |f| {
-      start = clock.now()
-      _ = List.range(0, 10).map(|_| f(input))
-      clock.now().since(start).to_milliseconds()
+      times = List.range(0, 10).map(|_| {
+        start = clock.now()
+        _ = f(input)
+        clock.now().since(start).to_milliseconds()
+      })
+      sorted = times.sort()
+      # FRICTION(009): the positions are in range, but `List.get` returns an Option.
+      (Assert.some(sorted.get(4)) + Assert.some(sorted.get(5))) / 2
     }
     finding = |s| Lib.find_all(re, s).length()
     replacing = |s| Lib.replace(re, s, |m| m.text()).code_points().length()

@@ -12,10 +12,12 @@
   ```
   regex の class（`wish/class.emel`、計画の Task 5）でも、`:70` の `hits[i]` と `TARGETS[i]`（`canonicalize` で、set に入る source の印と target を、target の順に並べた表の位置で読む）、`:105` の `spans[mid]`（`contains` の手書きの二分探索）に添字を書いた
   regex の vm（`wish/vm.emel`、計画の Task 6）でも、`:109` の `prog.insts[t.pc]`（スレッドの命令を読む）、`:111`、`:137`、`:138`、`:145` の `input[pos]`、`input[pos - 1]`、`input[i]`（入力の code point を読む）、`:164` の `prog.enclosing[g]` に添字を書いた
+  regex の時間のテスト（`regex/test/linear_test.emel` の `replace_builds_its_result_in_time_proportional_to_the_matches`、friction-review の後の修正）でも、10 回の時間を並べ替えた List の中央値を `(sorted[4] + sorted[5]) / 2` と読みたかった。テストの中の 1 行で新しい単位ではないので、wish は書いていない
 - 診断:
   wish check（emela 0.28.2）の 14 行目の診断は `=>` のもの（``error[E0110]: expected `->` `` ほか 2 つ）だけで、`TARGETS[i]` には何も出なかった。`[grammar.expr]` の `postfix` に添字の形は無く、位置で読むのは `Array.get(a, index) -> Option[A]` だけ
   class の wish check（v0.28.2）では、`:75` の `sort_by(fn(i) { TARGETS[i] })` に E0148 と ``error[E0301]: type mismatch: expected `fn(Int, Int) -> Ordering`, found `fn(?5) -> List[Int]` `` が出た（本体の値が `[i]` の List と読まれている）。添字が無いとは言わない。`:70` と `:105` には届かなかった（`let` の 004 と、`=` で書いた関数の本体の 020）
   vm の wish check（v0.28.2）では、どの添字にも診断が届かなかった（`let` の 004、`=>` の E0110、`or` の 016 の後ろにあった）
+  テストの中央値は wish を書かずに std の `List.get` で書いたので、診断は無い
 - 回避策:
   `TARGET_ARRAY.get(i) match { Some(folded) -> folded; None -> panic(...) }`（`regex/src/fold.emel`、`FRICTION(009)` の印）。`None` は表が壊れたときだけ起きるので、`Option.or(c)` で探索の失敗と混ぜずに defect にした
   class（`regex/src/class.emel`）:
@@ -25,9 +27,12 @@
   - `instruction`: `prog.insts.get(pc) match { Some(inst) -> inst; None -> panic(...) }`（`FRICTION(009)` の印）。`Program` の最後の命令は Accept で、どの jump も中に収まるので `None` は起きない。vm はスレッドを 1 つ処理するたびにこれを呼ぶ
   - 入力の code point: `input.get(pos)` と `input.get(pos - 1)` の `None` は「入力の前か後ろ」という本当の結果（`^ $ \b \B` の判定と、最後の位置で何も消費しないこと）なので、起きない分岐は残らない。印は付けない
   - `prog.enclosing[g]`: 設計を変え（量指定子に番号を振らず、消す group の範囲で名指す）、その表が無くなった
+  テスト（`regex/test/linear_test.emel`）:
+  - 中央値: `(Assert.some(sorted.get(4)) + Assert.some(sorted.get(5))) / 2`（`FRICTION(009)` の印）。`sorted` は 10 回の時間を `List.sort` したもので、4 と 5 は範囲内なので `None` は起きない。brix の `Assert.some` が `None` で panic する match を持つので、起きない分岐は自分では書いていない。読むのは Array ではなく List なので `Array.at` の提案の直接の例にはならないが、範囲内と分かっている位置を読むのに Option が返る形は同じ
 - コスト:
   起きない分岐 1 つ（3 行）。普段のコードに基盤レベルは漏れていない。std も同じ形を書いている: `Std.Array` の `bisect` と `binary_search`（`crates/emela-core/lib/std/array.emel:154-174`）は、範囲内と分かっている `get(a, mid)` の `None` を `_` の腕に混ぜる。`proposals/array.md:76` の例は `Array.get(counts, b) |> Option.or(0)` で既定値にする
   class では起きない分岐 1 つ（印のコメントを含めて 3 行）。vm でも 1 つ（印のコメントを含めて 4 行）
+  テストでは、`Assert.some(...)` で包むだけで行は増えない（印のコメント 1 行）
 - spec:
   `[api.std.array]`（`get` は範囲外で `None`、`set` は範囲外で defect）、`[lib.api-rules]`（「Not found, or out of range: return an Option」と「A precondition of the caller is broken: it is a defect」）、`proposals/array.md:100`（読み出しの範囲外は not found、書き込みの範囲外は defect）と `:226`（`set` を Option にしなかった理由）、`[grammar.expr]`
 - 既存:
