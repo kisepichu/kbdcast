@@ -153,6 +153,8 @@ fn spans(set: CharSet) -> List[Span] {
 
 # The spans of `a` and `b`, which are each in the order of `from`, in the order of `from`, after
 # the reverse of `done`.
+# FRICTION(021): only a self tail call is guaranteed not to use the stack, so the result is built
+# in reverse in `done` instead of as `[x, ..merge(xs, b)]`.
 fn merge(a: List[Span], b: List[Span], done: List[Span]) -> List[Span] {
   (a, b) match {
     ([], _)                                  -> done.reverse().append(b)
@@ -164,6 +166,7 @@ fn merge(a: List[Span], b: List[Span], done: List[Span]) -> List[Span] {
 
 # `spans`, in the order of `from`, with the spans that overlap or touch joined, after the reverse
 # of `done`.
+# FRICTION(021)
 fn coalesce(spans: List[Span], done: List[Span]) -> List[Span] {
   (spans, done) match {
     ([], _)          -> done.reverse()
@@ -176,6 +179,7 @@ fn coalesce(spans: List[Span], done: List[Span]) -> List[Span] {
 
 # The code points from `next` to MAX_CODE_POINT that are not in `spans`, after the reverse of
 # `done`.
+# FRICTION(021)
 fn gaps(next: Int, spans: List[Span], done: List[Span]) -> List[Span] {
   spans match {
     [] if next <= MAX_CODE_POINT -> [Span(next, MAX_CODE_POINT), ..done].reverse()
@@ -188,6 +192,7 @@ fn gaps(next: Int, spans: List[Span], done: List[Span]) -> List[Span] {
 # Walks `spans` and `sources`, both in increasing order, together. The spans without the sources
 # (after the reverse of `kept`), and for each source whether it is in the spans (after the reverse
 # of `hits`).
+# FRICTION(021)
 fn remove_sources(
   spans: List[Span],
   sources: List[Int],
