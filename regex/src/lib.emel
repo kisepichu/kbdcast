@@ -1,0 +1,5 @@
+# Regular expressions: the regular subset of ECMAScript's syntax with the `u` flag, matched in
+# time linear in the input by a Pike VM. Positions count code points.
+#
+# The public API (`compile`, `is_match`, `find`, `find_all`, `replace`, `split`) is not written
+# yet.

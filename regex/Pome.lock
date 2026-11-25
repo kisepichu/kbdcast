@@ -1,0 +1,10 @@
+# Written by `emela pome`. Do not edit.
+version = 1
+
+[[pome]]
+path = "github.com/emela-lang/brix"
+version = "v0.4.0"
+commit = "a685c98b611fcc4418d698a4b71260547e10f0ff"
+hash = "h1:h6uiy2Ff1MYLg8ROnxf7nHm5HruRhv8/4jRzQmiaoJo="
+manifest = "h1:bd40T0AkFC4/t2L4czRcxiNUdIJFlIGkoylNqNLpnw0="
+dev = true
