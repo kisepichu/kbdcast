@@ -10,4 +10,4 @@
 - コスト: 道具に filter が 1 つ。手で emela を呼ぶと毎回警告が出る
 - spec: なし（README の Install は「Linux (x86_64)」とだけ書き、glibc の要件を書いていない）
 - 既存: issue は無い（「GLIBC」「glibc」で検索、2026-11-23）。release は `.github/workflows/release-plz.yml` で `ubuntu-latest` を使って build している
-- 行き先: spec と実装のずれ → issue（未提出。出す前に user に確認する）
+- 行き先: spec と実装のずれ → issue
