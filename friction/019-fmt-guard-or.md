@@ -1,6 +1,6 @@
 # 019 fmt-guard-or
 
-- 状態: open
+- 状態: filed
 - Emela: v0.28.2
 - 意図: `regex/src/syntax.emel` を `emela fmt` で整える（`tools/check.ts` が `emela fmt --check` を走らせる）。その中に、or-pattern の代わり（015）の長い `||` の guard がある
 - こう書きたかった:
@@ -36,4 +36,4 @@
   `[fmt.wrap]`（「The formatter does not break before `-` or `||` outside brackets ... A chain of `||` that does not fit outside brackets is enclosed in parentheses, and broken before each `||` inside them.」）、`[lex.continuation]`（行頭の `||` は anonymous function を始める）、`[fmt.block]`
 - 既存: emela の issue に無い（2026-11-25 に取得した issue と PR の 864 件を、「guard」「ガード」「cannot format this file」「internal error」で検索。当たったのは別の話題）
 - 行き先:
-  spec と実装がずれている（fmt のバグ）→ issue。下書き（未提出。出すのは user）: `emela fmt` breaks a `||` chain in a match guard that does not fit the width before each `||`, without the parentheses that `[fmt.wrap]` adds outside brackets, and then stops with `internal error: cannot format this file: the output has a syntax error: expected '->'`, leaving the whole file unformatted. The same chain in a function body is enclosed in parentheses, and an `&&` chain in a guard is broken fine. Reproduction: the function above (v0.28.2). The offset in the message is in the formatter's output, so it does not point at the arm in the input either
+  spec と実装がずれている（fmt のバグ）→ issue: https://github.com/emela-lang/emela/issues/897（2026-11-26 に user が出した。main の 596b603 から build した emela でも同じ形で止まる）。修正の PR: https://github.com/emela-lang/emela/pull/898（2026-11-26、fork の kisepichu/emela から。`if` の条件でも同じ原因で止まることと、手で書いた括弧の形が変わることも直す。`[fmt.wrap]` の文と、括弧の中の改行の実装とのずれは、PR で作者に相談した）
