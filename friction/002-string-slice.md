@@ -5,14 +5,18 @@
 - 意図: regex で一致した範囲（code point の offset）の文字列を取り出す．code point の List から文字列を組み立てる．kbdcast の regex の spec（`docs/superpowers/specs/2026-11-25-kbdcast-R-regex-design.md` §4，§10）が「String の部分文字列の関数が無い」として予想していた friction
 - こう書きたかった:
   std の関数として `String.slice(s, from, to)` と `String.from_code_points(cps)` を呼ぶ．std の外で書くなら `wish/text.emel` の形（`String.code_points` を `List.drop` と `List.take` で切り，`String.from_scalars` で戻す）
+  key codec の表記（`wish/notation.emel:49`，`:56`，`:61`，サブプロジェクト 2 の計画の Task 3）でも，`<` と `>` の間の文字列（error に出す `<Ecs>` の中身）と名前を，code point の List から `String.from_code_points(...)` で作った
 - 診断:
   repo の外の使い捨ての Pome で `String.slice(s, 1, 2)` と `String.from_code_points(cps)` を `emela check` した結果（v0.28.2，2026-11-25）: ``error[E0212]: module `String` has no `slice` `` と ``error[E0212]: module `String` has no `from_code_points` ``（こちらには ``= help: did you mean `from_code_point`?`` が付く）．wish check では ``error[E0212]: module `String` has no `from_scalars` ``
+  表記の wish check（v0.28.2）では，3 か所とも `let`（004）と前置の match（E0142）の行にあり，届かなかった（`:56` の ``error[E0217]: expected constructor, found type `String` `` は，`=>` の後ろの行がパターンとして読まれた後追い）
 - 回避策:
   `text` Pome（`text/src/lib.emel`）に `Text.slice` と `Text.from_code_points` を std に入れるならこうなる形で置いた．印はモジュールの先頭のコメント（Emela にモジュールの doc comment は無い．008）の `FRICTION(002)`．中身は `String.code_points` の List を `List.drop` と `List.take` で切り，`String.from_code_point` で 1 つずつ戻して `List.join` する（戻すときに起きない `None` を扱う回り道は 003）
+  表記（`src/key/notation.emel` の `string_of`，`FRICTION(002)` の印）: root の Pome は text に依存しない（key codec の spec §3 で，依存はテストの brix だけ）ので，`cps.map(text_of).join("")` を private に書いた（`text_of` の起きない `None` は 003）．`<C-C-x>` と `<Ecs>` の error の中身と，名前を string の literal のパターンで引く所（`named`）の 3 か所から呼ぶ（呼ぶ所にも `FRICTION(002)` の印）
 - コスト:
   Pome が 1 つ（実装 20 行ほど，テスト 70 行ほど）．`slice` は呼ぶたびに `s` 全体を code point の List にするので O(`s` の code point の数)．`Bytes.slice` と `Array.slice` は O(`to - from`) 以下と書かれている．regex の `find_all` のように同じ文字列から k 回切り出すと O(k × n) になる．普段のコードに基盤レベルは漏れていない
   regex（`regex/src/lib.emel`）は `Text.slice` を避けることになった．`Text.slice` は呼ぶたびに文字列の全体をたどるので，`replace` と `split`（計画の Task 7）が一致の数 k に対して k + 1 回呼ぶと O(k × n) になり，`Match` の `text` と `group` も 1 つごとに O(n) だった．最終レビューのあとで，入力を code point の Array にするのを 1 回の呼び出しにつき 1 回にし，部分をその Array の範囲から `Text.from_code_points(input.slice(from, to).to_list())` で作るように変えた（`string_of`．`Match` は String の代わりにその Array を持つ．起きない `None` を `panic` にする回り道は 003）．印は `regex/src/lib.emel` の先頭のコメントの `FRICTION(002)`．std に O(`to - from`) の `slice` があれば，`Match` は String を持ったまま `slice` を呼べばよく，Array も `string_of` も要らない
   計測（bun，使い捨ての Pome で前と後の regex を並べ，`Regex.compile` を除いた時間を `Std.Clock` で計った，2026-11-26）: `a1` を並べた入力を `\d` で `split` すると（3 回ずつ），10000 code point（5001 個の piece）で前が 2073–2294 ms，後が 41–49 ms．20000 code point（10001 個の piece）で前が 9360–12216 ms（Task 7 の報告では compile を含めて 10.2 秒），後が 52–59 ms．前は入力を 2 倍にすると 4 倍を超えて増える．`a` を n 個並べた入力で各 `a` をその `text()` に置き換える `replace` を 10 回続けた時間は（3 回の実行で 3 組ずつ），n = 4000 で前が 7236–10754 ms，後が 224–296 ms．同じ組で計った，同じ入力の `find_all`（文字列を作らない）を 10 回続けた時間（前も後も 138–219 ms）に対して，前は 37–61 倍，後は 1.3–2.0 倍
+  表記: 補助関数 1 つ（3 行）．入力の String から `<` と `>` の間を `slice` で取れれば，error の 2 か所は code point を String に戻さずに済み，名前も `String.to_ascii_lowercase(String.slice(...))` で引ける
 - spec:
   `[target.string]`（「There is no API that takes a position as a number」），`[api.string]`，`[lib.api-rules]`，`[api.std.bytes]` と `[api.std.array]` の `slice`，`[api.std.json]` の `SyntaxError` の `offset`
 - 既存:

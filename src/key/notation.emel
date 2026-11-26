@@ -1,0 +1,317 @@
+# The vim notation of keys: what a `>` line of a tape holds, and how the overlay shows a key.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
+
+import Key.{
+  Key,
+  KeyCode,
+  Mods,
+  NO_MODS,
+  Char,
+  Enter,
+  Esc,
+  Tab,
+  Backspace,
+  Delete,
+  Insert,
+  Up,
+  Down,
+  Left,
+  Right,
+  Home,
+  End,
+  PageUp,
+  PageDown,
+  Function,
+}
+import Std.Set.{Set}
+
+## `parse` could not read a `<...>`. `offset` counts code points from the start of the input to
+## the `<`.
+pub error NotationError(message: String, offset: Int)
+
+# FRICTION(013): Emela has no literal for the code point of a character, so the characters that
+# patterns look at have names.
+const SPACE: Int = 0x20
+const HYPHEN: Int = 0x2D
+const DIGIT_ZERO: Int = 0x30
+const DIGIT_ONE: Int = 0x31
+const DIGIT_NINE: Int = 0x39
+const LESS_THAN: Int = 0x3C
+const GREATER_THAN: Int = 0x3E
+const SMALL_A: Int = 0x61
+const SMALL_C: Int = 0x63
+const SMALL_D: Int = 0x64
+const SMALL_F: Int = 0x66
+const SMALL_M: Int = 0x6D
+const SMALL_S: Int = 0x73
+
+## The keys of `s`, the content of a `>` line. A `<` starts one key if what follows it is
+## modifiers and a name and `>` (`<CR>`, `<C-Space>`), or one or more modifiers and any one
+## character and `>` (`<C-]>`, `<M-あ>`, `<C->>`). Names and modifiers are read in any case:
+##
+## - names: `CR` (also `Enter` and `Return`), `Esc`, `Tab`, `BS`, `Del`, `Insert`, `Up`, `Down`,
+##   `Left`, `Right`, `Home`, `End`, `PageUp`, `PageDown`, `F1` to `F12`, `Space`, `lt`
+## - modifiers: `C-`, `M-` (also `A-`), `S-`, `D-`
+##
+## Ctrl without Shift makes an ASCII capital letter small (`<C-A>` is `<C-a>`, as in vim), and
+## then `Key.key` brings the key to normal form (`<S-a>` is `A`).
+##
+## Fails if what follows a `<` is ASCII letters, digits and `-` up to a `>` but no key (`<Ecs>`,
+## `<x>`, `<F13>`), or holds the same modifier twice (`<C-C-x>`). Any other `<` is the character
+## (`a < b`, `<C-x` without its `>`, `<<EOF`).
+pub fn parse(s: String) -> List[Key] fails NotationError {
+  keys(s.code_points(), 0, [])
+}
+
+# The keys of `cs`, which starts `offset` code points into the input, after the reverse of `done`.
+# FRICTION(021): the keys are put in `done` in reverse, so that the call to `keys` is a tail call.
+fn keys(cs: List[Int], offset: Int, done: List[Key]) -> List[Key] fails NotationError {
+  cs match {
+    []          -> done.reverse()
+    [LESS_THAN, ..rest] -> angle(rest) match {
+      Read(key:, length:) -> keys(rest.drop(length), offset + 1 + length, [key, ..done])
+      UnknownName(body)   -> fail NotationError(message: "unknown key name: <#{body}>", offset:)
+      DuplicateModifier(body) -> fail NotationError(
+        message: "duplicate modifier in <#{body}>",
+        offset:,
+      )
+      NotAKey             -> keys(rest, offset + 1, [character(LESS_THAN), ..done])
+    }
+    [c, ..rest] -> keys(rest, offset + 1, [character(c), ..done])
+  }
+}
+
+# What a `<` starts.
+enum Angle {
+  # A key, and the number of code points after the `<` up to and including its `>`.
+  Read(key: Key, length: Int)
+  # ASCII letters, digits and `-` up to a `>` that are no key: the text between `<` and `>`.
+  UnknownName(String)
+  # A key with a modifier written twice: the text between `<` and `>`.
+  DuplicateModifier(String)
+  # Nothing: the `<` is the character.
+  NotAKey
+}
+
+enum Modifier {
+  Ctrl
+  Alt
+  Shift
+  Super
+} derive Eq, Ord
+
+# What the code points `cs` after a `<` make it start.
+fn angle(cs: List[Int]) -> Angle {
+  (written, rest) = modifiers(cs, [])
+  # Each modifier is a letter and `-`.
+  start = written.length() * 2
+  (name, after_name) = span(rest, is_ascii_alphanumeric)
+  target = rest match {
+    [c, GREATER_THAN, ..] if !written.is_empty() -> Some((Char(c), start + 2))
+    _ -> after_name match {
+      [GREATER_THAN, ..] -> named(name).map(|code| (code, start + name.length() + 1))
+      _                  -> None
+    }
+  }
+  target match {
+    Some((code, length)) -> {
+      held = Set.from_list(written)
+      # FRICTION(018): List has no `has_duplicates` (nor `contains`), so the modifiers are a Set,
+      # and a duplicate is a Set smaller than the List.
+      if held.size() < written.length() {
+        # FRICTION(002)
+        DuplicateModifier(string_of(cs.take(length - 1)))
+      } else {
+        Read(key: build(code, held), length:)
+      }
+    }
+    None -> {
+      (body, after_body) = span(cs, |c| is_ascii_alphanumeric(c) || c == HYPHEN)
+      after_body match {
+        # FRICTION(002)
+        [GREATER_THAN, ..] if !body.is_empty() -> UnknownName(string_of(body))
+        _                                      -> NotAKey
+      }
+    }
+  }
+}
+
+# The modifiers at the start of `cs` (each one a letter and `-`), with those of `done`, and what
+# follows them. Their order does not matter, so they are kept in the reverse of the written order.
+fn modifiers(cs: List[Int], done: List[Modifier]) -> (List[Modifier], List[Int]) {
+  cs match {
+    [c, HYPHEN, ..rest] -> modifier(c) match {
+      Some(m) -> modifiers(rest, [m, ..done])
+      None    -> (done, cs)
+    }
+    _ -> (done, cs)
+  }
+}
+
+fn modifier(c: Int) -> Option[Modifier] {
+  to_ascii_lowercase(c) match {
+    SMALL_C -> Some(Ctrl)
+    SMALL_M -> Some(Alt)
+    # FRICTION(015): there is no or-pattern, so `A-`, the other name of `M-`, has an arm of its
+    # own.
+    SMALL_A -> Some(Alt)
+    SMALL_S -> Some(Shift)
+    SMALL_D -> Some(Super)
+    _       -> None
+  }
+}
+
+# What the name `name` (ASCII letters and digits) stands for, in any case.
+fn named(name: List[Int]) -> Option[KeyCode] {
+  lowered = name.map(to_ascii_lowercase)
+  # FRICTION(002)
+  string_of(lowered) match {
+    "cr"       -> Some(Enter)
+    # FRICTION(015): there is no or-pattern, so the other names of `CR` have arms of their own.
+    "enter"    -> Some(Enter)
+    "return"   -> Some(Enter)
+    "esc"      -> Some(Esc)
+    "tab"      -> Some(Tab)
+    "bs"       -> Some(Backspace)
+    "del"      -> Some(Delete)
+    "insert"   -> Some(Insert)
+    "up"       -> Some(Up)
+    "down"     -> Some(Down)
+    "left"     -> Some(Left)
+    "right"    -> Some(Right)
+    "home"     -> Some(Home)
+    "end"      -> Some(End)
+    "pageup"   -> Some(PageUp)
+    "pagedown" -> Some(PageDown)
+    "space"    -> Some(Char(SPACE))
+    "lt"       -> Some(Char(LESS_THAN))
+    _          -> function_key(lowered)
+  }
+}
+
+# F1 to F12: `f` and a number without a leading zero. `Key.f_key` rejects the numbers above 12.
+fn function_key(lowered: List[Int]) -> Option[KeyCode] {
+  number = lowered match {
+    [SMALL_F, d] if d >= DIGIT_ONE && d <= DIGIT_NINE             -> Some(d - DIGIT_ZERO)
+    [SMALL_F, DIGIT_ONE, d] if d >= DIGIT_ZERO && d <= DIGIT_NINE -> Some(10 + d - DIGIT_ZERO)
+    _                                                             -> None
+  }
+  number.and_then(Key.f_key).map(|f| Function(f))
+}
+
+# The key `code` with the modifiers `held`.
+fn build(code: KeyCode, held: Set[Modifier]) -> Key {
+  mods = Mods(
+    ctrl: held.contains(Ctrl),
+    alt: held.contains(Alt),
+    shift: held.contains(Shift),
+    super: held.contains(Super),
+  )
+  code = code match {
+    # `<C-A>` is `<C-a>`, as in vim.
+    Char(c) if mods.ctrl && !mods.shift && is_ascii_uppercase(c) -> Char(to_ascii_lowercase(c))
+    _                                                            -> code
+  }
+  Key.key(code, mods) |> expect("a name or a String gives only scalar values and F1 to F12")
+}
+
+# The character `c` without modifiers.
+fn character(c: Int) -> Key {
+  Key.key(Char(c), NO_MODS) |> expect("the code points of a String are scalar values")
+}
+
+## `k` in the notation that `parse` reads, with the canonical name and the modifiers in the order
+## `C-M-S-D-`. A character without modifiers is itself, except a space (`<Space>`) and `<`
+## (`<lt>`). Ctrl with an ASCII capital letter, which means Ctrl and Shift, is `<C-S-a>`.
+pub fn print(k: Key) -> String {
+  mods = k.mods()
+  k.code() match {
+    Char(c) if mods.ctrl && is_ascii_uppercase(c) -> bracket(
+      Mods(shift: True, ..mods),
+      text_of(to_ascii_lowercase(c)),
+    )
+    Char(c) if mods == NO_MODS && c != SPACE && c != LESS_THAN -> text_of(c)
+    code -> bracket(mods, name(code))
+  }
+}
+
+# `<`, the modifiers of `mods`, `name` and `>`.
+fn bracket(mods: Mods, name: String) -> String {
+  c = if mods.ctrl { "C-" } else { "" }
+  m = if mods.alt { "M-" } else { "" }
+  s = if mods.shift { "S-" } else { "" }
+  d = if mods.super { "D-" } else { "" }
+  "<#{c}#{m}#{s}#{d}#{name}>"
+}
+
+fn name(code: KeyCode) -> String {
+  code match {
+    Char(SPACE)     -> "Space"
+    Char(LESS_THAN) -> "lt"
+    Char(c)         -> text_of(c)
+    Enter           -> "CR"
+    Esc             -> "Esc"
+    Tab             -> "Tab"
+    Backspace       -> "BS"
+    Delete          -> "Del"
+    Insert          -> "Insert"
+    Up              -> "Up"
+    Down            -> "Down"
+    Left            -> "Left"
+    Right           -> "Right"
+    Home            -> "Home"
+    End             -> "End"
+    PageUp          -> "PageUp"
+    PageDown        -> "PageDown"
+    Function(f)     -> "F#{f.f_number()}"
+  }
+}
+
+# FRICTION(041): List has no `take_while` (or `span`), so the run is cut where `find_index` finds
+# the first code point that `f` rejects.
+# The longest start of `cs` whose code points `f` accepts, and the rest.
+fn span(cs: List[Int], f: fn(Int) -> Bool) -> (List[Int], List[Int]) {
+  n = cs.find_index(|c| !f(c)).or(cs.length())
+  (cs.take(n), cs.drop(n))
+}
+
+# FRICTION(002): String has no `from_code_points`, so the text between `<` and `>`, and a name, are
+# built back from their code points one by one.
+fn string_of(cps: List[Int]) -> String {
+  cps.map(text_of).join("")
+}
+
+# FRICTION(003): `String.from_code_point` gives an Option even for a code point taken from a String
+# or from a Key, which are scalar values.
+fn text_of(c: Int) -> String {
+  String.from_code_point(c) |> expect("the code point comes from a String or a Key")
+}
+
+# FRICTION(040): Option has no `expect`, so a None that cannot happen is a match with a panic.
+fn expect[A](opt: Option[A], why: String) -> A {
+  opt match {
+    Some(a) -> a
+    None    -> panic("None, but #{why}")
+  }
+}
+
+# FRICTION(039): std has no predicates or case conversion on a code point, so these are written
+# here.
+# FRICTION(013)
+fn is_ascii_uppercase(c: Int) -> Bool {
+  c >= 0x41 && c <= 0x5A # A to Z
+}
+
+# FRICTION(039)
+# FRICTION(013)
+fn is_ascii_alphanumeric(c: Int) -> Bool {
+  (c >= 0x30 && c <= 0x39) || is_ascii_uppercase(c) || (c >= 0x61 && c <= 0x7A) # 0-9, A-Z, a-z
+}
+
+# FRICTION(039)
+# FRICTION(013): a small letter is 0x20 above its capital.
+fn to_ascii_lowercase(c: Int) -> Int {
+  if is_ascii_uppercase(c) { c + 0x20 } else { c }
+}

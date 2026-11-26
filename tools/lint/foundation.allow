@@ -3,3 +3,4 @@
 # 形式: <repo からの相対パス>  # <理由>
 regex/src/syntax.emel  # parser の関数が RegexSyntax で失敗し、その RegexSyntax を parse まで伝える。parse を呼ぶ lib の compile が、lib の RegexSyntax に詰め替える（公開する error は、friction 012 のとおり lib にもう 1 つ宣言する）
 regex/src/lib.emel  # library の公開 API（compile など）が RegexSyntax を宣言する。Syntax.RegexSyntax を詰め替えて返す（FRICTION(012)）
+src/key/notation.emel  # 公開 API の parse が NotationError を宣言する（tape の行の誤りを、tape のパーサが行番号を足して外に出す）

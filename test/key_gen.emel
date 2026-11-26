@@ -1,0 +1,87 @@
+# Generators of keys for the property tests of the notation (`notation_test.emel`) and of the
+# encoding.
+#
+# FRICTION(028): brix's Gen has no choice from a list of values (`element`) and no `bool`, so they
+# are written here.
+
+import Brix.Pbt.Gen.{Gen}
+import Key.{
+  Key,
+  KeyCode,
+  Mods,
+  Char,
+  Enter,
+  Esc,
+  Tab,
+  Backspace,
+  Delete,
+  Insert,
+  Up,
+  Down,
+  Left,
+  Right,
+  Home,
+  End,
+  PageUp,
+  PageDown,
+  Function,
+}
+
+## A key in normal form: one of `codes` with each of the four modifiers held or not, made by
+## `Key.key`.
+pub fn keys() -> Gen[Key] {
+  Gen.pair(element(codes()), mods())
+    |> Gen.map(|(code, mods)| expect(Key.key(code, mods), "every code is a scalar value or F1-F12"))
+}
+
+# An ASCII printable character, `é` (U+E9), `あ` (U+3042), `😀` (U+1F600), a control character
+# (0x00 to 0x1F, 0x7F), a special key, or F1 to F12.
+fn codes() -> List[KeyCode] {
+  # FRICTION(013)
+  chars = [List.range(0x20, 0x7F), [0xE9, 0x3042, 0x1F600], List.range(0x00, 0x20), [0x7F]].flatten(
+  ).map(|c| Char(c))
+  specials = [
+    Enter,
+    Esc,
+    Tab,
+    Backspace,
+    Delete,
+    Insert,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+  ]
+  functions = List.range(1, 13).map(|n| Function(expect(Key.f_key(n), "n is 1 to 12")))
+  [chars, specials, functions].flatten()
+}
+
+# Each of the four modifiers held or not.
+fn mods() -> Gen[Mods] {
+  Gen.pair(Gen.pair(bool(), bool()), Gen.pair(bool(), bool()))
+    |> Gen.map(|((ctrl, alt), (shift, super))| Mods(ctrl:, alt:, shift:, super:))
+}
+
+# FRICTION(028): brix has no `element`.
+# One of `values`. Shrinks toward the first one.
+fn element[A](values: List[A]) -> Gen[A] {
+  Gen.int_between(0, values.length() - 1)
+    |> Gen.map(|i| expect(values.get(i), "i is an index of values"))
+}
+
+# FRICTION(028): brix has no `bool`.
+fn bool() -> Gen[Bool] {
+  Gen.int_between(0, 1) |> Gen.map(|n| n == 1)
+}
+
+# FRICTION(040): Option has no `expect`, so a None that cannot happen is a match with a panic.
+fn expect[A](opt: Option[A], why: String) -> A {
+  opt match {
+    Some(a) -> a
+    None    -> panic("None, but #{why}")
+  }
+}
