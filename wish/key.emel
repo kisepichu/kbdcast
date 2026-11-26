@@ -1,0 +1,406 @@
+# wish-target: src/key.emel
+# キーの型。Key は正規形だけを持ち、作れるのは key だけ。
+
+pub opaque type Key(code: KeyCode, mods: Mods) deriving (Eq, Show)
+
+pub enum KeyCode {
+  Char(Int)
+  | Enter | Esc | Tab | Backspace | Delete | Insert
+  | Up | Down | Left | Right | Home | End | PageUp | PageDown
+  | F(FKey)
+} deriving (Eq, Show)
+
+pub type Mods(ctrl: Bool, alt: Bool, shift: Bool, super: Bool) deriving (Eq, Show)
+
+pub const NO_MODS: Mods = Mods(ctrl: False, alt: False, shift: False, super: False)
+
+# 1 から 12
+pub opaque type FKey(number: Int) deriving (Eq, Show)
+
+pub fn f_key(n: Int) -> Option[FKey] =
+  if n >= 1 && n <= 12 { Some(FKey(number: n)) } else { None }
+
+pub fn f_number(f: FKey) -> Int = f.number
+
+pub fn code(k: Key) -> KeyCode = k.code
+
+pub fn mods(k: Key) -> Mods = k.mods
+
+# 正規形にする。None は Char が scalar value でないときだけ。
+pub fn key(code: KeyCode, mods: Mods) -> Option[Key] =
+  match code {
+    Char(c) if !CodePoint.is_scalar_value(c) -> None
+    Char(c) if CodePoint.is_control(c) -> {
+      # 制御文字は代表にし、もとの修飾を足してから、もう一度正規形にする
+      let (rep, rep_mods) = control_representative(c)
+      key(rep, union(rep_mods, mods))
+    }
+    Char(c) if mods.shift && c >= 'a' && c <= 'z' ->
+      Some(Key(code: Char(c - 'a' + 'A'), mods: Mods { ..mods, shift: False }))
+    Char(c) if mods.shift && (c >= 'A' && c <= 'Z' || CodePoint.is_ascii_punctuation(c)) ->
+      Some(Key(code: Char(c), mods: Mods { ..mods, shift: False }))
+    _ -> Some(Key(code: code, mods: mods))
+  }
+
+# spec §6 の代表
+fn control_representative(c: Int) -> (KeyCode, Mods) =
+  match c {
+    0x00 -> (Char(' '), CTRL)
+    0x08 | 0x7F -> (Backspace, NO_MODS)
+    0x09 -> (Tab, NO_MODS)
+    0x0D -> (Enter, NO_MODS)
+    0x1B -> (Esc, NO_MODS)
+    0x1C..=0x1F -> (Char(c + 0x40), CTRL)
+    _ -> (Char(c + 0x60), CTRL)
+  }
+
+const CTRL: Mods = Mods { ..NO_MODS, ctrl: True }
+
+fn union(a: Mods, b: Mods) -> Mods =
+  Mods(
+    ctrl: a.ctrl || b.ctrl,
+    alt: a.alt || b.alt,
+    shift: a.shift || b.shift,
+    super: a.super || b.super,
+  )
+
+# --- wish check (emela 0.28.2) ---
+# (Pome.toml は wish check が仮に置いた: Pome.toml)
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key.emel:38:35 ]
+#     │
+#  38 │     Char(c) if mods.shift && c >= 'a' && c <= 'z' ->
+#     │                                   ┬  
+#     │                                   ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key.emel:38:37 ]
+#     │
+#  38 │     Char(c) if mods.shift && c >= 'a' && c <= 'z' ->
+#     │                                     ┬  
+#     │                                     ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key.emel:38:47 ]
+#     │
+#  38 │     Char(c) if mods.shift && c >= 'a' && c <= 'z' ->
+#     │                                               ┬  
+#     │                                               ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key.emel:38:49 ]
+#     │
+#  38 │     Char(c) if mods.shift && c >= 'a' && c <= 'z' ->
+#     │                                                 ┬  
+#     │                                                 ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key.emel:39:31 ]
+#     │
+#  39 │       Some(Key(code: Char(c - 'a' + 'A'), mods: Mods { ..mods, shift: False }))
+#     │                               ┬  
+#     │                               ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key.emel:39:33 ]
+#     │
+#  39 │       Some(Key(code: Char(c - 'a' + 'A'), mods: Mods { ..mods, shift: False }))
+#     │                                 ┬  
+#     │                                 ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key.emel:39:37 ]
+#     │
+#  39 │       Some(Key(code: Char(c - 'a' + 'A'), mods: Mods { ..mods, shift: False }))
+#     │                                     ┬  
+#     │                                     ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key.emel:39:39 ]
+#     │
+#  39 │       Some(Key(code: Char(c - 'a' + 'A'), mods: Mods { ..mods, shift: False }))
+#     │                                       ┬  
+#     │                                       ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key.emel:40:36 ]
+#     │
+#  40 │     Char(c) if mods.shift && (c >= 'A' && c <= 'Z' || CodePoint.is_ascii_punctuation(c)) ->
+#     │                                    ┬  
+#     │                                    ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key.emel:40:38 ]
+#     │
+#  40 │     Char(c) if mods.shift && (c >= 'A' && c <= 'Z' || CodePoint.is_ascii_punctuation(c)) ->
+#     │                                      ┬  
+#     │                                      ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key.emel:40:48 ]
+#     │
+#  40 │     Char(c) if mods.shift && (c >= 'A' && c <= 'Z' || CodePoint.is_ascii_punctuation(c)) ->
+#     │                                                ┬  
+#     │                                                ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key.emel:40:50 ]
+#     │
+#  40 │     Char(c) if mods.shift && (c >= 'A' && c <= 'Z' || CodePoint.is_ascii_punctuation(c)) ->
+#     │                                                  ┬  
+#     │                                                  ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key.emel:48:19 ]
+#     │
+#  48 │     0x00 -> (Char(' '), CTRL)
+#     │                   ┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key.emel:48:21 ]
+#     │
+#  48 │     0x00 -> (Char(' '), CTRL)
+#     │                     ┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#    ╭─[ src/key.emel:4:48 ]
+#    │
+#  4 │ pub opaque type Key(code: KeyCode, mods: Mods) deriving (Eq, Show)
+#    │                                                ────┬───  
+#    │                                                    ╰───── 
+# ───╯
+#
+# error[E0110]: expected variant name
+#    ╭─[ src/key.emel:8:3 ]
+#    │
+#  8 │   | Enter | Esc | Tab | Backspace | Delete | Insert
+#    │   ┬  
+#    │   ╰── 
+# ───╯
+#
+# error[E0110]: expected `,` or newline between variants
+#    ╭─[ src/key.emel:8:5 ]
+#    │
+#  8 │   | Enter | Esc | Tab | Backspace | Delete | Insert
+#    │     ──┬──  
+#    │       ╰──── 
+# ───╯
+#
+# error[E0110]: expected variant name
+#    ╭─[ src/key.emel:9:3 ]
+#    │
+#  9 │   | Up | Down | Left | Right | Home | End | PageUp | PageDown
+#    │   ┬  
+#    │   ╰── 
+# ───╯
+#
+# error[E0110]: expected `,` or newline between variants
+#    ╭─[ src/key.emel:9:5 ]
+#    │
+#  9 │   | Up | Down | Left | Right | Home | End | PageUp | PageDown
+#    │     ─┬  
+#    │      ╰── 
+# ───╯
+#
+# error[E0110]: expected variant name
+#     ╭─[ src/key.emel:10:3 ]
+#     │
+#  10 │   | F(FKey)
+#     │   ┬  
+#     │   ╰── 
+# ────╯
+#
+# error[E0110]: expected `,` or newline between variants
+#     ╭─[ src/key.emel:10:5 ]
+#     │
+#  10 │   | F(FKey)
+#     │     ┬  
+#     │     ╰── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/key.emel:11:3 ]
+#     │
+#  11 │ } deriving (Eq, Show)
+#     │   ────┬───  
+#     │       ╰───── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/key.emel:13:64 ]
+#     │
+#  13 │ pub type Mods(ctrl: Bool, alt: Bool, shift: Bool, super: Bool) deriving (Eq, Show)
+#     │                                                                ────┬───  
+#     │                                                                    ╰───── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/key.emel:18:35 ]
+#     │
+#  18 │ pub opaque type FKey(number: Int) deriving (Eq, Show)
+#     │                                   ────┬───  
+#     │                                       ╰───── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/key.emel:20:8 ]
+#     │
+#  20 │ pub fn f_key(n: Int) -> Option[FKey] =
+#     │        ──┬──  
+#     │          ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/key.emel:20:38 ]
+#     │
+#  20 │ pub fn f_key(n: Int) -> Option[FKey] =
+#     │                                      ┬  
+#     │                                      ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/key.emel:23:8 ]
+#     │
+#  23 │ pub fn f_number(f: FKey) -> Int = f.number
+#     │        ────┬───  
+#     │            ╰───── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/key.emel:23:33 ]
+#     │
+#  23 │ pub fn f_number(f: FKey) -> Int = f.number
+#     │                                 ┬  
+#     │                                 ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/key.emel:25:8 ]
+#     │
+#  25 │ pub fn code(k: Key) -> KeyCode = k.code
+#     │        ──┬─  
+#     │          ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/key.emel:25:32 ]
+#     │
+#  25 │ pub fn code(k: Key) -> KeyCode = k.code
+#     │                                ┬  
+#     │                                ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/key.emel:27:8 ]
+#     │
+#  27 │ pub fn mods(k: Key) -> Mods = k.mods
+#     │        ──┬─  
+#     │          ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/key.emel:27:29 ]
+#     │
+#  27 │ pub fn mods(k: Key) -> Mods = k.mods
+#     │                             ┬  
+#     │                             ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/key.emel:30:8 ]
+#     │
+#  30 │ pub fn key(code: KeyCode, mods: Mods) -> Option[Key] =
+#     │        ─┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/key.emel:30:54 ]
+#     │
+#  30 │ pub fn key(code: KeyCode, mods: Mods) -> Option[Key] =
+#     │                                                      ┬  
+#     │                                                      ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/key.emel:46:4 ]
+#     │
+#  46 │ fn control_representative(c: Int) -> (KeyCode, Mods) =
+#     │    ───────────┬──────────  
+#     │               ╰──────────── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/key.emel:46:54 ]
+#     │
+#  46 │ fn control_representative(c: Int) -> (KeyCode, Mods) =
+#     │                                                      ┬  
+#     │                                                      ╰── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/key.emel:57:25 ]
+#     │
+#  57 │ const CTRL: Mods = Mods { ..NO_MODS, ctrl: True }
+#     │                         ┬  
+#     │                         ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/key.emel:59:4 ]
+#     │
+#  59 │ fn union(a: Mods, b: Mods) -> Mods =
+#     │    ──┬──  
+#     │      ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/key.emel:59:36 ]
+#     │
+#  59 │ fn union(a: Mods, b: Mods) -> Mods =
+#     │                                    ┬  
+#     │                                    ╰── 
+# ────╯
+#
+# error[E0334]: function `code` has the same name as a field of `Key`
+#     ╭─[ src/key.emel:25:8 ]
+#     │
+#  25 │ pub fn code(k: Key) -> KeyCode = k.code
+#     │        ──┬─  
+#     │          ╰─── 
+# ────╯
+#
+# error[E0334]: function `mods` has the same name as a field of `Key`
+#     ╭─[ src/key.emel:27:8 ]
+#     │
+#  27 │ pub fn mods(k: Key) -> Mods = k.mods
+#     │        ──┬─  
+#     │          ╰─── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `Mods`, found `fn(Bool, Bool, Bool, Bool) -> Mods`
+#     ╭─[ src/key.emel:57:20 ]
+#     │
+#  57 │ const CTRL: Mods = Mods { ..NO_MODS, ctrl: True }
+#     │                    ──┬─  
+#     │                      ╰─── 
+# ────╯
+#
+# 42 errors
+# --- end wish check ---
