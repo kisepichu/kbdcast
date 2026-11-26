@@ -1,0 +1,124 @@
+# wish-target: test/golden.emel
+import Key.{Key, KeyCode, Mods, key, f_key}
+import KeyCode.*
+
+## The key that tools/termwiz-golden gave termwiz for a row of KeyGolden.ROWS: `name` is one
+## character or the name of a special key, `bits` the xterm modifier bits (1 Shift, 2 Alt, 4 Ctrl).
+pub fn row_key(name: String, bits: Int) -> Key {
+  let mods = Mods(shift: bits & 1 != 0, alt: bits & 2 != 0, ctrl: bits & 4 != 0, super: false)
+  let code = match name {
+    "Enter" -> Enter
+    "Esc" -> Esc
+    "Tab" -> Tab
+    "Backspace" -> Backspace
+    "Delete" -> Delete
+    "Insert" -> Insert
+    "Up" -> Up
+    "Down" -> Down
+    "Left" -> Left
+    "Right" -> Right
+    "Home" -> Home
+    "End" -> End
+    "PageUp" -> PageUp
+    "PageDown" -> PageDown
+    "F" ++ n if n.length() > 0 -> Function(f_key(n.to_int().expect("F key number")).expect("F key in 1 to 12"))
+    c -> Char(c.code_point())
+  }
+  key(code, mods).expect("a key that termwiz encoded")
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0105]: unrecognized character `&`
+#    ╭─[ test/golden.emel:8:31 ]
+#    │
+#  8 │   let mods = Mods(shift: bits & 1 != 0, alt: bits & 2 != 0, ctrl: bits & 4 != 0, super: false)
+#    │                               ┬  
+#    │                               ╰── 
+# ───╯
+#
+# error[E0105]: unrecognized character `&`
+#    ╭─[ test/golden.emel:8:51 ]
+#    │
+#  8 │   let mods = Mods(shift: bits & 1 != 0, alt: bits & 2 != 0, ctrl: bits & 4 != 0, super: false)
+#    │                                                   ┬  
+#    │                                                   ╰── 
+# ───╯
+#
+# error[E0105]: unrecognized character `&`
+#    ╭─[ test/golden.emel:8:72 ]
+#    │
+#  8 │   let mods = Mods(shift: bits & 1 != 0, alt: bits & 2 != 0, ctrl: bits & 4 != 0, super: false)
+#    │                                                                        ┬  
+#    │                                                                        ╰── 
+# ───╯
+#
+# error[E0122]: expected newline after declaration
+#    ╭─[ test/golden.emel:3:15 ]
+#    │
+#  3 │ import KeyCode.*
+#    │               ┬  
+#    │               ╰── 
+# ───╯
+#
+# error[E0118]: expected expression
+#    ╭─[ test/golden.emel:8:3 ]
+#    │
+#  8 │   let mods = Mods(shift: bits & 1 != 0, alt: bits & 2 != 0, ctrl: bits & 4 != 0, super: false)
+#    │   ─┬─  
+#    │    ╰─── 
+# ───╯
+#
+# error[E0122]: expected newline or `}` after statement
+#    ╭─[ test/golden.emel:8:7 ]
+#    │
+#  8 │   let mods = Mods(shift: bits & 1 != 0, alt: bits & 2 != 0, ctrl: bits & 4 != 0, super: false)
+#    │       ──┬─  
+#    │         ╰─── 
+# ───╯
+#
+# error[E0118]: expected expression
+#    ╭─[ test/golden.emel:9:3 ]
+#    │
+#  9 │   let code = match name {
+#    │   ─┬─  
+#    │    ╰─── 
+# ───╯
+#
+# error[E0122]: expected newline or `}` after statement
+#    ╭─[ test/golden.emel:9:7 ]
+#    │
+#  9 │   let code = match name {
+#    │       ──┬─  
+#    │         ╰─── 
+# ───╯
+#
+# error[E0211]: cannot find value `code` in this scope
+#     ╭─[ test/golden.emel:27:7 ]
+#     │
+#  27 │   key(code, mods).expect("a key that termwiz encoded")
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `mods` in this scope
+#     ╭─[ test/golden.emel:27:13 ]
+#     │
+#  27 │   key(code, mods).expect("a key that termwiz encoded")
+#     │             ──┬─  
+#     │               ╰─── 
+# ────╯
+#
+# error[E0313]: type `Option[Key]` has no field or function `expect`
+#     ╭─[ test/golden.emel:27:19 ]
+#     │
+#  27 │   key(code, mods).expect("a key that termwiz encoded")
+#     │                   ───┬──  
+#     │                      ╰──── 
+# ────╯
+#
+# 11 errors, 1 warning
+# --- end wish check ---

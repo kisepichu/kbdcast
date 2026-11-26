@@ -2,7 +2,7 @@
 
 - 日付: 2026-11-27
 - 全体設計: `docs/superpowers/specs/2026-11-23-kbdcast-design.md`（§5 の 2）
-- 状態: spec
+- 状態: 実装済み（PR #15）
 
 ## 1. 目的と範囲
 
@@ -48,16 +48,16 @@ root に最初の Pome を作る。
 ```emela
 pub opaque type Key(code: KeyCode, mods: Mods)
 pub enum KeyCode { Char(Int) | Enter | Esc | Tab | Backspace | Delete | Insert
-                 | Up | Down | Left | Right | Home | End | PageUp | PageDown | F(FKey) }
+                 | Up | Down | Left | Right | Home | End | PageUp | PageDown | Function(FKey) }
 pub type Mods(ctrl: Bool, alt: Bool, shift: Bool, super: Bool)
 pub opaque type FKey                              # 1 から 12
 ```
 
 - `Char` は、Shift を効かせた後に出る文字の code point を持つ。空白と `<` も `Char` である。
 - `Mods` は互いに独立な 4 つの修飾なので、Bool を並べる。super は tape に書けて、`Unencodable` で理由を言うためだけにある。kitty を足すまで送れない。
-- `FKey` は 1 から 12。termwiz は F24 まで送れるが、xterm の terminfo は F13 を `<S-F1>` と同じ bytes（`CSI 1;2P`）にしていて紛らわしいので、F13 以降は入れない。
+- `FKey` は 1 から 12。termwiz は F24 まで送れるが、xterm の terminfo は F13 を `<S-F1>` と同じ bytes（`CSI 1;2P`）にしていて紛らわしいので、F13 以降は入れない。構成子の名前が `F` でなく `Function` なのは、小文字を含まない `F` は `[lex.name]` で型名（構成子の名前）にならないため（friction 034。termwiz の `KeyCode::Function` と同じ名前）。
 
-`Key` を作る関数は、次の正規形にそろえる。正規形は termwiz の `KeyCode::encode` が最初に行う正規化と同じである。
+`Key` を作る関数は、次の正規形にそろえる。Shift の扱いは、termwiz の `KeyCode::encode` が最初に行う正規化と同じである。制御文字の扱いは kbdcast のもの（termwiz は `Char(0x7F)` を `Delete` にし、ほかの制御文字はそのまま持つ）。
 
 - Shift と ASCII の英小文字は、大文字にして Shift を外す（`a` と Shift → `A`）。
 - Shift と ASCII の英大文字、ASCII の記号（`is_ascii_punctuation`）は、Shift を外す。
@@ -112,16 +112,16 @@ pub fn encode(key: Key, modes: InputModes) -> Bytes fails Unencodable
 | キー | 形 |
 |---|---|
 | 修飾の無い文字 | UTF-8 |
-| Ctrl と文字 | Level2 では `CSI 27;m;c~`。Off と Level1 では、termwiz の `ctrl_mapping` がある文字は制御文字（Alt なら前に ESC）。Ctrl 付きの英大文字は、Level1 で `CSI 27;m;c~`、Off では表せない。`ctrl_mapping` の無い文字は、Alt も付いた ASCII の英数字と記号なら ESC と文字で、Ctrl が落ちるので表せない。それ以外は、Level1 で `CSI 27;m;c~`、Off では表せない |
+| Ctrl と文字 | Level2 では `CSI 27;m;c~`。Off と Level1 では、termwiz の `ctrl_mapping` がある文字は制御文字（Alt なら前に ESC）。ただし Shift が残る文字（空白と数字 2〜8。`<C-S-2>`、`<C-S-Space>`）は、制御文字になると Shift が落ちるので、Off と Level1 では表せない。Ctrl 付きの英大文字は、Level1 で `CSI 27;m;c~`、Off では表せない。`ctrl_mapping` の無い文字は、Alt も付いた ASCII の英数字と記号なら ESC と文字で、Ctrl が落ちるので表せない。それ以外は、Level1 で `CSI 27;m;c~`、Off では表せない |
 | Alt と ASCII の英数字、記号（Ctrl なし） | ESC と文字。Shift の残る数字では、どの段階でも Shift が落ちるので `NeedsKitty` |
-| ほかの修飾付きの文字（Ctrl なし。Shift の付いた数字、空白、ASCII でない文字） | Level1 と Level2 では `CSI 27;m;c~`。Off では、Alt は ESC を前に付け、Shift は落ちるので表せない |
+| ほかの修飾付きの文字（Ctrl なし。Shift の付いた数字、空白、ASCII でない文字。私用領域の文字も同じ） | Level1 と Level2 では `CSI 27;m;c~`。Off では、Alt は ESC を前に付け、Shift は落ちるので表せない |
 | 矢印、Home、End | 修飾が無ければ `CSI A`〜`D`、`H`、`F`（`Application` では SS3）。修飾があれば `CSI 1;m A` など |
 | Insert、Delete、PageUp、PageDown | `CSI 2~`、`3~`、`5~`、`6~`。修飾があれば `CSI n;m~` |
 | F1〜F4 | `SS3 P`〜`S`。修飾があれば `CSI 1;m P`〜`S` |
 | F5〜F12 | `CSI 15~`、`17~`〜`21~`、`23~`、`24~`。修飾があれば `CSI n;m~` |
 | Tab | 0x09。`other_keys` が Off でなく修飾があれば `CSI 27;m;9~`。Off では、Shift は `CSI Z`、Ctrl は `CSI 9;5u`、Ctrl と Shift は `CSI 1;5Z`、Alt は ESC を前に付ける |
 | Enter、Esc | 0x0d（`CrLf` では 0x0d 0x0a）、0x1b。Alt は ESC を前に付ける。Shift か Ctrl があれば、Enter は Level1 から、Esc は Level2 から `CSI 27;m;c~` で、それより下では表せない |
-| Backspace | 0x7f。Alt は ESC を前に付ける。Ctrl は Off と Level1 で 0x08、Level2 で `CSI 27;m;8~`。Shift は Level2 で `CSI 27;m;127~`、それより下では表せない |
+| Backspace | 0x7f。Alt は ESC を前に付ける。Ctrl は Off と Level1 で 0x08、Level2 で `CSI 27;m;8~`。Shift は Level2 で `CSI 27;m;127~`、それより下では表せない。Ctrl と Shift の両方は Level2 で Ctrl の形（`CSI 27;6;8~`。m に Shift が残る）、それより下では表せない |
 
 代表: 同じ制御文字になるキーの組は、1 つの名前（代表）にまとめる。組は termwiz の `ctrl_mapping` の組で、英大文字（Ctrl と Shift）は除く。Level2 では、Ctrl 付きの文字は `CSI 27;m;c~` になって区別できるので、代表は使わない（どのキーも自分自身が代表）。Off と Level1 の代表は次のとおり。
 
@@ -157,11 +157,12 @@ pub fn decode(b: Bytes) -> List[Decoded]
    - `1;m P`〜`S`（修飾付きの F1〜F4）
    - `Z` は Shift と Tab。`1;m Z` は、m の修飾に Shift を足した Tab
    - `27;m;c ~`（modifyOtherKeys）と、kitty の拡張の無い `c;m u`。c が 9、13、27、127、8 なら Tab、Enter、Esc、Backspace、Backspace。それ以外は `Char(c)`
+   - kitty の拡張の付いた `c;m u` は読めない列とする。`:` の後の値（event type など）を持つものと、c が私用領域 0xE000〜0xF8FF（kitty が自分のキーに使う番号）のもの。`27;m;c ~` では、私用領域の c も `Char(c)` として読む（modifyOtherKeys は、修飾付きのその文字をこの形で送る）
    - 修飾の番号に、Shift、Alt、Ctrl のほかのビットが立っていたら読めない列とする
 
-   読めない列は、列ごとに `Unknown`。終わりの文字が来ないまま bytes が終わったら、`ESC [` からの残りを `Unknown` にする。ただし `ESC [` だけで終わったら `<M-[>`。
-3. `ESC O` の後の `A B C D H F P Q R S` は SS3 の列（矢印、Home、End、F1〜F4）。`ESC O` だけで終わったら `<M-O>`。
-4. `ESC` の後に 1 つのキーが続けば、そのキーに Alt を付ける（`ESC x` → `<M-x>`、`ESC 0x01` → `<C-M-a>`、`ESC ESC` → `<M-Esc>`）。末尾の `ESC` だけなら `<Esc>`。
+   読めない列は、列ごとに `Unknown`。中間の文字を含む列はキーにならない。終わりの文字が来ないまま bytes が終わったら、`ESC [` からの残りを `Unknown` にする。終わりの文字の前に、列を続けられない byte（3 つの範囲の外の byte か、中間の文字の後の引数の文字）が来たら、`ESC [` からその前までを `Unknown` にし、その byte から読み直す（`1b5b0d` → `Unknown(1b5b)`、`<CR>`）。項目の始まりの `ESC [` だけで bytes が終わったら `<M-[>`。
+3. `ESC O` の後の `A B C D H F P Q R S` は SS3 の列（矢印、Home、End、F1〜F4）。項目の始まりの `ESC O` だけで bytes が終わったら `<M-O>`。
+4. `ESC` の後に 1 つのキーが続けば、そのキーに Alt を付ける（`ESC x` → `<M-x>`、`ESC 0x01` → `<C-M-a>`、`ESC ESC` → `<M-Esc>`）。`ESC` の後のキーは、ほかの規則で読む（`ESC ESC [ A` → `<M-Up>`）。`<M-[>` と `<M-O>` の特例は項目の始まりにだけ効くので、`ESC ESC [` と `ESC ESC O` で終わったら `<M-Esc>` と `[`、`O`。`ESC` の後にキーが続かなければ `<Esc>`（末尾の `ESC`、`ESC 0xff` → `<Esc>`、`Unknown(ff)`）。
 5. 制御文字は §6 の代表にする。0x0d の直後の 0x0a は、その 0x0d に含める（`CrLf` の Enter）。
 6. それ以外は UTF-8 として読み、1 つの code point を 1 つの `Char` にする。読めない bytes は、続く分をまとめて 1 つの `Unknown` にする。
 
@@ -173,8 +174,8 @@ pub fn decode(b: Bytes) -> List[Decoded]
 |---|---|
 | encode と decode（golden） | `tools/termwiz-golden/` が書いた `test/key_golden.emel` の各行で、「`encode` が成功する」と「termwiz の bytes を decode すると `[Key(代表)]` になる」が同じであること。成功したら bytes が termwiz と一致すること。失敗したら理由の段階が、成功する最小の段階であること |
 | super | 固定の例。どのキーでも、どの mode でも `NeedsKitty` |
-| 表記（性質） | brix の pbt で正規形の `Key` を作り（ASCII でない文字を含む）、`parse(print(k)) == [k]`。正規化を 2 回かけても変わらない |
-| encode と decode（性質） | 表せる `k` と mode `m` について `decode(encode(k, m)) == [Key(代表)]`。ASCII でない文字と、Alt と Ctrl と Shift の組を含む |
+| 表記（性質） | brix の pbt で正規形の `Key` を作り、`parse(print(k)) == [k]`。正規化を 2 回かけても変わらない（`key(code(k), mods(k)) == Some(k)`）。文字は、golden と同じ文字と制御文字に加えて、scalar value 全体（surrogate を除く BMP、私用領域、補助面）から選ぶ。super を含む |
+| encode と decode（性質） | 表せる `k` と mode `m` について `decode(encode(k, m)) == [Key(代表)]`。文字は表記の性質と同じ。super の付いたキーはどれも表せないので、super の無い修飾で作る |
 | 表記（固定） | 別名、大文字と小文字、`<C-A>`、`<S-a>`、文字になる `<`（`a < b`、`<C-x`、`<<EOF`）、error のメッセージと `offset` |
 | decode（固定） | 貼り付け（閉じない場合と UTF-8 でない場合）、末尾の ESC、`ESC [` と `ESC O` だけ、読めない CSI、途中で切れた列、正しくない UTF-8、1 つのイベントに複数のキー、CR LF |
 
@@ -186,12 +187,14 @@ golden の表:
 - 真似るのは WezTerm の端末の層（`term/src/terminalstate/keyboard.rs` が termwiz の `encode` を呼ぶ所）だけ。GUI の層が物理キーを `KeyCode` にする部分（Windows の AltGr など）は扱わない。
 - Rust の版は `mise.toml` で固定する。`tools/check.ts` は harness を走らせない。`tools/gen-case-folding.ts` と同じく、表は手で作り直して commit する。
 
+結果（PR #15）: 11,904 通りのうち、送れるのが 10,280、`NeedsOtherKeys(One)` が 944、`NeedsOtherKeys(Two)` が 560、`NeedsKitty` が 120（どれも Alt と Shift と数字）。§6 の表が bytes か「表せない」を書いている所で、termwiz との違いは 0。性質テストの広げた文字は、`27;m;c~` の私用領域の文字を decode が読めない誤りを見つけた（§7 の規則 2 の 2 つ目）。
+
 ## 9. 検査の仕組みとの関係
 
 - wish-first の単位: key、notation、encode、decode。
 - 公開 API で `fails` を宣言する `key/notation` と `key/encode` を、理由を付けて `tools/lint/foundation.allow` に登録する。
 - root に Pome ができると、`tools/wish.ts` が入れ子の新しい Pome の wish を黙って検査しなくなる（issue #12）。2 の wish はどれも root の `src/` を指すので当たらないが、問題が起き始めるのは 2 からなので、最初の task で直す。
-- 先に予想しておく friction: 文字の code point のリテラルが無い（013 と同じ）、正規形を保つ opaque な型と構築関数の書き方、Bytes を 1 byte ずつ読む再帰、生成した大きな表の compile の時間。
+- 先に予想しておく friction: 文字の code point のリテラルが無い（013 と同じ）、正規形を保つ opaque な型と構築関数の書き方、Bytes を 1 byte ずつ読む再帰、生成した大きな表の compile の時間。→ 最初の 3 つは起きた（013、035 と 042、041 と 043 と 044 と 052）。表の compile の時間は起きなかった（`emela test` 全体で約 1 秒）。ほかに出た friction は 034〜054。
 - PR を出す前に、別の session で friction-review skill を走らせる。
 
 ## 10. 周辺の変更

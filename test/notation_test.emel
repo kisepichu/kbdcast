@@ -1,0 +1,109 @@
+import Brix.Pbt.Property.{Config}
+import Key.Notation.{NotationError}
+import KeyGen
+
+# The keys that `parse` reads from `s`, each one as `print` writes it.
+fn printed(s: String) -> List[String] fails NotationError {
+  Notation.parse(s).map(|k| Notation.print(k))
+}
+
+# The message and the offset of the NotationError that `parse` fails with, or `("", -1)` if it does
+# not fail.
+fn failure(s: String) -> (String, Int) {
+  {
+    Notation.parse(s)
+    ("", -1)
+  } escape {
+    NotationError(message:, offset:) -> (message, offset)
+  }
+}
+
+@test
+fn parse_reads_each_character_as_a_key() {
+  assert printed("abc") == ["a", "b", "c"]
+  assert printed("a b") == ["a", "<Space>", "b"]
+  assert printed("あ😀") == ["あ", "😀"]
+  assert printed("x<CR>") == ["x", "<CR>"]
+  assert printed("") == []
+}
+
+@test
+fn parse_reads_the_names_of_keys_in_any_case() {
+  assert printed("<CR>") == ["<CR>"]
+  assert printed("<cr>") == ["<CR>"]
+  assert printed("<Enter>") == ["<CR>"]
+  assert printed("<Return>") == ["<CR>"]
+  assert printed("<Esc><Tab><BS><Del><Insert>") == ["<Esc>", "<Tab>", "<BS>", "<Del>", "<Insert>"]
+  assert printed("<Up><Down><Left><Right><Home><End><PageUp><PageDown>")
+    == ["<Up>", "<Down>", "<Left>", "<Right>", "<Home>", "<End>", "<PageUp>", "<PageDown>"]
+  assert printed("<F1><f12>") == ["<F1>", "<F12>"]
+  assert printed("<Space><lt><LT>") == ["<Space>", "<lt>", "<lt>"]
+}
+
+@test
+fn parse_reads_modifiers_in_any_case_and_order() {
+  assert printed("<C-x>") == ["<C-x>"]
+  assert printed("<c-x>") == ["<C-x>"]
+  # Ctrl without Shift makes an ASCII capital letter small, as in vim.
+  assert printed("<C-X>") == ["<C-x>"]
+  assert printed("<C-S-x>") == ["<C-S-x>"]
+  assert printed("<S-C-x>") == ["<C-S-x>"]
+  assert printed("<C-S-X>") == ["<C-S-x>"]
+  # Only an ASCII capital letter: `É` keeps its case, with Shift or without.
+  assert printed("<C-É>") == ["<C-É>"]
+  assert printed("<C-S-É>") == ["<C-S-É>"]
+  assert printed("<M-x>") == ["<M-x>"]
+  assert printed("<A-x>") == ["<M-x>"]
+  assert printed("<M-X>") == ["<M-X>"]
+  assert printed("<D-S-M-C-Up>") == ["<C-M-S-D-Up>"]
+  assert printed("<C-S-1>") == ["<C-S-1>"]
+  assert printed("<C-M-S-a>") == ["<C-M-S-a>"]
+}
+
+@test
+fn parse_puts_shift_into_a_letter_or_punctuation() {
+  assert printed("<S-a>") == ["A"]
+  assert printed("<s-A>") == ["A"]
+  assert printed("<S-!>") == ["!"]
+  assert printed("<S-1>") == ["<S-1>"]
+  assert printed("<S-Up>") == ["<S-Up>"]
+}
+
+@test
+fn parse_reads_any_one_character_after_modifiers() {
+  assert printed("<C-]><C->><C--><C-Space><M-lt><M-あ>")
+    == ["<C-]>", "<C->>", "<C-->", "<C-Space>", "<M-lt>", "<M-あ>"]
+}
+
+@test
+fn parse_reads_a_less_than_sign_that_starts_no_key_as_a_character() {
+  assert printed("a < b") == ["a", "<Space>", "<lt>", "<Space>", "b"]
+  assert printed("<C-x") == ["<lt>", "C", "-", "x"]
+  assert printed("<<EOF") == ["<lt>", "<lt>", "E", "O", "F"]
+  assert printed("<") == ["<lt>"]
+  assert printed("<>") == ["<lt>", ">"]
+}
+
+@test
+fn parse_rejects_a_name_it_does_not_know() {
+  assert failure("<Ecs>") == ("unknown key name: <Ecs>", 0)
+  assert failure("ab<Foo>") == ("unknown key name: <Foo>", 2)
+  assert failure("<C-Foo>") == ("unknown key name: <C-Foo>", 0)
+  assert failure("<Q-x>") == ("unknown key name: <Q-x>", 0)
+  # One character is a key only after a modifier.
+  assert failure("<x>") == ("unknown key name: <x>", 0)
+  assert failure("<F0>") == ("unknown key name: <F0>", 0)
+  assert failure("<F13>") == ("unknown key name: <F13>", 0)
+}
+
+@test
+fn parse_rejects_a_modifier_written_twice() {
+  assert failure("あ<C-C-x>") == ("duplicate modifier in <C-C-x>", 1)
+}
+
+@test
+fn parse_reads_back_what_print_writes() {
+  Property.check_with(KeyGen.keys(), Config(cases: 2000, ..Property.config()), |k| {
+    assert Notation.parse(Notation.print(k)) == [k]
+  })
+}

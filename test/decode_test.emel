@@ -1,0 +1,177 @@
+import Std.Bytes
+import Key.Decode.{Decoded, Key, Paste, Unknown}
+import Key.Notation
+
+# What `decode` reads from the bytes written in hexadecimal in `hex`: a key as `print` writes it,
+# a paste as `paste(text)`, and bytes it cannot read as `unknown(hex)`.
+fn decoded(hex: String) -> List[String] {
+  Decode.decode(Bytes.hex(hex)).map(|d| shown(d))
+}
+
+fn shown(d: Decoded) -> String {
+  d match {
+    Key(k)     -> Notation.print(k)
+    Paste(s)   -> "paste(#{s})"
+    Unknown(b) -> "unknown(#{b.to_hex()})"
+  }
+}
+
+@test
+fn decode_reads_nothing_from_no_bytes() {
+  assert decoded("") == []
+}
+
+@test
+fn decode_reads_each_code_point_of_utf8_as_a_character() {
+  assert decoded("616263") == ["a", "b", "c"]
+  assert decoded("e38182") == ["あ"]
+  assert decoded("f09f9880") == ["😀"]
+}
+
+@test
+fn decode_reads_a_control_character_as_its_representative() {
+  assert decoded("0d") == ["<CR>"]
+  # The 0x0A right after 0x0D is part of the Enter (LNM).
+  assert decoded("0d0a") == ["<CR>"]
+  assert decoded("0d0d") == ["<CR>", "<CR>"]
+  assert decoded("0a") == ["<C-j>"]
+  assert decoded("09") == ["<Tab>"]
+  assert decoded("08") == ["<BS>"]
+  assert decoded("7f") == ["<BS>"]
+  assert decoded("00") == ["<C-Space>"]
+  assert decoded("01") == ["<C-a>"]
+  assert decoded("1a") == ["<C-z>"]
+  assert decoded("1c") == ["<C-\\>"]
+  assert decoded("1d") == ["<C-]>"]
+  assert decoded("1e") == ["<C-^>"]
+  assert decoded("1f") == ["<C-_>"]
+}
+
+@test
+fn decode_reads_esc_before_a_key_as_alt_with_that_key() {
+  assert decoded("1b") == ["<Esc>"]
+  assert decoded("1b1b") == ["<M-Esc>"]
+  assert decoded("1b61") == ["<M-a>"]
+  assert decoded("1b41") == ["<M-A>"]
+  assert decoded("1b01") == ["<C-M-a>"]
+  assert decoded("1b7f") == ["<M-BS>"]
+  assert decoded("1b0d0a") == ["<M-CR>"]
+  assert decoded("1be38182") == ["<M-あ>"]
+  # `ESC [` and `ESC O` that end the bytes start no sequence.
+  assert decoded("1b5b") == ["<M-[>"]
+  assert decoded("1b4f") == ["<M-O>"]
+  # After another ESC they start no sequence either: that ESC is the key that the first one gives
+  # Alt.
+  assert decoded("1b1b5b") == ["<M-Esc>", "["]
+  assert decoded("1b1b4f") == ["<M-Esc>", "O"]
+  assert decoded("1bff") == ["<Esc>", "unknown(ff)"]
+}
+
+@test
+fn decode_reads_the_cursor_keys() {
+  assert decoded("1b5b41") == ["<Up>"]
+  assert decoded("1b5b42") == ["<Down>"]
+  assert decoded("1b5b43") == ["<Right>"]
+  assert decoded("1b5b44") == ["<Left>"]
+  assert decoded("1b4f41") == ["<Up>"]
+  assert decoded("1b5b48") == ["<Home>"]
+  assert decoded("1b5b46") == ["<End>"]
+  assert decoded("1b4f48") == ["<Home>"]
+  assert decoded("1b4f46") == ["<End>"]
+  assert decoded("1b5b313b3541") == ["<C-Up>"]
+  assert decoded("1b5b313b3248") == ["<S-Home>"]
+  assert decoded("1b1b5b41") == ["<M-Up>"]
+}
+
+@test
+fn decode_reads_the_keys_that_end_in_a_tilde() {
+  assert decoded("1b5b327e") == ["<Insert>"]
+  assert decoded("1b5b337e") == ["<Del>"]
+  assert decoded("1b5b357e") == ["<PageUp>"]
+  assert decoded("1b5b367e") == ["<PageDown>"]
+  assert decoded("1b5b333b357e") == ["<C-Del>"]
+}
+
+@test
+fn decode_reads_the_function_keys() {
+  assert decoded("1b4f50") == ["<F1>"]
+  assert decoded("1b4f53") == ["<F4>"]
+  assert decoded("1b5b313b3250") == ["<S-F1>"]
+  assert decoded("1b5b31357e") == ["<F5>"]
+  assert decoded("1b5b31377e") == ["<F6>"]
+  assert decoded("1b5b32317e") == ["<F10>"]
+  assert decoded("1b5b32337e") == ["<F11>"]
+  assert decoded("1b5b32347e") == ["<F12>"]
+  assert decoded("1b5b32343b357e") == ["<C-F12>"]
+}
+
+@test
+fn decode_reads_tab_with_shift() {
+  assert decoded("1b5b5a") == ["<S-Tab>"]
+  assert decoded("1b5b313b355a") == ["<C-S-Tab>"]
+  assert decoded("1b1b5b5a") == ["<M-S-Tab>"]
+}
+
+@test
+fn decode_reads_modify_other_keys_and_csi_u() {
+  assert decoded("1b5b393b3575") == ["<C-Tab>"]
+  assert decoded("1b5b39373b3575") == ["<C-a>"]
+  assert decoded("1b5b32373b353b39377e") == ["<C-a>"]
+  assert decoded("1b5b32373b353b36357e") == ["<C-S-a>"]
+  assert decoded("1b5b32373b353b3130357e") == ["<C-i>"]
+  assert decoded("1b5b32373b323b34397e") == ["<S-1>"]
+  assert decoded("1b5b32373b323b33327e") == ["<S-Space>"]
+  assert decoded("1b5b32373b323b397e") == ["<S-Tab>"]
+  assert decoded("1b5b32373b323b31337e") == ["<S-CR>"]
+  assert decoded("1b5b32373b323b32377e") == ["<S-Esc>"]
+  assert decoded("1b5b32373b323b3132377e") == ["<S-BS>"]
+  assert decoded("1b5b32373b353b387e") == ["<C-BS>"]
+  assert decoded("1b5b32373b333b3233337e") == ["<M-é>"]
+  # `CSI 27;m;c~` reads a `c` in the private use area that kitty gives its keys as the character,
+  # as it reads any other scalar value: in modifyOtherKeys, termwiz sends such a character with
+  # modifiers so.
+  assert decoded("1b5b32373b353b35373339397e") == ["<C-\u{E037}>"]
+  # 63744, the first number after the private use area that kitty gives its keys.
+  assert decoded("1b5b36333734343b3575") == ["<C-\u{F900}>"]
+}
+
+@test
+fn decode_reads_a_bracketed_paste() {
+  assert decoded("1b5b3230307e68656c6c6f1b5b3230317e") == ["paste(hello)"]
+  assert decoded("1b5b3230307e611b5b3230317e62") == ["paste(a)", "b"]
+  # Without its end, the paste takes the rest of the bytes.
+  assert decoded("1b5b3230307e6162") == ["paste(ab)"]
+  # A paste that is not UTF-8 is unknown as a whole.
+  assert decoded("1b5b3230307eff1b5b3230317e") == ["unknown(1b5b3230307eff1b5b3230317e)"]
+}
+
+@test
+fn decode_keeps_each_sequence_it_cannot_read_as_unknown() {
+  assert decoded("1b5b3f3175") == ["unknown(1b5b3f3175)"]
+  assert decoded("1b5b3f317561") == ["unknown(1b5b3f3175)", "a"]
+  # `CSI 97:65;2u`: an extension of kitty, with `:`.
+  assert decoded("1b5b39373a36353b3275") == ["unknown(1b5b39373a36353b3275)"]
+  # `CSI 57399 u`: no `;m`. 57399 is also in the private use area that kitty gives its keys
+  # (57344 to 63743), whose numbers are unreadable in `CSI c;m u`.
+  assert decoded("1b5b353733393975") == ["unknown(1b5b353733393975)"]
+  assert decoded("1b5b35373339393b3575") == ["unknown(1b5b35373339393b3575)"]
+  assert decoded("1b5b35373334343b3575") == ["unknown(1b5b35373334343b3575)"]
+  assert decoded("1b5b36333734333b3575") == ["unknown(1b5b36333734333b3575)"]
+  # Modifier number 9: a bit other than Shift, Alt and Ctrl.
+  assert decoded("1b5b313b3941") == ["unknown(1b5b313b3941)"]
+  # A sequence that the bytes end before its final byte.
+  assert decoded("1b5b31") == ["unknown(1b5b31)"]
+  assert decoded("611b5b313b") == ["a", "unknown(1b5b313b)"]
+  # A sequence that a byte cuts before its final byte, when it cannot continue the sequence: a byte
+  # outside the ranges of ECMA-48, or a parameter byte after an intermediate byte. That byte starts
+  # the next item.
+  assert decoded("1b5b0d") == ["unknown(1b5b)", "<CR>"]
+  assert decoded("1b5b31203141") == ["unknown(1b5b3120)", "1", "A"]
+}
+
+@test
+fn decode_keeps_each_run_of_bytes_that_are_not_utf8_as_one_unknown() {
+  assert decoded("ff") == ["unknown(ff)"]
+  assert decoded("61fffe62") == ["a", "unknown(fffe)", "b"]
+  assert decoded("e381") == ["unknown(e381)"]
+}

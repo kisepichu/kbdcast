@@ -17,7 +17,7 @@ kbdcast は、端末アプリのデモ GIF を、操作を書いた tape から�
 | `cli/` | main | 置かない |
 | `wish/` | 理想のコード（src の外）。`wish/README.md` | — |
 | `friction/` | 回り道の記録。`friction/README.md` | — |
-| `tools/` | 検査の道具（Bun 上の TypeScript） | — |
+| `tools/` | 検査と生成の道具（Bun 上の TypeScript）。key codec の golden を作る Rust の harness（`tools/termwiz-golden/`） | — |
 
 まだ無いディレクトリは、そのサブプロジェクトで作る。
 

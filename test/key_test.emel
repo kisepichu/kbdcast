@@ -1,0 +1,101 @@
+import Brix.Pbt.Property.{Config}
+import Key.{KeyCode, Mods, NO_MODS, Char, Enter, Esc, Tab, Backspace, Up, Function}
+import KeyGen
+
+const SHIFT: Mods = Mods(shift: True, ..NO_MODS)
+const CTRL: Mods = Mods(ctrl: True, ..NO_MODS)
+const ALT: Mods = Mods(alt: True, ..NO_MODS)
+const SUPER: Mods = Mods(super: True, ..NO_MODS)
+const CTRL_SHIFT: Mods = Mods(ctrl: True, shift: True, ..NO_MODS)
+const CTRL_ALT: Mods = Mods(ctrl: True, alt: True, ..NO_MODS)
+const ALT_SHIFT: Mods = Mods(alt: True, shift: True, ..NO_MODS)
+
+# What `key` is given, and the code and the mods of the key it makes (spec §4, and the
+# representatives of the control characters in spec §6).
+const CASES: List[((KeyCode, Mods), (KeyCode, Mods))] = [
+  ((Char(0x61), NO_MODS), (Char(0x61), NO_MODS)), # a
+  # Shift goes into an ASCII letter or punctuation, and stays on anything else.
+  ((Char(0x61), SHIFT), (Char(0x41), NO_MODS)), # a -> A
+  ((Char(0x41), SHIFT), (Char(0x41), NO_MODS)), # A
+  ((Char(0x21), SHIFT), (Char(0x21), NO_MODS)), # !
+  ((Char(0x7E), SHIFT), (Char(0x7E), NO_MODS)), # ~
+  ((Char(0x31), SHIFT), (Char(0x31), SHIFT)), # 1
+  ((Char(0x20), SHIFT), (Char(0x20), SHIFT)), # space
+  ((Char(0xE9), SHIFT), (Char(0xE9), SHIFT)), # é
+  ((Up, SHIFT), (Up, SHIFT)),
+  # The other mods stay. Ctrl with an ASCII capital letter means Ctrl and Shift.
+  ((Char(0x41), CTRL), (Char(0x41), CTRL)), # A
+  ((Char(0x61), CTRL_SHIFT), (Char(0x41), CTRL)), # a -> A
+  ((Char(0x61), ALT_SHIFT), (Char(0x41), ALT)), # a -> A
+  ((Char(0x61), SUPER), (Char(0x61), SUPER)), # a
+  # A control character becomes its representative, with the mods it was given added.
+  ((Char(0x01), NO_MODS), (Char(0x61), CTRL)), # ^A -> a
+  ((Char(0x01), ALT), (Char(0x61), CTRL_ALT)), # ^A -> a
+  ((Char(0x01), SHIFT), (Char(0x41), CTRL)), # ^A -> A
+  ((Char(0x1A), NO_MODS), (Char(0x7A), CTRL)), # ^Z -> z
+  ((Char(0x00), NO_MODS), (Char(0x20), CTRL)), # ^@ -> space
+  ((Char(0x09), NO_MODS), (Tab, NO_MODS)),
+  ((Char(0x09), SHIFT), (Tab, SHIFT)),
+  ((Char(0x0D), NO_MODS), (Enter, NO_MODS)),
+  ((Char(0x1B), NO_MODS), (Esc, NO_MODS)),
+  ((Char(0x08), NO_MODS), (Backspace, NO_MODS)),
+  ((Char(0x7F), NO_MODS), (Backspace, NO_MODS)),
+  ((Char(0x0A), NO_MODS), (Char(0x6A), CTRL)), # ^J -> j
+  ((Char(0x1C), NO_MODS), (Char(0x5C), CTRL)), # ^\ -> \
+  ((Char(0x1D), NO_MODS), (Char(0x5D), CTRL)), # ^] -> ]
+  ((Char(0x1E), NO_MODS), (Char(0x5E), CTRL)), # ^^ -> ^
+  ((Char(0x1F), NO_MODS), (Char(0x5F), CTRL)), # ^_ -> _
+  ((Char(0x3042), NO_MODS), (Char(0x3042), NO_MODS)), # あ
+  ((Char(0x1F600), NO_MODS), (Char(0x1F600), NO_MODS)), # 😀
+]
+
+@test
+fn key_puts_the_code_and_the_mods_in_normal_form() {
+  CASES.each(|((code, mods), want)| {
+    made = Key.key(code, mods).map(|k| (k.code(), k.mods()))
+    # FRICTION(053): `assert` has no label, so the input is on both sides, so that a failure shows
+    # which case it is.
+    assert ((code, mods), made) == ((code, mods), Some(want))
+  })
+}
+
+@test
+fn key_does_not_change_a_key_in_normal_form() {
+  CASES.each(|((code, mods), _)| {
+    k = Key.key(code, mods)
+    assert k.and_then(|k| Key.key(k.code(), k.mods())) == k
+  })
+}
+
+@test
+fn key_does_not_change_any_key_in_normal_form() {
+  Property.check_with(KeyGen.keys(), Config(cases: 2000, ..Property.config()), |k| {
+    assert Key.key(k.code(), k.mods()) == Some(k)
+  })
+}
+
+@test
+fn key_is_none_only_for_a_char_that_is_not_a_scalar_value() {
+  assert Key.key(Char(0xD800), NO_MODS) == None
+  assert Key.key(Char(0xDFFF), NO_MODS) == None
+  assert Key.key(Char(0x110000), NO_MODS) == None
+  assert Key.key(Char(-1), NO_MODS) == None
+}
+
+@test
+fn f_key_is_one_to_twelve() {
+  assert Key.f_key(0) == None
+  assert Key.f_key(13) == None
+  assert Key.f_key(1).map(|f| f.f_number()) == Some(1)
+  assert Key.f_key(12).map(|f| f.f_number()) == Some(12)
+}
+
+@test
+fn key_keeps_an_f_key() {
+  [1, 12].each(|n| {
+    f = Key.f_key(n)
+    assert f.is_some()
+    assert f.and_then(|fk| Key.key(Function(fk), NO_MODS)).map(|k| k.code())
+      == f.map(|fk| Function(fk))
+  })
+}

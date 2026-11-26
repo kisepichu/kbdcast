@@ -210,7 +210,7 @@ git commit --no-gpg-sign -m "fix: wish の Pome を wish-target から決め、r
 **Interfaces:**
 - Produces（module `Key`、`src/key.emel`）:
   - `pub opaque type Key`（code と mods を持つ。作れるのは `key` だけ）
-  - `pub enum KeyCode { Char(Int) | Enter | Esc | Tab | Backspace | Delete | Insert | Up | Down | Left | Right | Home | End | PageUp | PageDown | F(FKey) }`
+  - `pub enum KeyCode { Char(Int) | Enter | Esc | Tab | Backspace | Delete | Insert | Up | Down | Left | Right | Home | End | PageUp | PageDown | Function(FKey) }`（計画では `F(FKey)` と書いたが、小文字を含まない `F` は `[lex.name]` で構成子の名前にならないので `Function` にした。ESCALATION 1、friction 034）
   - `pub type Mods(ctrl: Bool, alt: Bool, shift: Bool, super: Bool)` と `pub const NO_MODS: Mods`（4 つとも False）
   - `pub opaque type FKey`、`pub fn f_key(n: Int) -> Option[FKey]`（1〜12 のときだけ `Some`）、`pub fn f_number(f: FKey) -> Int`
   - `pub fn key(code: KeyCode, mods: Mods) -> Option[Key]`（spec §4 の正規形にする。`None` は `Char` が scalar value でないときだけ）
@@ -285,7 +285,7 @@ Emela の spec は `module.opaque`、`data.type`、`data.enum`、`data.const`、
 
 `None` になるもの: `Char(0xD800)`、`Char(0xDFFF)`、`Char(0x110000)`、`Char(-1)`。
 
-`f_key`: `f_key(0)` と `f_key(13)` は `None`。`f_key(1)` と `f_key(12)` は `Some` で、`f_number` がその数を返す。`key(F(f), NO_MODS)` は `Some` で、`code` が `F(f)`。
+`f_key`: `f_key(0)` と `f_key(13)` は `None`。`f_key(1)` と `f_key(12)` は `Some` で、`f_number` がその数を返す。`key(Function(f), NO_MODS)` は `Some` で、`code` が `Function(f)`。
 
 正規形は 2 回かけても変わらない: 上の表の各行の結果 `k` について、`key(code(k), mods(k)) == Some(k)`。
 
@@ -326,6 +326,7 @@ git commit --no-gpg-sign -m "feat: root の Pome を置き、正規形の Key �
   - `pub fn parse(s: String) -> List[Key] fails NotationError`
   - `pub fn print(k: Key) -> String`
 - Produces（test の module `KeyGen`、`test/key_gen.emel`）: brix の pbt の生成器 `pub fn keys() -> Gen[Key]`（Task 6 も使う）。文字は、ASCII の印字できる文字、`é`（U+E9）、`あ`（U+3042）、`😀`（U+1F600）、制御文字（0x00〜0x1F、0x7F）から選び、特殊キーと F1〜F12 も混ぜる。修飾は 4 つを独立に選ぶ。`key` を通すので、出るのは正規形だけ。brix の使い方は `regex/test/differential_test.emel` と `regex/test/pattern_gen.emel` を見る（選択の関数が無いことは friction 028）
+  - 実装では（ESCALATION 3）、文字を scalar value 全体（surrogate を除く BMP、私用領域、補助面）からも選ぶようにし、super を含まない `pub fn keys_without_super() -> Gen[Key]` を足した。
 
 - [ ] **Step 1: wish を書いて検査し、commit する**
 
@@ -522,7 +523,9 @@ Emela の spec は `api.std.bytes`、`api.list`、`data.enum`。kbdcast の spec
 | `61fffe62` | `a` `unknown(fffe)` `b` |
 | `e381` | `unknown(e381)` |
 
-（`1b5b353733393975` は `CSI 57399 u`。kitty の私用領域の番号なので読めない列。`1b5b39373a36353b3275` は `CSI 97:65;2u` で、`:` の付いた kitty の拡張。`1b5b313b3941` は修飾の番号 9 で、Shift、Alt、Ctrl のほかのビットが立っている。）
+（`1b5b353733393975` は `CSI 57399 u`。`;m` が無いので読めない列。`1b5b39373a36353b3275` は `CSI 97:65;2u` で、`:` の付いた kitty の拡張。`1b5b313b3941` は修飾の番号 9 で、Shift、Alt、Ctrl のほかのビットが立っている。）
+
+実装で足した行（ESCALATION 2、3。spec §7 に規則を足した）: `1b1b5b` → `<M-Esc>` `[`、`1b1b4f` → `<M-Esc>` `O`、`1b5b0d` → `unknown(1b5b)` `<CR>`、`1b5b31203141` → `unknown(1b5b3120)` `1` `A`。私用領域は、`CSI 57399;5u` と `CSI 57344;5u` が unknown、`CSI 63744;5u` が `<C-\u{F900}>`、`CSI 27;5;57399~` が `<C-\u{E037}>`。
 
 Run: `mise exec -- emela test .`
 Expected: FAIL
@@ -794,7 +797,7 @@ git commit --no-gpg-sign -m "test: termwiz 0.22.0 から key codec の golden �
   - `pub enum Reason { NeedsOtherKeys(Level) | NeedsKitty }`
   - `pub error Unencodable(key: Key, reason: Reason)`
   - `pub fn encode(key: Key, modes: InputModes) -> Bytes fails Unencodable`
-- Produces（test の module `Golden` に足す）: `pub fn row_modes(index: Int) -> InputModes`（mode の番号を `InputModes` に）、`pub fn representative(k: Key, other_keys: OtherKeys) -> Key`（spec §6 の代表）。`KeyGen` に `pub fn modes() -> Gen[InputModes]`
+- Produces（test の module `Golden` に足す）: `pub fn row_modes(index: Int) -> InputModes`（mode の番号を `InputModes` に）、`pub fn representative(k: Key, other_keys: OtherKeys) -> Key`（spec §6 の代表）。`KeyGen` に `pub fn modes() -> Gen[InputModes]`。実装では、固定の例と golden のテストが共に使う `pub enum Outcome { Sent(String), Refused(Reason) }` と `pub fn outcome(k: Key, modes: InputModes) -> Outcome` も足した（ESCALATION 3、4）
 
 - [ ] **Step 1: wish を書いて検査し、commit する**
 
@@ -866,7 +869,7 @@ super: `<D-a>`、`<D-Up>`、`<C-D-x>` は、12 のどの mode（`row_modes(0)`�
 
 `test/golden.emel` の `representative` は spec §6 の表のとおり。`other_keys` が `On(Two)` なら `k` そのもの。そうでなければ、Alt を外したキーが表の「同じ組」にあれば代表に変え、外した Alt を戻す（表の組は `parse` で作ってよい）。
 
-性質（`KeyGen.keys()` と `KeyGen.modes()`）: `encode(k, m)` が成功したら、`decode(bytes) == [Key(representative(k, m.other_keys))]`。
+性質（`KeyGen.keys_without_super()` と `KeyGen.modes()`。super の付いたキーはどれも表せないので除く。ESCALATION 3）: `encode(k, m)` が成功したら、`decode(bytes) == [Key(representative(k, m.other_keys))]`。
 
 Run: `mise exec -- emela test .`
 Expected: FAIL

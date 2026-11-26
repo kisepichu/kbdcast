@@ -1,0 +1,140 @@
+## A key that a terminal sends to an application: what it makes (`code`) and the modifiers held
+## with it (`mods`). Only `key` makes one, so every `Key` is in the normal form that termwiz's
+## `KeyCode::encode` brings a key to before it encodes it.
+# FRICTION(035): a function cannot have the name of a field of its type (E0334), so the fields
+# are not named `code` and `mods`, the names of the functions that read them.
+pub opaque type Key(key_code: KeyCode, key_mods: Mods) derive Eq, Show
+
+## What a key makes. `Char` holds the code point that comes out with Shift applied. A space and
+## `<` are `Char` too.
+pub enum KeyCode {
+  Char(Int)
+  Enter
+  Esc
+  Tab
+  Backspace
+  Delete
+  Insert
+  Up
+  Down
+  Left
+  Right
+  Home
+  End
+  PageUp
+  PageDown
+  # FRICTION(034): `F` has no lowercase letter, so it is an uppercase name (the name of a const)
+  # and cannot name a variant.
+  Function(FKey)
+} derive Eq, Show
+
+## The modifiers held with a key. `super` can be written in a tape only so that encoding can say
+## why such a key cannot be sent.
+pub type Mods(ctrl: Bool, alt: Bool, shift: Bool, super: Bool) derive Eq, Show
+
+## No modifier held.
+pub const NO_MODS: Mods = Mods(ctrl: False, alt: False, shift: False, super: False)
+
+const CTRL: Mods = Mods(ctrl: True, ..NO_MODS)
+
+## A function key from F1 to F12.
+pub opaque type FKey(number: Int) derive Eq, Show
+
+## F`n`. `None` unless `n` is 1 to 12.
+pub fn f_key(n: Int) -> Option[FKey] {
+  if n >= 1 && n <= 12 { Some(FKey(number: n)) } else { None }
+}
+
+## The number of `f`, 1 to 12.
+pub fn f_number(f: FKey) -> Int {
+  f.number
+}
+
+## What `k` makes.
+pub fn code(k: Key) -> KeyCode {
+  k.key_code
+}
+
+## The modifiers held with `k`.
+pub fn mods(k: Key) -> Mods {
+  k.key_mods
+}
+
+## The key `code` held with `mods`, in normal form:
+##
+## - Shift goes into an ASCII small letter (`a` with Shift is `A`), and is dropped from an ASCII
+##   capital letter and from ASCII punctuation. It stays on anything else (`1`, a space, `é`,
+##   `Up`).
+## - A control character (0x00 to 0x1F, 0x7F) becomes its representative (0x01 is `a` with Ctrl,
+##   0x09 is `Tab`), with `mods` added.
+## - So Ctrl with an ASCII capital letter means that Ctrl and Shift were both held.
+##
+## `None` only if a `Char` is not a Unicode scalar value.
+pub fn key(code: KeyCode, mods: Mods) -> Option[Key] {
+  code match {
+    Char(c) if !is_scalar_value(c) -> None
+    Char(c) if is_control(c) -> {
+      (rep_code, rep_mods) = representative(c)
+      key(rep_code, union(rep_mods, mods))
+    }
+    # FRICTION(013): Emela has no literal for the code point of a character, so these are
+    # hexadecimal: 0x61 to 0x7A is `a` to `z`, 0x41 to 0x5A is `A` to `Z`, and each small letter
+    # is 0x20 above its capital.
+    Char(c) if mods.shift && c >= 0x61 && c <= 0x7A -> Some(
+      Key(key_code: Char(c - 0x20), key_mods: Mods(shift: False, ..mods)),
+    )
+    Char(c) if mods.shift && ((c >= 0x41 && c <= 0x5A) || is_ascii_punctuation(c)) -> Some(
+      Key(key_code: code, key_mods: Mods(shift: False, ..mods)),
+    )
+    _                              -> Some(Key(key_code: code, key_mods: mods))
+  }
+}
+
+# The representative of the control character `c`, and the modifiers it holds: the key that
+# termwiz turns into `c` with Ctrl (spec §6).
+fn representative(c: Int) -> (KeyCode, Mods) {
+  c match {
+    # FRICTION(013)
+    0x00           -> (Char(0x20), CTRL) # space
+    0x08           -> (Backspace, NO_MODS)
+    0x09           -> (Tab, NO_MODS)
+    0x0D           -> (Enter, NO_MODS)
+    0x1B           -> (Esc, NO_MODS)
+    # FRICTION(015): there is no or-pattern, so 0x7F has an arm of its own.
+    0x7F           -> (Backspace, NO_MODS)
+    # FRICTION(038): there are no range patterns, so 0x1C to 0x1F is a guard.
+    _ if c >= 0x1C -> (Char(c + 0x40), CTRL) # \ ] ^ _
+    _              -> (Char(c + 0x60), CTRL) # a-z
+  }
+}
+
+# The modifiers held in `a` or in `b`.
+fn union(a: Mods, b: Mods) -> Mods {
+  Mods(
+    ctrl: a.ctrl || b.ctrl,
+    alt: a.alt || b.alt,
+    shift: a.shift || b.shift,
+    super: a.super || b.super,
+  )
+}
+
+# FRICTION(039): std has no predicates on a code point, so these three are written here.
+fn is_scalar_value(c: Int) -> Bool {
+  c >= 0 && c <= 0x10FFFF && (c < 0xD800 || c > 0xDFFF)
+}
+
+# FRICTION(039)
+fn is_control(c: Int) -> Bool {
+  c <= 0x1F || c == 0x7F
+}
+
+# FRICTION(039): Rust's `is_ascii_punctuation`, which termwiz uses.
+# FRICTION(013)
+fn is_ascii_punctuation(c: Int) -> Bool {
+  (
+    (c >= 0x21 && c <= 0x2F) # ! to /
+      || (c >= 0x3A && c <= 0x40) # : to @
+      || (c >= 0x5B && c <= 0x60) # [ to `
+      || (c >= 0x7B && c <= 0x7E) # { to ~
+  )
+}

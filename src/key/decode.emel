@@ -1,0 +1,386 @@
+# The bytes of an `i` event of a recorded cast, read back as keys, bracketed pastes and bytes that
+# are no key.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
+
+import Std.Bytes.{Bytes}
+import Key.{
+  KeyCode,
+  Mods,
+  NO_MODS,
+  Char,
+  Enter,
+  Tab,
+  Delete,
+  Insert,
+  Up,
+  Down,
+  Left,
+  Right,
+  Home,
+  End,
+  PageUp,
+  PageDown,
+  Function,
+}
+
+## What `decode` reads from the bytes of an `i` event.
+pub enum Decoded {
+  # FRICTION(042): importing the opaque type `Key` also imports its constructor `Key`, which is
+  # the name of this variant, so the type is written through its module.
+  ## A key.
+  Key(Key.Key)
+  ## A bracketed paste: the text between `CSI 200~` and `CSI 201~`.
+  Paste(String)
+  ## Bytes that are no key: a sequence that `decode` cannot read, or bytes that are not UTF-8.
+  Unknown(Bytes)
+} derive Eq, Show
+
+# FRICTION(013): Emela has no literal for the code point of a character, so the bytes that
+# patterns look at have names.
+const LF: Int = 0x0A
+const CR: Int = 0x0D
+const ESC: Int = 0x1B
+const CAPITAL_A: Int = 0x41
+const CAPITAL_B: Int = 0x42
+const CAPITAL_C: Int = 0x43
+const CAPITAL_D: Int = 0x44
+const CAPITAL_F: Int = 0x46
+const CAPITAL_H: Int = 0x48
+const CAPITAL_O: Int = 0x4F
+const CAPITAL_P: Int = 0x50
+const CAPITAL_Q: Int = 0x51
+const CAPITAL_R: Int = 0x52
+const CAPITAL_S: Int = 0x53
+const CAPITAL_Z: Int = 0x5A
+const LEFT_BRACKET: Int = 0x5B
+const SMALL_U: Int = 0x75
+const TILDE: Int = 0x7E
+
+# `CSI 200~` and `CSI 201~`, which start and end a bracketed paste.
+const PASTE_START: Bytes = Bytes.hex("1b5b3230307e")
+const PASTE_END: Bytes = Bytes.hex("1b5b3230317e")
+
+const SHIFT: Mods = Mods(shift: True, ..NO_MODS)
+
+## The keys, pastes and unknown bytes in `b`, the bytes of one `i` event, read from the front. No
+## state is kept from one event to the next.
+##
+## 1. `CSI 200~` starts a paste of the text up to `CSI 201~`, or to the end of `b` if no
+##    `CSI 201~` comes. If that text is not UTF-8, the whole paste is unknown.
+## 2. `ESC [` and a byte after it start a sequence of parameter bytes (0x30 to 0x3F),
+##    intermediate bytes (0x20 to 0x2F) and a final byte (0x40 to 0x7E), as in ECMA-48. It is a
+##    cursor key, Home or End (`A B C D H F`, with modifiers after `1;`), Insert, Delete, PageUp,
+##    PageDown or F5 to F12 (`n~` and `n;m~`), F1 to F4 with modifiers (`1;m P` to `S`), Tab with
+##    Shift (`Z`, and `1;m Z`), or a key of modifyOtherKeys (`27;m;c~`) or of `c;m u`. Any other
+##    sequence is unknown, and so is one whose modifier number holds a bit other than Shift, Alt
+##    and Ctrl. So a `CSI u` with an extension of kitty is unknown: values after `:` (such as an
+##    event type), or a `c` in the private use area 0xE000 to 0xF8FF, where kitty numbers its
+##    own keys. In `27;m;c~` such a `c` is a character like any other, since modifyOtherKeys
+##    sends a character of that area with modifiers so. If `b` ends before the final byte, the
+##    bytes from `ESC [` are unknown. If a byte that cannot continue the sequence comes before the
+##    final byte (a byte outside the three ranges, or a parameter byte after an intermediate
+##    byte), the bytes from `ESC [` up to it are unknown, and that byte starts the next item.
+## 3. `ESC O` before one of `A B C D H F P Q R S` is SS3 (a cursor key, Home, End, F1 to F4).
+## 4. `ESC` before a key is that key with Alt (`ESC a` is `<M-a>`, `ESC ESC` is `<M-Esc>`). The
+##    key after the `ESC` is read by the other rules, not by this one: `ESC ESC [ A` is `<M-Up>`,
+##    and `ESC ESC [` is `<M-Esc>` and `[`. So an `ESC [` or `ESC O` that ends `b` is `<M-[>` or
+##    `<M-O>` only at the start of an item. `ESC` before anything else, or at the end, is
+##    `<Esc>`.
+## 5. A control character is its representative (`Key.key`). A 0x0A right after 0x0D is part of
+##    that Enter.
+## 6. Anything else is UTF-8: each code point is a character, and each run of bytes at which no
+##    code point starts is unknown.
+pub fn decode(b: Bytes) -> List[Decoded] {
+  # FRICTION(052): Bytes has no list pattern, so the walk keeps the bytes two ways in step: `b` and
+  # the offset `at`, to slice and to read UTF-8, and `bs`, the List of the bytes from `at` on, to
+  # match.
+  items(b, 0, b.to_list(), [])
+}
+
+# FRICTION(021): the items are put in `done` in reverse, so that the call to `items` is a tail
+# call.
+# The items of `b` from `at` on, after the reverse of `done`. `bs` holds the bytes from `at` on.
+fn items(b: Bytes, at: Int, bs: List[Int], done: List[Decoded]) -> List[Decoded] {
+  bs match {
+    [] -> done.reverse()
+    _ -> {
+      (d, length) = item(b, at, bs)
+      items(b, at + length, bs.drop(length), [d, ..done])
+    }
+  }
+}
+
+# The item at `at` of `b`, and the number of bytes it takes. `bs` holds the bytes from `at` on,
+# and is not empty.
+fn item(b: Bytes, at: Int, bs: List[Int]) -> (Decoded, Int) {
+  bs match {
+    [ESC, _, ..] if !opens_sequence(bs.tail()) -> unprefixed(b, at + 1, bs.tail(), True) match {
+      (Key(k), length) -> (Key(k), 1 + length)
+      # The ESC alone.
+      _                -> character(b, at, False)
+    }
+    _ -> unprefixed(b, at, bs, False)
+  }
+}
+
+# Whether `rest`, the bytes after an ESC, make a CSI or SS3 sequence with it.
+fn opens_sequence(rest: List[Int]) -> Bool {
+  rest match {
+    [LEFT_BRACKET, _, ..] -> True
+    [CAPITAL_O, c, ..]    -> letter(c).is_some()
+    _                     -> False
+  }
+}
+
+# The item at `at` of `b`, read without rule 4 of `decode`, with Alt added to a key if `alt`, and
+# the number of bytes it takes. `bs` holds the bytes from `at` on, and is not empty.
+fn unprefixed(b: Bytes, at: Int, bs: List[Int], alt: Bool) -> (Decoded, Int) {
+  bs match {
+    # FRICTION(050): a list pattern cannot start with the bytes of a const (`[..PASTE_START, ..]`),
+    # so the arm matches its first 2 bytes, and a guard compares a slice of `b` with all of it.
+    [ESC, LEFT_BRACKET, ..] if b.slice(at, at + PASTE_START.size()) == PASTE_START -> paste(b, at)
+    # `ESC [` that ends `b` starts no sequence.
+    [ESC, LEFT_BRACKET, ..rest] if !rest.is_empty() -> csi(b, at, rest, alt)
+    [ESC, CAPITAL_O, c, ..] -> letter(c) match {
+      Some(code) -> (Key(pressed(code, NO_MODS, alt)), 3)
+      None       -> character(b, at, alt)
+    }
+    [CR, LF, ..]                                    -> (Key(pressed(Enter, NO_MODS, alt)), 2)
+    _                                               -> character(b, at, alt)
+  }
+}
+
+# The paste that `CSI 200~` starts at `at` of `b`, and the number of bytes it takes.
+fn paste(b: Bytes, at: Int) -> (Decoded, Int) {
+  start = at + PASTE_START.size()
+  (text_end, end) = find(b, PASTE_END, start) match {
+    Some(i) -> (i, i + PASTE_END.size())
+    None    -> (b.size(), b.size())
+  }
+  b.slice(start, text_end).decode_utf8() match {
+    Some(text) -> (Paste(text), end - at)
+    None       -> (Unknown(b.slice(at, end)), end - at)
+  }
+}
+
+# FRICTION(044): Bytes has no function that finds bytes in it, so this compares the bytes at each
+# offset in turn.
+# The offset of the first `needle` in `b` from `from` on.
+fn find(b: Bytes, needle: Bytes, from: Int) -> Option[Int] {
+  if from + needle.size() > b.size() {
+    None
+  } else if b.slice(from, from + needle.size()) == needle {
+    Some(from)
+  } else {
+    find(b, needle, from + 1)
+  }
+}
+
+# The CSI sequence at `at` of `b`, whose bytes after `ESC [` are `rest`, and the number of bytes it
+# takes.
+fn csi(b: Bytes, at: Int, rest: List[Int], alt: Bool) -> (Decoded, Int) {
+  parameters = run_length(rest, |c| c >= 0x30 && c <= 0x3F)
+  intermediates = run_length(rest.drop(parameters), |c| c >= 0x20 && c <= 0x2F)
+  length = 2 + parameters + intermediates
+  rest.drop(parameters + intermediates) match {
+    [f, ..] if f >= 0x40 && f <= 0x7E -> {
+      # No sequence that is a key has intermediate bytes.
+      found = if intermediates == 0 {
+        numbers(b.slice(at + 2, at + 2 + parameters)).and_then(|ns| csi_key(ns, f, alt))
+      } else {
+        None
+      }
+      found match {
+        Some(k) -> (Key(k), length + 1)
+        None    -> (Unknown(b.slice(at, at + length + 1)), length + 1)
+      }
+    }
+    # `b` ends, or a byte that cannot continue the sequence comes, before the final byte: a byte
+    # outside the three ranges, or a parameter byte after an intermediate byte. That byte starts
+    # the next item.
+    _ -> (Unknown(b.slice(at, at + length)), length)
+  }
+}
+
+# FRICTION(041): List has no `take_while` (or `span`), so the run ends where `find_index` finds the
+# first byte that `f` rejects.
+# The number of bytes at the start of `bs` that `f` accepts.
+fn run_length(bs: List[Int], f: fn(Int) -> Bool) -> Int {
+  bs.find_index(|c| !f(c)).or(bs.length())
+}
+
+# The numbers that `;` separates in `parameters`, the parameter bytes of a CSI sequence. `None` if
+# one is empty or holds a byte other than a digit (`:`, `<`, `=`, `>`, `?`), or is too large.
+fn numbers(parameters: Bytes) -> Option[List[Int]] {
+  if parameters.is_empty() {
+    Some([])
+  } else {
+    # FRICTION(046): Bytes and List have no `split`, and Int has no parse of digit bytes, so the
+    # parameter bytes, which are ASCII, are read as a String.
+    text = parameters.decode_utf8() |> expect("the parameter bytes are ASCII")
+    fields = text.split(";")
+    # FRICTION(006): there is no function that makes a List of Options an Option of a List, so a
+    # field that is no number is one that `filter_map` drops.
+    ns = fields.filter_map(number)
+    if ns.length() == fields.length() { Some(ns) } else { None }
+  }
+}
+
+# The number in `field`, a field of the parameter bytes of a CSI sequence. `None` if it is empty,
+# holds a byte other than a digit, or is too large for an Int.
+fn number(field: String) -> Option[Int] {
+  Some(Int.parse(field)) escape {
+    ParseError(_) -> None
+  }
+}
+
+# FRICTION(017): there is no `?` on an Option, so the parts that can be missing are chained with
+# `and_then` and `map`.
+# The key of the CSI sequence with the numbers `ns` and the final byte `f`, with Alt if `alt`.
+fn csi_key(ns: List[Int], f: Int, alt: Bool) -> Option[Key.Key] {
+  (ns, f) match {
+    ([27, m, c], TILDE) -> typed(c, m, alt)
+    ([n], TILDE)        -> tilde(n).map(|code| pressed(code, NO_MODS, alt))
+    ([n, m], TILDE)     -> tilde(n).and_then(|code| held(code, m, alt))
+    # kitty numbers its own keys in the private use area 0xE000 to 0xF8FF.
+    ([c, m], SMALL_U)   -> if c >= 0xE000 && c <= 0xF8FF { None } else { typed(c, m, alt) }
+    ([], CAPITAL_Z)     -> Some(pressed(Tab, SHIFT, alt))
+    ([1, m], CAPITAL_Z) -> modifiers(m).map(|mods| pressed(Tab, Mods(shift: True, ..mods), alt))
+    ([], _)             -> cursor(f).map(|code| pressed(code, NO_MODS, alt))
+    ([1, m], _)         -> letter(f).and_then(|code| held(code, m, alt))
+    _                   -> None
+  }
+}
+
+# The key of `n` in `CSI n~` and `CSI n;m~`.
+fn tilde(n: Int) -> Option[KeyCode] {
+  n match {
+    2                       -> Some(Insert)
+    3                       -> Some(Delete)
+    5                       -> Some(PageUp)
+    6                       -> Some(PageDown)
+    15                      -> function(5)
+    # FRICTION(038): there are no range patterns, so 17 to 21 (F6 to F10) is a guard.
+    _ if n >= 17 && n <= 21 -> function(n - 11)
+    # FRICTION(015): there is no or-pattern, so 23 and 24 have arms of their own.
+    23                      -> function(11)
+    24                      -> function(12)
+    _                       -> None
+  }
+}
+
+# The key of the final byte `f` of `CSI 1;m f` and `SS3 f`: a cursor key, Home, End, or F1 to F4.
+fn letter(f: Int) -> Option[KeyCode] {
+  f match {
+    # FRICTION(015): there is no or-pattern, so `P` to `S` have arms of their own.
+    CAPITAL_P -> function(1)
+    CAPITAL_Q -> function(2)
+    CAPITAL_R -> function(3)
+    CAPITAL_S -> function(4)
+    _         -> cursor(f)
+  }
+}
+
+# The key of the final byte `f` of `CSI f`: a cursor key, Home or End.
+fn cursor(f: Int) -> Option[KeyCode] {
+  f match {
+    CAPITAL_A -> Some(Up)
+    CAPITAL_B -> Some(Down)
+    CAPITAL_C -> Some(Right)
+    CAPITAL_D -> Some(Left)
+    CAPITAL_H -> Some(Home)
+    CAPITAL_F -> Some(End)
+    _         -> None
+  }
+}
+
+# F`n`. `None` unless `n` is 1 to 12.
+fn function(n: Int) -> Option[KeyCode] {
+  Key.f_key(n).map(|f| Function(f))
+}
+
+# The modifiers of the xterm modifier number `m`: 1, plus 1 for Shift, 2 for Alt and 4 for Ctrl.
+# `None` if `m` holds any other bit.
+fn modifiers(m: Int) -> Option[Mods] {
+  bits = m - 1
+  if bits < 0 || bits > 7 {
+    None
+  } else {
+    Some(
+      Mods(
+        ctrl: bits.bit_and(4) != 0,
+        alt: bits.bit_and(2) != 0,
+        shift: bits.bit_and(1) != 0,
+        super: False,
+      ),
+    )
+  }
+}
+
+# `code`, which is no `Char`, with the modifiers of the xterm modifier number `m`, and with Alt if
+# `alt`.
+fn held(code: KeyCode, m: Int, alt: Bool) -> Option[Key.Key] {
+  modifiers(m).map(|mods| pressed(code, mods, alt))
+}
+
+# The key of the code `c` of `CSI 27;m;c~` and `CSI c;m u`, with the modifiers of the xterm
+# modifier number `m`, and with Alt if `alt`. `Key.key` makes a control character its
+# representative: 9 is Tab, 8 and 127 are Backspace. `None` if `c` is not a scalar value.
+fn typed(c: Int, m: Int, alt: Bool) -> Option[Key.Key] {
+  modifiers(m).and_then(|mods| Key.key(Char(c), Mods(alt: mods.alt || alt, ..mods)))
+}
+
+# `code` with `mods`, and with Alt if `alt`. `code` is no `Char`, or a `Char` of a code point read
+# from UTF-8, so `Key.key` makes a key of it.
+fn pressed(code: KeyCode, mods: Mods, alt: Bool) -> Key.Key {
+  Key.key(code, Mods(alt: mods.alt || alt, ..mods))
+    |> expect("the code is no Char, or a Char of a code point read from UTF-8")
+}
+
+# The code point at `at` of `b` as a character, with Alt if `alt`, and the number of bytes it
+# takes. If no code point starts there, the run of bytes from `at` at which none starts, as
+# unknown.
+fn character(b: Bytes, at: Int, alt: Bool) -> (Decoded, Int) {
+  code_point(b, at, 1) match {
+    Some((c, length)) -> (Key(pressed(Char(c), NO_MODS, alt)), length)
+    None -> {
+      end = not_utf8_end(b, at + 1)
+      (Unknown(b.slice(at, end)), end - at)
+    }
+  }
+}
+
+# FRICTION(041): the run of bytes that are not UTF-8 is not a `take_while` of the bytes (whether a
+# code point starts at a byte depends on the bytes after it), so this steps through the offsets.
+# The first offset from `at` on at which a code point starts, or the end of `b`.
+fn not_utf8_end(b: Bytes, at: Int) -> Int {
+  if at < b.size() && code_point(b, at, 1).is_none() { not_utf8_end(b, at + 1) } else { at }
+}
+
+# FRICTION(043): std has no function that decodes the first code point of bytes, so this tries
+# `Bytes.decode_utf8` on the first `length` bytes from `at` and then on more, up to 4.
+# The code point that starts at `at` of `b`, and the number of bytes it takes.
+fn code_point(b: Bytes, at: Int, length: Int) -> Option[(Int, Int)] {
+  if length > 4 || at + length > b.size() {
+    None
+  } else {
+    b.slice(at, at + length).decode_utf8() match {
+      # FRICTION(040): `s`, decoded from 1 to 4 bytes, is not empty, so its first code point is
+      # never None.
+      Some(s) -> Some(
+        (s.code_points().head() |> expect("a String decoded from bytes is not empty"), length),
+      )
+      None -> code_point(b, at, length + 1)
+    }
+  }
+}
+
+# FRICTION(040): Option has no `expect`, so a None that cannot happen is a match with a panic.
+fn expect[A](opt: Option[A], why: String) -> A {
+  opt match {
+    Some(a) -> a
+    None    -> panic("None, but #{why}")
+  }
+}

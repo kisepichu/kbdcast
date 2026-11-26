@@ -14,7 +14,7 @@
 
 repo を一時ディレクトリに写し、wish-target の場所に wish を置いて、その Pome で `emela pome install` と `emela check` を走らせる。出力はファイル末尾の `# --- wish check` から `# --- end wish check ---` までのブロックに書かれる。もう一度走らせると、このブロックは置き換わる。元の repo の `src/` は変わらない。
 
-Pome がまだ無ければ、wish check が仮の Pome.toml を置く。wish-target の最初の `src` か `test` の段より前を Pome のディレクトリとし、一時ディレクトリの中にだけ置く（`src` も `test` も無い wish-target は「Pome が無い」エラーになる）。置いたときは、ブロックの最初の行に `# (Pome.toml は wish check が仮に置いた: <dir>/Pome.toml)` と書かれる。
+wish の Pome は、wish-target の最初の `src` か `test` の段より前のディレクトリ（`src/key.emel` なら repo の root、`regex/src/vm.emel` なら `regex/`）。その上に別の `Pome.toml` があるかどうかに関わらず、この Pome で検査する。そのディレクトリに `Pome.toml` がまだ無ければ、wish check が一時ディレクトリの中にだけ仮の `Pome.toml` を置き、ブロックの最初の行に `# (Pome.toml は wish check が仮に置いた: <dir>/Pome.toml)` と書く。`src` も `test` も無い wish-target は、`<target> が Pome の src/ か test/ の下を指していない` というエラーになる。
 
 ## 手順
 

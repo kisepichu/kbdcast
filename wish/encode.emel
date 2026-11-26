@@ -1,0 +1,2807 @@
+# wish-target: src/key/encode.emel
+module Key.Encode
+
+import Key.{Key, KeyCode.*, Mods, NO_MODS, f_number}
+
+# DECCKM（CSI ? 1 h / l）
+pub enum CursorKeys { Normal | Application }
+# LNM（CSI 20 h / l）
+pub enum Newline { Cr | CrLf }
+pub enum Level { One | Two }
+# modifyOtherKeys（CSI > 4 ; n m）
+pub enum OtherKeys { Off | On(Level) }
+
+pub type InputModes(cursor_keys: CursorKeys, newline: Newline, other_keys: OtherKeys)
+
+pub const DEFAULT_MODES: InputModes = InputModes(cursor_keys: Normal, newline: Cr, other_keys: Off)
+
+pub enum Reason { NeedsOtherKeys(Level) | NeedsKitty }
+
+pub error Unencodable(key: Key, reason: Reason)
+
+# 今の mode で表せなければ、other_keys だけを上げた mode を下から順に試し、
+# 最初に表せた段階を理由にする。どれでも表せなければ kitty が要る。
+pub fn encode(key: Key, modes: InputModes) -> Bytes fails Unencodable {
+  match bytes_in(key, modes) {
+    Some(b) -> b
+    None -> fail Unencodable(key, reason(key, modes))
+  }
+}
+
+fn reason(key: Key, modes: InputModes) -> Reason {
+  let higher = match modes.other_keys {
+    Off -> [One, Two]
+    On(One) -> [Two]
+    On(Two) -> []
+  }
+  match higher.find(|level| bytes_in(key, modes with { other_keys: On(level) }).is_some()) {
+    Some(level) -> NeedsOtherKeys(level)
+    None -> NeedsKitty
+  }
+}
+
+# キーの種類ごとの規則。None は、この mode では端末が修飾を落として送るので表せないこと。
+fn bytes_in(key: Key, modes: InputModes) -> Option[Bytes] {
+  let m = key.mods
+  if m.super {
+    return None
+  }
+  match key.code {
+    Char(c) -> char(c, m, modes.other_keys)
+    Enter -> enter(m, modes)
+    Esc -> esc(m, modes.other_keys)
+    Tab -> tab(m, modes.other_keys)
+    Backspace -> backspace(m, modes.other_keys)
+    Up -> Some(cursor("A", m, modes.cursor_keys))
+    Down -> Some(cursor("B", m, modes.cursor_keys))
+    Right -> Some(cursor("C", m, modes.cursor_keys))
+    Left -> Some(cursor("D", m, modes.cursor_keys))
+    Home -> Some(cursor("H", m, modes.cursor_keys))
+    End -> Some(cursor("F", m, modes.cursor_keys))
+    Insert -> Some(tilde(2, m))
+    Delete -> Some(tilde(3, m))
+    PageUp -> Some(tilde(5, m))
+    PageDown -> Some(tilde(6, m))
+    Function(f) -> Some(function(f_number(f), m))
+  }
+}
+
+fn char(c: Int, m: Mods, other_keys: OtherKeys) -> Option[Bytes] {
+  match (m, other_keys) {
+    (NO_MODS, _) -> Some(c.to_utf8())
+    (Mods(ctrl: true, ..), On(Two)) -> Some(other_key(c, m))
+    (Mods(ctrl: true, ..), _) -> ctrl_char(c, m, other_keys)
+    # Shift の残る数字は、どの段階でも Shift が落ちる
+    (Mods(alt: true, shift, ..), _) if is_ascii_graphic(c) ->
+      if shift { None } else { Some(b"\e" ++ c.to_utf8()) }
+    (_, On(_)) -> Some(other_key(c, m))
+    (Mods(shift: true, ..), Off) -> None
+    (Mods(alt: true, ..), Off) -> Some(b"\e" ++ c.to_utf8())
+  }
+}
+
+# Ctrl と文字（Off と Level1）
+fn ctrl_char(c: Int, m: Mods, other_keys: OtherKeys) -> Option[Bytes] {
+  match ctrl_mapping(c) {
+    # Ctrl 付きの英大文字は Ctrl と Shift
+    Some(_) if 'A' <= c && c <= 'Z' -> if other_keys == On(One) { Some(other_key(c, m)) } else { None }
+    # 数字と空白の Shift は落ちる
+    Some(_) if m.shift -> None
+    Some(control) -> Some(alt_prefix(m, [control]))
+    # ESC と文字になり、Ctrl が落ちる
+    None if m.alt && is_ascii_graphic(c) -> None
+    None -> if other_keys == On(One) { Some(other_key(c, m)) } else { None }
+  }
+}
+
+fn ctrl_mapping(c: Int) -> Option[Int] {
+  match c {
+    '@' | '`' | ' ' | '2' -> Some(0x00)
+    'a'..='z' -> Some(c - 'a' + 1)
+    'A'..='Z' -> Some(c - 'A' + 1)
+    '[' | '3' | '{' -> Some(0x1b)
+    '\\' | '4' | '|' -> Some(0x1c)
+    ']' | '5' | '}' -> Some(0x1d)
+    '^' | '6' | '~' -> Some(0x1e)
+    '_' | '7' | '/' -> Some(0x1f)
+    '8' | '?' -> Some(0x7f)
+    _ -> None
+  }
+}
+
+fn enter(m: Mods, modes: InputModes) -> Option[Bytes] {
+  let cr = match modes.newline {
+    Cr -> b"\r"
+    CrLf -> b"\r\n"
+  }
+  if m.shift || m.ctrl {
+    match modes.other_keys {
+      Off -> None
+      On(_) -> Some(other_key(13, m))
+    }
+  } else {
+    Some(alt_prefix(m, cr))
+  }
+}
+
+fn esc(m: Mods, other_keys: OtherKeys) -> Option[Bytes] {
+  if m.shift || m.ctrl {
+    match other_keys {
+      On(Two) -> Some(other_key(27, m))
+      _ -> None
+    }
+  } else {
+    Some(alt_prefix(m, b"\e"))
+  }
+}
+
+fn tab(m: Mods, other_keys: OtherKeys) -> Option[Bytes] {
+  match (other_keys, m) {
+    (_, NO_MODS) -> Some(b"\t")
+    (On(_), _) -> Some(other_key(9, m))
+    (Off, Mods(ctrl: true, shift: true, ..)) -> Some(alt_prefix(m, b"\e[1;5Z"))
+    (Off, Mods(ctrl: true, ..)) -> Some(alt_prefix(m, b"\e[9;5u"))
+    (Off, Mods(shift: true, ..)) -> Some(alt_prefix(m, b"\e[Z"))
+    (Off, _) -> Some(alt_prefix(m, b"\t"))
+  }
+}
+
+fn backspace(m: Mods, other_keys: OtherKeys) -> Option[Bytes] {
+  match (m, other_keys) {
+    (Mods(ctrl: true, ..), On(Two)) -> Some(other_key(8, m))
+    (Mods(shift: true, ..), On(Two)) -> Some(other_key(127, m))
+    (Mods(shift: true, ..), _) -> None
+    (Mods(ctrl: true, ..), _) -> Some(alt_prefix(m, [0x08]))
+    _ -> Some(alt_prefix(m, [0x7f]))
+  }
+}
+
+fn cursor(final: String, m: Mods, cursor_keys: CursorKeys) -> Bytes {
+  match (m, cursor_keys) {
+    (NO_MODS, Normal) -> "\e[{final}".to_bytes()
+    (NO_MODS, Application) -> "\eO{final}".to_bytes()
+    _ -> "\e[1;{modifier_number(m)}{final}".to_bytes()
+  }
+}
+
+fn tilde(n: Int, m: Mods) -> Bytes {
+  if m == NO_MODS { "\e[{n}~".to_bytes() } else { "\e[{n};{modifier_number(m)}~".to_bytes() }
+}
+
+fn function(n: Int, m: Mods) -> Bytes {
+  match n {
+    1..=4 -> {
+      let final = ["P", "Q", "R", "S"][n - 1]
+      if m == NO_MODS { "\eO{final}".to_bytes() } else { "\e[1;{modifier_number(m)}{final}".to_bytes() }
+    }
+    _ -> tilde([15, 17, 18, 19, 20, 21, 23, 24][n - 5], m)
+  }
+}
+
+# modifyOtherKeys の形
+fn other_key(c: Int, m: Mods) -> Bytes {
+  "\e[27;{modifier_number(m)};{c}~".to_bytes()
+}
+
+fn alt_prefix(m: Mods, b: Bytes) -> Bytes {
+  if m.alt { b"\e" ++ b } else { b }
+}
+
+# xterm と同じく 1 + Shift(1) + Alt(2) + Ctrl(4)
+fn modifier_number(m: Mods) -> Int {
+  1 + (if m.shift { 1 } else { 0 }) + (if m.alt { 2 } else { 0 }) + (if m.ctrl { 4 } else { 0 })
+}
+
+fn is_ascii_graphic(c: Int) -> Bool {
+  '!' <= c && c <= '~'
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0107]: unknown escape sequence `\e`
+#     ╭─[ src/key/encode.emel:76:39 ]
+#     │
+#  76 │       if shift { None } else { Some(b"\e" ++ c.to_utf8()) }
+#     │                                       ─┬  
+#     │                                        ╰── 
+# ────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#     ╭─[ src/key/encode.emel:79:42 ]
+#     │
+#  79 │     (Mods(alt: true, ..), Off) -> Some(b"\e" ++ c.to_utf8())
+#     │                                          ─┬  
+#     │                                           ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/encode.emel:87:16 ]
+#     │
+#  87 │     Some(_) if 'A' <= c && c <= 'Z' -> if other_keys == On(One) { Some(other_key(c, m)) } else { None }
+#     │                ┬  
+#     │                ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/encode.emel:87:18 ]
+#     │
+#  87 │     Some(_) if 'A' <= c && c <= 'Z' -> if other_keys == On(One) { Some(other_key(c, m)) } else { None }
+#     │                  ┬  
+#     │                  ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/encode.emel:87:33 ]
+#     │
+#  87 │     Some(_) if 'A' <= c && c <= 'Z' -> if other_keys == On(One) { Some(other_key(c, m)) } else { None }
+#     │                                 ┬  
+#     │                                 ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/encode.emel:87:35 ]
+#     │
+#  87 │     Some(_) if 'A' <= c && c <= 'Z' -> if other_keys == On(One) { Some(other_key(c, m)) } else { None }
+#     │                                   ┬  
+#     │                                   ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/encode.emel:99:5 ]
+#     │
+#  99 │     '@' | '`' | ' ' | '2' -> Some(0x00)
+#     │     ┬  
+#     │     ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/encode.emel:99:7 ]
+#     │
+#  99 │     '@' | '`' | ' ' | '2' -> Some(0x00)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/encode.emel:99:11 ]
+#     │
+#  99 │     '@' | '`' | ' ' | '2' -> Some(0x00)
+#     │           ┬  
+#     │           ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character ```
+#     ╭─[ src/key/encode.emel:99:12 ]
+#     │
+#  99 │     '@' | '`' | ' ' | '2' -> Some(0x00)
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/encode.emel:99:13 ]
+#     │
+#  99 │     '@' | '`' | ' ' | '2' -> Some(0x00)
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/encode.emel:99:17 ]
+#     │
+#  99 │     '@' | '`' | ' ' | '2' -> Some(0x00)
+#     │                 ┬  
+#     │                 ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/encode.emel:99:19 ]
+#     │
+#  99 │     '@' | '`' | ' ' | '2' -> Some(0x00)
+#     │                   ┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/encode.emel:99:23 ]
+#     │
+#  99 │     '@' | '`' | ' ' | '2' -> Some(0x00)
+#     │                       ┬  
+#     │                       ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/encode.emel:99:25 ]
+#     │
+#  99 │     '@' | '`' | ' ' | '2' -> Some(0x00)
+#     │                         ┬  
+#     │                         ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:100:5 ]
+#      │
+#  100 │     'a'..='z' -> Some(c - 'a' + 1)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:100:7 ]
+#      │
+#  100 │     'a'..='z' -> Some(c - 'a' + 1)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:100:11 ]
+#      │
+#  100 │     'a'..='z' -> Some(c - 'a' + 1)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:100:13 ]
+#      │
+#  100 │     'a'..='z' -> Some(c - 'a' + 1)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:100:27 ]
+#      │
+#  100 │     'a'..='z' -> Some(c - 'a' + 1)
+#      │                           ┬  
+#      │                           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:100:29 ]
+#      │
+#  100 │     'a'..='z' -> Some(c - 'a' + 1)
+#      │                             ┬  
+#      │                             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:101:5 ]
+#      │
+#  101 │     'A'..='Z' -> Some(c - 'A' + 1)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:101:7 ]
+#      │
+#  101 │     'A'..='Z' -> Some(c - 'A' + 1)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:101:11 ]
+#      │
+#  101 │     'A'..='Z' -> Some(c - 'A' + 1)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:101:13 ]
+#      │
+#  101 │     'A'..='Z' -> Some(c - 'A' + 1)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:101:27 ]
+#      │
+#  101 │     'A'..='Z' -> Some(c - 'A' + 1)
+#      │                           ┬  
+#      │                           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:101:29 ]
+#      │
+#  101 │     'A'..='Z' -> Some(c - 'A' + 1)
+#      │                             ┬  
+#      │                             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:102:5 ]
+#      │
+#  102 │     '[' | '3' | '{' -> Some(0x1b)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:102:7 ]
+#      │
+#  102 │     '[' | '3' | '{' -> Some(0x1b)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:102:11 ]
+#      │
+#  102 │     '[' | '3' | '{' -> Some(0x1b)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:102:13 ]
+#      │
+#  102 │     '[' | '3' | '{' -> Some(0x1b)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:102:17 ]
+#      │
+#  102 │     '[' | '3' | '{' -> Some(0x1b)
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:102:19 ]
+#      │
+#  102 │     '[' | '3' | '{' -> Some(0x1b)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:103:5 ]
+#      │
+#  103 │     '\\' | '4' | '|' -> Some(0x1c)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/key/encode.emel:103:6 ]
+#      │
+#  103 │     '\\' | '4' | '|' -> Some(0x1c)
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/key/encode.emel:103:7 ]
+#      │
+#  103 │     '\\' | '4' | '|' -> Some(0x1c)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:103:8 ]
+#      │
+#  103 │     '\\' | '4' | '|' -> Some(0x1c)
+#      │        ┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:103:12 ]
+#      │
+#  103 │     '\\' | '4' | '|' -> Some(0x1c)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:103:14 ]
+#      │
+#  103 │     '\\' | '4' | '|' -> Some(0x1c)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:103:18 ]
+#      │
+#  103 │     '\\' | '4' | '|' -> Some(0x1c)
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:103:20 ]
+#      │
+#  103 │     '\\' | '4' | '|' -> Some(0x1c)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:104:5 ]
+#      │
+#  104 │     ']' | '5' | '}' -> Some(0x1d)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:104:7 ]
+#      │
+#  104 │     ']' | '5' | '}' -> Some(0x1d)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:104:11 ]
+#      │
+#  104 │     ']' | '5' | '}' -> Some(0x1d)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:104:13 ]
+#      │
+#  104 │     ']' | '5' | '}' -> Some(0x1d)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:104:17 ]
+#      │
+#  104 │     ']' | '5' | '}' -> Some(0x1d)
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:104:19 ]
+#      │
+#  104 │     ']' | '5' | '}' -> Some(0x1d)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:105:5 ]
+#      │
+#  105 │     '^' | '6' | '~' -> Some(0x1e)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `^`
+#      ╭─[ src/key/encode.emel:105:6 ]
+#      │
+#  105 │     '^' | '6' | '~' -> Some(0x1e)
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:105:7 ]
+#      │
+#  105 │     '^' | '6' | '~' -> Some(0x1e)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:105:11 ]
+#      │
+#  105 │     '^' | '6' | '~' -> Some(0x1e)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:105:13 ]
+#      │
+#  105 │     '^' | '6' | '~' -> Some(0x1e)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:105:17 ]
+#      │
+#  105 │     '^' | '6' | '~' -> Some(0x1e)
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `~`
+#      ╭─[ src/key/encode.emel:105:18 ]
+#      │
+#  105 │     '^' | '6' | '~' -> Some(0x1e)
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:105:19 ]
+#      │
+#  105 │     '^' | '6' | '~' -> Some(0x1e)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:106:5 ]
+#      │
+#  106 │     '_' | '7' | '/' -> Some(0x1f)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:106:7 ]
+#      │
+#  106 │     '_' | '7' | '/' -> Some(0x1f)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:106:11 ]
+#      │
+#  106 │     '_' | '7' | '/' -> Some(0x1f)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:106:13 ]
+#      │
+#  106 │     '_' | '7' | '/' -> Some(0x1f)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:106:17 ]
+#      │
+#  106 │     '_' | '7' | '/' -> Some(0x1f)
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:106:19 ]
+#      │
+#  106 │     '_' | '7' | '/' -> Some(0x1f)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:107:5 ]
+#      │
+#  107 │     '8' | '?' -> Some(0x7f)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:107:7 ]
+#      │
+#  107 │     '8' | '?' -> Some(0x7f)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:107:11 ]
+#      │
+#  107 │     '8' | '?' -> Some(0x7f)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/key/encode.emel:107:12 ]
+#      │
+#  107 │     '8' | '?' -> Some(0x7f)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:107:13 ]
+#      │
+#  107 │     '8' | '?' -> Some(0x7f)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#      ╭─[ src/key/encode.emel:134:26 ]
+#      │
+#  134 │     Some(alt_prefix(m, b"\e"))
+#      │                          ─┬  
+#      │                           ╰── 
+# ─────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#      ╭─[ src/key/encode.emel:142:70 ]
+#      │
+#  142 │     (Off, Mods(ctrl: true, shift: true, ..)) -> Some(alt_prefix(m, b"\e[1;5Z"))
+#      │                                                                      ─┬  
+#      │                                                                       ╰── 
+# ─────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#      ╭─[ src/key/encode.emel:143:57 ]
+#      │
+#  143 │     (Off, Mods(ctrl: true, ..)) -> Some(alt_prefix(m, b"\e[9;5u"))
+#      │                                                         ─┬  
+#      │                                                          ╰── 
+# ─────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#      ╭─[ src/key/encode.emel:144:58 ]
+#      │
+#  144 │     (Off, Mods(shift: true, ..)) -> Some(alt_prefix(m, b"\e[Z"))
+#      │                                                          ─┬  
+#      │                                                           ╰── 
+# ─────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#      ╭─[ src/key/encode.emel:161:27 ]
+#      │
+#  161 │     (NO_MODS, Normal) -> "\e[{final}".to_bytes()
+#      │                           ─┬  
+#      │                            ╰── 
+# ─────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#      ╭─[ src/key/encode.emel:162:32 ]
+#      │
+#  162 │     (NO_MODS, Application) -> "\eO{final}".to_bytes()
+#      │                                ─┬  
+#      │                                 ╰── 
+# ─────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#      ╭─[ src/key/encode.emel:163:11 ]
+#      │
+#  163 │     _ -> "\e[1;{modifier_number(m)}{final}".to_bytes()
+#      │           ─┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#      ╭─[ src/key/encode.emel:168:22 ]
+#      │
+#  168 │   if m == NO_MODS { "\e[{n}~".to_bytes() } else { "\e[{n};{modifier_number(m)}~".to_bytes() }
+#      │                      ─┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#      ╭─[ src/key/encode.emel:168:52 ]
+#      │
+#  168 │   if m == NO_MODS { "\e[{n}~".to_bytes() } else { "\e[{n};{modifier_number(m)}~".to_bytes() }
+#      │                                                    ─┬  
+#      │                                                     ╰── 
+# ─────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#      ╭─[ src/key/encode.emel:175:26 ]
+#      │
+#  175 │       if m == NO_MODS { "\eO{final}".to_bytes() } else { "\e[1;{modifier_number(m)}{final}".to_bytes() }
+#      │                          ─┬  
+#      │                           ╰── 
+# ─────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#      ╭─[ src/key/encode.emel:175:59 ]
+#      │
+#  175 │       if m == NO_MODS { "\eO{final}".to_bytes() } else { "\e[1;{modifier_number(m)}{final}".to_bytes() }
+#      │                                                           ─┬  
+#      │                                                            ╰── 
+# ─────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#      ╭─[ src/key/encode.emel:183:4 ]
+#      │
+#  183 │   "\e[27;{modifier_number(m)};{c}~".to_bytes()
+#      │    ─┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#      ╭─[ src/key/encode.emel:187:16 ]
+#      │
+#  187 │   if m.alt { b"\e" ++ b } else { b }
+#      │                ─┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:196:3 ]
+#      │
+#  196 │   '!' <= c && c <= '~'
+#      │   ┬  
+#      │   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:196:5 ]
+#      │
+#  196 │   '!' <= c && c <= '~'
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:196:20 ]
+#      │
+#  196 │   '!' <= c && c <= '~'
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `~`
+#      ╭─[ src/key/encode.emel:196:21 ]
+#      │
+#  196 │   '!' <= c && c <= '~'
+#      │                     ┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/encode.emel:196:22 ]
+#      │
+#  196 │   '!' <= c && c <= '~'
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0126]: expected declaration
+#    ╭─[ src/key/encode.emel:2:1 ]
+#    │
+#  2 │ module Key.Encode
+#    │ ───┬──  
+#    │    ╰──── 
+# ───╯
+#
+# error[E0127]: imports must come before declarations
+#    ╭─[ src/key/encode.emel:4:1 ]
+#    │
+#  4 │ import Key.{Key, KeyCode.*, Mods, NO_MODS, f_number}
+#    │ ───┬──  
+#    │    ╰──── 
+# ───╯
+#
+# error[E0110]: expected `}`
+#    ╭─[ src/key/encode.emel:4:25 ]
+#    │
+#  4 │ import Key.{Key, KeyCode.*, Mods, NO_MODS, f_number}
+#    │                         ┬  
+#    │                         ╰── 
+# ───╯
+#
+# error[E0122]: expected newline after declaration
+#    ╭─[ src/key/encode.emel:4:25 ]
+#    │
+#  4 │ import Key.{Key, KeyCode.*, Mods, NO_MODS, f_number}
+#    │                         ┬  
+#    │                         ╰── 
+# ───╯
+#
+# error[E0110]: expected `,` or newline between variants
+#    ╭─[ src/key/encode.emel:7:30 ]
+#    │
+#  7 │ pub enum CursorKeys { Normal | Application }
+#    │                              ┬  
+#    │                              ╰── 
+# ───╯
+#
+# error[E0110]: expected `,` or newline between variants
+#    ╭─[ src/key/encode.emel:9:23 ]
+#    │
+#  9 │ pub enum Newline { Cr | CrLf }
+#    │                       ┬  
+#    │                       ╰── 
+# ───╯
+#
+# error[E0110]: expected `,` or newline between variants
+#     ╭─[ src/key/encode.emel:10:22 ]
+#     │
+#  10 │ pub enum Level { One | Two }
+#     │                      ┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0110]: expected `,` or newline between variants
+#     ╭─[ src/key/encode.emel:12:26 ]
+#     │
+#  12 │ pub enum OtherKeys { Off | On(Level) }
+#     │                          ┬  
+#     │                          ╰── 
+# ────╯
+#
+# error[E0110]: expected `,` or newline between variants
+#     ╭─[ src/key/encode.emel:18:41 ]
+#     │
+#  18 │ pub enum Reason { NeedsOtherKeys(Level) | NeedsKitty }
+#     │                                         ┬  
+#     │                                         ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/key/encode.emel:25:3 ]
+#     │
+#  25 │   match bytes_in(key, modes) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/encode.emel:32:3 ]
+#     │
+#  32 │   let higher = match modes.other_keys {
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/key/encode.emel:32:7 ]
+#     │
+#  32 │   let higher = match modes.other_keys {
+#     │       ───┬──  
+#     │          ╰──── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/key/encode.emel:37:3 ]
+#     │
+#  37 │   match higher.find(|level| bytes_in(key, modes with { other_keys: On(level) }).is_some()) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/key/encode.emel:37:49 ]
+#     │
+#  37 │   match higher.find(|level| bytes_in(key, modes with { other_keys: On(level) }).is_some()) {
+#     │                                                 ──┬─  
+#     │                                                   ╰─── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/key/encode.emel:37:49 ]
+#     │
+#  37 │   match higher.find(|level| bytes_in(key, modes with { other_keys: On(level) }).is_some()) {
+#     │                                                 ──┬─  
+#     │                                                   ╰─── 
+# ────╯
+#
+# error[E0110]: expected `{`
+#     ╭─[ src/key/encode.emel:37:49 ]
+#     │
+#  37 │   match higher.find(|level| bytes_in(key, modes with { other_keys: On(level) }).is_some()) {
+#     │                                                 ──┬─  
+#     │                                                   ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/key/encode.emel:37:49 ]
+#     │
+#  37 │   match higher.find(|level| bytes_in(key, modes with { other_keys: On(level) }).is_some()) {
+#     │                                                 ──┬─  
+#     │                                                   ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/encode.emel:45:3 ]
+#     │
+#  45 │   let m = key.mods
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/key/encode.emel:45:7 ]
+#     │
+#  45 │   let m = key.mods
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/encode.emel:47:5 ]
+#     │
+#  47 │     return None
+#     │     ───┬──  
+#     │        ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/key/encode.emel:47:12 ]
+#     │
+#  47 │     return None
+#     │            ──┬─  
+#     │              ╰─── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/key/encode.emel:49:3 ]
+#     │
+#  49 │   match key.code {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/key/encode.emel:70:3 ]
+#     │
+#  70 │   match (m, other_keys) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/encode.emel:75:62 ]
+#     │
+#  75 │     (Mods(alt: true, shift, ..), _) if is_ascii_graphic(c) ->
+#     │                                                              ┬  
+#     │                                                              ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/key/encode.emel:76:7 ]
+#     │
+#  76 │       if shift { None } else { Some(b"\e" ++ c.to_utf8()) }
+#     │       ─┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/encode.emel:76:16 ]
+#     │
+#  76 │       if shift { None } else { Some(b"\e" ++ c.to_utf8()) }
+#     │                ┬  
+#     │                ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/encode.emel:76:25 ]
+#     │
+#  76 │       if shift { None } else { Some(b"\e" ++ c.to_utf8()) }
+#     │                         ──┬─  
+#     │                           ╰─── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/key/encode.emel:79:41 ]
+#     │
+#  79 │     (Mods(alt: true, ..), Off) -> Some(b"\e" ++ c.to_utf8())
+#     │                                         ┬  
+#     │                                         ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/encode.emel:79:41 ]
+#     │
+#  79 │     (Mods(alt: true, ..), Off) -> Some(b"\e" ++ c.to_utf8())
+#     │                                         ┬  
+#     │                                         ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/key/encode.emel:85:3 ]
+#     │
+#  85 │   match ctrl_mapping(c) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/encode.emel:87:16 ]
+#     │
+#  87 │     Some(_) if 'A' <= c && c <= 'Z' -> if other_keys == On(One) { Some(other_key(c, m)) } else { None }
+#     │                ┬  
+#     │                ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/encode.emel:87:17 ]
+#     │
+#  87 │     Some(_) if 'A' <= c && c <= 'Z' -> if other_keys == On(One) { Some(other_key(c, m)) } else { None }
+#     │                 ┬  
+#     │                 ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/encode.emel:87:18 ]
+#     │
+#  87 │     Some(_) if 'A' <= c && c <= 'Z' -> if other_keys == On(One) { Some(other_key(c, m)) } else { None }
+#     │                  ┬  
+#     │                  ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/key/encode.emel:98:3 ]
+#     │
+#  98 │   match c {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/key/encode.emel:99:5 ]
+#     │
+#  99 │     '@' | '`' | ' ' | '2' -> Some(0x00)
+#     │     ┬  
+#     │     ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/encode.emel:99:6 ]
+#     │
+#  99 │     '@' | '`' | ' ' | '2' -> Some(0x00)
+#     │      ┬  
+#     │      ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/encode.emel:99:6 ]
+#     │
+#  99 │     '@' | '`' | ' ' | '2' -> Some(0x00)
+#     │      ┬  
+#     │      ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/encode.emel:99:7 ]
+#     │
+#  99 │     '@' | '`' | ' ' | '2' -> Some(0x00)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/key/encode.emel:100:5 ]
+#      │
+#  100 │     'a'..='z' -> Some(c - 'a' + 1)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/encode.emel:100:6 ]
+#      │
+#  100 │     'a'..='z' -> Some(c - 'a' + 1)
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/encode.emel:100:7 ]
+#      │
+#  100 │     'a'..='z' -> Some(c - 'a' + 1)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/key/encode.emel:101:5 ]
+#      │
+#  101 │     'A'..='Z' -> Some(c - 'A' + 1)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/encode.emel:101:6 ]
+#      │
+#  101 │     'A'..='Z' -> Some(c - 'A' + 1)
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/encode.emel:101:7 ]
+#      │
+#  101 │     'A'..='Z' -> Some(c - 'A' + 1)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/key/encode.emel:102:5 ]
+#      │
+#  102 │     '[' | '3' | '{' -> Some(0x1b)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/encode.emel:102:6 ]
+#      │
+#  102 │     '[' | '3' | '{' -> Some(0x1b)
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/encode.emel:102:7 ]
+#      │
+#  102 │     '[' | '3' | '{' -> Some(0x1b)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0110]: expected `]`
+#      ╭─[ src/key/encode.emel:102:9 ]
+#      │
+#  102 │     '[' | '3' | '{' -> Some(0x1b)
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/encode.emel:102:9 ]
+#      │
+#  102 │     '[' | '3' | '{' -> Some(0x1b)
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/key/encode.emel:105:5 ]
+#      │
+#  105 │     '^' | '6' | '~' -> Some(0x1e)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/encode.emel:105:6 ]
+#      │
+#  105 │     '^' | '6' | '~' -> Some(0x1e)
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/encode.emel:105:6 ]
+#      │
+#  105 │     '^' | '6' | '~' -> Some(0x1e)
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/encode.emel:105:7 ]
+#      │
+#  105 │     '^' | '6' | '~' -> Some(0x1e)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/key/encode.emel:106:5 ]
+#      │
+#  106 │     '_' | '7' | '/' -> Some(0x1f)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/encode.emel:106:6 ]
+#      │
+#  106 │     '_' | '7' | '/' -> Some(0x1f)
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0123]: `_` can only be used in patterns
+#      ╭─[ src/key/encode.emel:106:6 ]
+#      │
+#  106 │     '_' | '7' | '/' -> Some(0x1f)
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/encode.emel:106:7 ]
+#      │
+#  106 │     '_' | '7' | '/' -> Some(0x1f)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/key/encode.emel:107:5 ]
+#      │
+#  107 │     '8' | '?' -> Some(0x7f)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/encode.emel:107:6 ]
+#      │
+#  107 │     '8' | '?' -> Some(0x7f)
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/encode.emel:107:7 ]
+#      │
+#  107 │     '8' | '?' -> Some(0x7f)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/encode.emel:113:3 ]
+#      │
+#  113 │   let cr = match modes.newline {
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/key/encode.emel:113:7 ]
+#      │
+#  113 │   let cr = match modes.newline {
+#      │       ─┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/key/encode.emel:118:5 ]
+#      │
+#  118 │     match modes.other_keys {
+#      │     ──┬──  
+#      │       ╰──── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/key/encode.emel:129:5 ]
+#      │
+#  129 │     match other_keys {
+#      │     ──┬──  
+#      │       ╰──── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/encode.emel:134:25 ]
+#      │
+#  134 │     Some(alt_prefix(m, b"\e"))
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/encode.emel:134:25 ]
+#      │
+#  134 │     Some(alt_prefix(m, b"\e"))
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/key/encode.emel:134:25 ]
+#      │
+#  134 │     Some(alt_prefix(m, b"\e"))
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/key/encode.emel:139:3 ]
+#      │
+#  139 │   match (other_keys, m) {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/encode.emel:140:27 ]
+#      │
+#  140 │     (_, NO_MODS) -> Some(b"\t")
+#      │                           ┬  
+#      │                           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/encode.emel:140:27 ]
+#      │
+#  140 │     (_, NO_MODS) -> Some(b"\t")
+#      │                           ┬  
+#      │                           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/encode.emel:142:69 ]
+#      │
+#  142 │     (Off, Mods(ctrl: true, shift: true, ..)) -> Some(alt_prefix(m, b"\e[1;5Z"))
+#      │                                                                     ┬  
+#      │                                                                     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/encode.emel:142:69 ]
+#      │
+#  142 │     (Off, Mods(ctrl: true, shift: true, ..)) -> Some(alt_prefix(m, b"\e[1;5Z"))
+#      │                                                                     ┬  
+#      │                                                                     ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/encode.emel:142:69 ]
+#      │
+#  142 │     (Off, Mods(ctrl: true, shift: true, ..)) -> Some(alt_prefix(m, b"\e[1;5Z"))
+#      │                                                                     ┬  
+#      │                                                                     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/encode.emel:143:56 ]
+#      │
+#  143 │     (Off, Mods(ctrl: true, ..)) -> Some(alt_prefix(m, b"\e[9;5u"))
+#      │                                                        ┬  
+#      │                                                        ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/encode.emel:143:56 ]
+#      │
+#  143 │     (Off, Mods(ctrl: true, ..)) -> Some(alt_prefix(m, b"\e[9;5u"))
+#      │                                                        ┬  
+#      │                                                        ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/encode.emel:143:56 ]
+#      │
+#  143 │     (Off, Mods(ctrl: true, ..)) -> Some(alt_prefix(m, b"\e[9;5u"))
+#      │                                                        ┬  
+#      │                                                        ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/encode.emel:144:57 ]
+#      │
+#  144 │     (Off, Mods(shift: true, ..)) -> Some(alt_prefix(m, b"\e[Z"))
+#      │                                                         ┬  
+#      │                                                         ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/encode.emel:144:57 ]
+#      │
+#  144 │     (Off, Mods(shift: true, ..)) -> Some(alt_prefix(m, b"\e[Z"))
+#      │                                                         ┬  
+#      │                                                         ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/encode.emel:144:57 ]
+#      │
+#  144 │     (Off, Mods(shift: true, ..)) -> Some(alt_prefix(m, b"\e[Z"))
+#      │                                                         ┬  
+#      │                                                         ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/encode.emel:145:37 ]
+#      │
+#  145 │     (Off, _) -> Some(alt_prefix(m, b"\t"))
+#      │                                     ┬  
+#      │                                     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/encode.emel:145:37 ]
+#      │
+#  145 │     (Off, _) -> Some(alt_prefix(m, b"\t"))
+#      │                                     ┬  
+#      │                                     ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/encode.emel:145:37 ]
+#      │
+#  145 │     (Off, _) -> Some(alt_prefix(m, b"\t"))
+#      │                                     ┬  
+#      │                                     ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/key/encode.emel:150:3 ]
+#      │
+#  150 │   match (m, other_keys) {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/key/encode.emel:160:3 ]
+#      │
+#  160 │   match (m, cursor_keys) {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/key/encode.emel:172:3 ]
+#      │
+#  172 │   match n {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/encode.emel:173:6 ]
+#      │
+#  173 │     1..=4 -> {
+#      │      ─┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/encode.emel:173:6 ]
+#      │
+#  173 │     1..=4 -> {
+#      │      ─┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/encode.emel:173:8 ]
+#      │
+#  173 │     1..=4 -> {
+#      │        ┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/encode.emel:177:48 ]
+#      │
+#  177 │     _ -> tilde([15, 17, 18, 19, 20, 21, 23, 24][n - 5], m)
+#      │                                                ┬  
+#      │                                                ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/encode.emel:177:48 ]
+#      │
+#  177 │     _ -> tilde([15, 17, 18, 19, 20, 21, 23, 24][n - 5], m)
+#      │                                                ┬  
+#      │                                                ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/key/encode.emel:187:15 ]
+#      │
+#  187 │   if m.alt { b"\e" ++ b } else { b }
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/encode.emel:196:3 ]
+#      │
+#  196 │   '!' <= c && c <= '~'
+#      │   ┬  
+#      │   ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/key/encode.emel:196:4 ]
+#      │
+#  196 │   '!' <= c && c <= '~'
+#      │    ┬  
+#      │    ╰── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Bytes` in this scope
+#     ╭─[ src/key/encode.emel:24:47 ]
+#     │
+#  24 │ pub fn encode(key: Key, modes: InputModes) -> Bytes fails Unencodable {
+#     │                                               ──┬──  
+#     │                                                 ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `higher` in this scope
+#     ╭─[ src/key/encode.emel:37:9 ]
+#     │
+#  37 │   match higher.find(|level| bytes_in(key, modes with { other_keys: On(level) }).is_some()) {
+#     │         ───┬──  
+#     │            ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Bytes` in this scope
+#     ╭─[ src/key/encode.emel:44:52 ]
+#     │
+#  44 │ fn bytes_in(key: Key, modes: InputModes) -> Option[Bytes] {
+#     │                                                    ──┬──  
+#     │                                                      ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `m` in this scope
+#     ╭─[ src/key/encode.emel:46:6 ]
+#     │
+#  46 │   if m.super {
+#     │      ┬  
+#     │      ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Char` in this scope
+#     ╭─[ src/key/encode.emel:50:5 ]
+#     │
+#  50 │     Char(c) -> char(c, m, modes.other_keys)
+#     │     ──┬─  
+#     │       ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `m` in this scope
+#     ╭─[ src/key/encode.emel:50:24 ]
+#     │
+#  50 │     Char(c) -> char(c, m, modes.other_keys)
+#     │                        ┬  
+#     │                        ╰── 
+# ────╯
+#    = help: did you mean `c`?
+#
+# error[E0211]: cannot find constructor `Enter` in this scope
+#     ╭─[ src/key/encode.emel:51:5 ]
+#     │
+#  51 │     Enter -> enter(m, modes)
+#     │     ──┬──  
+#     │       ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `m` in this scope
+#     ╭─[ src/key/encode.emel:51:20 ]
+#     │
+#  51 │     Enter -> enter(m, modes)
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Esc` in this scope
+#     ╭─[ src/key/encode.emel:52:5 ]
+#     │
+#  52 │     Esc -> esc(m, modes.other_keys)
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `m` in this scope
+#     ╭─[ src/key/encode.emel:52:16 ]
+#     │
+#  52 │     Esc -> esc(m, modes.other_keys)
+#     │                ┬  
+#     │                ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Tab` in this scope
+#     ╭─[ src/key/encode.emel:53:5 ]
+#     │
+#  53 │     Tab -> tab(m, modes.other_keys)
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `m` in this scope
+#     ╭─[ src/key/encode.emel:53:16 ]
+#     │
+#  53 │     Tab -> tab(m, modes.other_keys)
+#     │                ┬  
+#     │                ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Backspace` in this scope
+#     ╭─[ src/key/encode.emel:54:5 ]
+#     │
+#  54 │     Backspace -> backspace(m, modes.other_keys)
+#     │     ────┬────  
+#     │         ╰────── 
+# ────╯
+#
+# error[E0211]: cannot find value `m` in this scope
+#     ╭─[ src/key/encode.emel:54:28 ]
+#     │
+#  54 │     Backspace -> backspace(m, modes.other_keys)
+#     │                            ┬  
+#     │                            ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Up` in this scope
+#     ╭─[ src/key/encode.emel:55:5 ]
+#     │
+#  55 │     Up -> Some(cursor("A", m, modes.cursor_keys))
+#     │     ─┬  
+#     │      ╰── 
+# ────╯
+#
+# error[E0211]: cannot find value `m` in this scope
+#     ╭─[ src/key/encode.emel:55:28 ]
+#     │
+#  55 │     Up -> Some(cursor("A", m, modes.cursor_keys))
+#     │                            ┬  
+#     │                            ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Down` in this scope
+#     ╭─[ src/key/encode.emel:56:5 ]
+#     │
+#  56 │     Down -> Some(cursor("B", m, modes.cursor_keys))
+#     │     ──┬─  
+#     │       ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `m` in this scope
+#     ╭─[ src/key/encode.emel:56:30 ]
+#     │
+#  56 │     Down -> Some(cursor("B", m, modes.cursor_keys))
+#     │                              ┬  
+#     │                              ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Right` in this scope
+#     ╭─[ src/key/encode.emel:57:5 ]
+#     │
+#  57 │     Right -> Some(cursor("C", m, modes.cursor_keys))
+#     │     ──┬──  
+#     │       ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `m` in this scope
+#     ╭─[ src/key/encode.emel:57:31 ]
+#     │
+#  57 │     Right -> Some(cursor("C", m, modes.cursor_keys))
+#     │                               ┬  
+#     │                               ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Left` in this scope
+#     ╭─[ src/key/encode.emel:58:5 ]
+#     │
+#  58 │     Left -> Some(cursor("D", m, modes.cursor_keys))
+#     │     ──┬─  
+#     │       ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `m` in this scope
+#     ╭─[ src/key/encode.emel:58:30 ]
+#     │
+#  58 │     Left -> Some(cursor("D", m, modes.cursor_keys))
+#     │                              ┬  
+#     │                              ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Home` in this scope
+#     ╭─[ src/key/encode.emel:59:5 ]
+#     │
+#  59 │     Home -> Some(cursor("H", m, modes.cursor_keys))
+#     │     ──┬─  
+#     │       ╰─── 
+# ────╯
+#    = help: did you mean `Some`?
+#
+# error[E0211]: cannot find value `m` in this scope
+#     ╭─[ src/key/encode.emel:59:30 ]
+#     │
+#  59 │     Home -> Some(cursor("H", m, modes.cursor_keys))
+#     │                              ┬  
+#     │                              ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `End` in this scope
+#     ╭─[ src/key/encode.emel:60:5 ]
+#     │
+#  60 │     End -> Some(cursor("F", m, modes.cursor_keys))
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `m` in this scope
+#     ╭─[ src/key/encode.emel:60:29 ]
+#     │
+#  60 │     End -> Some(cursor("F", m, modes.cursor_keys))
+#     │                             ┬  
+#     │                             ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Insert` in this scope
+#     ╭─[ src/key/encode.emel:61:5 ]
+#     │
+#  61 │     Insert -> Some(tilde(2, m))
+#     │     ───┬──  
+#     │        ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `m` in this scope
+#     ╭─[ src/key/encode.emel:61:29 ]
+#     │
+#  61 │     Insert -> Some(tilde(2, m))
+#     │                             ┬  
+#     │                             ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Delete` in this scope
+#     ╭─[ src/key/encode.emel:62:5 ]
+#     │
+#  62 │     Delete -> Some(tilde(3, m))
+#     │     ───┬──  
+#     │        ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `m` in this scope
+#     ╭─[ src/key/encode.emel:62:29 ]
+#     │
+#  62 │     Delete -> Some(tilde(3, m))
+#     │                             ┬  
+#     │                             ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `PageUp` in this scope
+#     ╭─[ src/key/encode.emel:63:5 ]
+#     │
+#  63 │     PageUp -> Some(tilde(5, m))
+#     │     ───┬──  
+#     │        ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `m` in this scope
+#     ╭─[ src/key/encode.emel:63:29 ]
+#     │
+#  63 │     PageUp -> Some(tilde(5, m))
+#     │                             ┬  
+#     │                             ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `PageDown` in this scope
+#     ╭─[ src/key/encode.emel:64:5 ]
+#     │
+#  64 │     PageDown -> Some(tilde(6, m))
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find value `m` in this scope
+#     ╭─[ src/key/encode.emel:64:31 ]
+#     │
+#  64 │     PageDown -> Some(tilde(6, m))
+#     │                               ┬  
+#     │                               ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Function` in this scope
+#     ╭─[ src/key/encode.emel:65:5 ]
+#     │
+#  65 │     Function(f) -> Some(function(f_number(f), m))
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find value `f_number` in this scope
+#     ╭─[ src/key/encode.emel:65:34 ]
+#     │
+#  65 │     Function(f) -> Some(function(f_number(f), m))
+#     │                                  ────┬───  
+#     │                                      ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find value `m` in this scope
+#     ╭─[ src/key/encode.emel:65:47 ]
+#     │
+#  65 │     Function(f) -> Some(function(f_number(f), m))
+#     │                                               ┬  
+#     │                                               ╰── 
+# ────╯
+#    = help: did you mean `f`?
+#
+# error[E0211]: cannot find type `Mods` in this scope
+#     ╭─[ src/key/encode.emel:69:20 ]
+#     │
+#  69 │ fn char(c: Int, m: Mods, other_keys: OtherKeys) -> Option[Bytes] {
+#     │                    ──┬─  
+#     │                      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find type `Bytes` in this scope
+#     ╭─[ src/key/encode.emel:69:59 ]
+#     │
+#  69 │ fn char(c: Int, m: Mods, other_keys: OtherKeys) -> Option[Bytes] {
+#     │                                                           ──┬──  
+#     │                                                             ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `NO_MODS` in this scope
+#     ╭─[ src/key/encode.emel:71:6 ]
+#     │
+#  71 │     (NO_MODS, _) -> Some(c.to_utf8())
+#     │      ───┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Mods` in this scope
+#     ╭─[ src/key/encode.emel:72:6 ]
+#     │
+#  72 │     (Mods(ctrl: true, ..), On(Two)) -> Some(other_key(c, m))
+#     │      ──┬─  
+#     │        ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `On` in this scope
+#     ╭─[ src/key/encode.emel:72:28 ]
+#     │
+#  72 │     (Mods(ctrl: true, ..), On(Two)) -> Some(other_key(c, m))
+#     │                            ─┬  
+#     │                             ╰── 
+# ────╯
+#    = help: did you mean `One`?
+#
+# error[E0211]: cannot find constructor `Two` in this scope
+#     ╭─[ src/key/encode.emel:72:31 ]
+#     │
+#  72 │     (Mods(ctrl: true, ..), On(Two)) -> Some(other_key(c, m))
+#     │                               ─┬─  
+#     │                                ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Mods` in this scope
+#     ╭─[ src/key/encode.emel:73:6 ]
+#     │
+#  73 │     (Mods(ctrl: true, ..), _) -> ctrl_char(c, m, other_keys)
+#     │      ──┬─  
+#     │        ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Mods` in this scope
+#     ╭─[ src/key/encode.emel:75:6 ]
+#     │
+#  75 │     (Mods(alt: true, shift, ..), _) if is_ascii_graphic(c) ->
+#     │      ──┬─  
+#     │        ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `shift` in this scope
+#     ╭─[ src/key/encode.emel:76:10 ]
+#     │
+#  76 │       if shift { None } else { Some(b"\e" ++ c.to_utf8()) }
+#     │          ──┬──  
+#     │            ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `On` in this scope
+#     ╭─[ src/key/encode.emel:77:9 ]
+#     │
+#  77 │     (_, On(_)) -> Some(other_key(c, m))
+#     │         ─┬  
+#     │          ╰── 
+# ────╯
+#    = help: did you mean `One`?
+#
+# error[E0211]: cannot find constructor `Mods` in this scope
+#     ╭─[ src/key/encode.emel:78:6 ]
+#     │
+#  78 │     (Mods(shift: true, ..), Off) -> None
+#     │      ──┬─  
+#     │        ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Mods` in this scope
+#     ╭─[ src/key/encode.emel:79:6 ]
+#     │
+#  79 │     (Mods(alt: true, ..), Off) -> Some(b"\e" ++ c.to_utf8())
+#     │      ──┬─  
+#     │        ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `b` in this scope
+#     ╭─[ src/key/encode.emel:79:40 ]
+#     │
+#  79 │     (Mods(alt: true, ..), Off) -> Some(b"\e" ++ c.to_utf8())
+#     │                                        ┬  
+#     │                                        ╰── 
+# ────╯
+#    = help: did you mean `m`?
+#
+# error[E0211]: cannot find type `Mods` in this scope
+#     ╭─[ src/key/encode.emel:84:25 ]
+#     │
+#  84 │ fn ctrl_char(c: Int, m: Mods, other_keys: OtherKeys) -> Option[Bytes] {
+#     │                         ──┬─  
+#     │                           ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find type `Bytes` in this scope
+#     ╭─[ src/key/encode.emel:84:64 ]
+#     │
+#  84 │ fn ctrl_char(c: Int, m: Mods, other_keys: OtherKeys) -> Option[Bytes] {
+#     │                                                                ──┬──  
+#     │                                                                  ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `A` in this scope
+#     ╭─[ src/key/encode.emel:87:17 ]
+#     │
+#  87 │     Some(_) if 'A' <= c && c <= 'Z' -> if other_keys == On(One) { Some(other_key(c, m)) } else { None }
+#     │                 ┬  
+#     │                 ╰── 
+# ────╯
+#    = help: did you mean `m`?
+#
+# error[E0211]: cannot find constructor `On` in this scope
+#     ╭─[ src/key/encode.emel:93:30 ]
+#     │
+#  93 │     None -> if other_keys == On(One) { Some(other_key(c, m)) } else { None }
+#     │                              ─┬  
+#     │                               ╰── 
+# ────╯
+#    = help: did you mean `One`?
+#
+# error[E0211]: cannot find value `a` in this scope
+#      ╭─[ src/key/encode.emel:100:6 ]
+#      │
+#  100 │     'a'..='z' -> Some(c - 'a' + 1)
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#    = help: did you mean `c`?
+#
+# error[E0211]: cannot find value `A` in this scope
+#      ╭─[ src/key/encode.emel:101:6 ]
+#      │
+#  101 │     'A'..='Z' -> Some(c - 'A' + 1)
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#    = help: did you mean `c`?
+#
+# error[E0211]: cannot find type `Mods` in this scope
+#      ╭─[ src/key/encode.emel:112:13 ]
+#      │
+#  112 │ fn enter(m: Mods, modes: InputModes) -> Option[Bytes] {
+#      │             ──┬─  
+#      │               ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Bytes` in this scope
+#      ╭─[ src/key/encode.emel:112:48 ]
+#      │
+#  112 │ fn enter(m: Mods, modes: InputModes) -> Option[Bytes] {
+#      │                                                ──┬──  
+#      │                                                  ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `On` in this scope
+#      ╭─[ src/key/encode.emel:120:7 ]
+#      │
+#  120 │       On(_) -> Some(other_key(13, m))
+#      │       ─┬  
+#      │        ╰── 
+# ─────╯
+#    = help: did you mean `One`?
+#
+# error[E0211]: cannot find value `cr` in this scope
+#      ╭─[ src/key/encode.emel:123:24 ]
+#      │
+#  123 │     Some(alt_prefix(m, cr))
+#      │                        ─┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Mods` in this scope
+#      ╭─[ src/key/encode.emel:127:11 ]
+#      │
+#  127 │ fn esc(m: Mods, other_keys: OtherKeys) -> Option[Bytes] {
+#      │           ──┬─  
+#      │             ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Bytes` in this scope
+#      ╭─[ src/key/encode.emel:127:50 ]
+#      │
+#  127 │ fn esc(m: Mods, other_keys: OtherKeys) -> Option[Bytes] {
+#      │                                                  ──┬──  
+#      │                                                    ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `On` in this scope
+#      ╭─[ src/key/encode.emel:130:7 ]
+#      │
+#  130 │       On(Two) -> Some(other_key(27, m))
+#      │       ─┬  
+#      │        ╰── 
+# ─────╯
+#    = help: did you mean `One`?
+#
+# error[E0211]: cannot find constructor `Two` in this scope
+#      ╭─[ src/key/encode.emel:130:10 ]
+#      │
+#  130 │       On(Two) -> Some(other_key(27, m))
+#      │          ─┬─  
+#      │           ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `b` in this scope
+#      ╭─[ src/key/encode.emel:134:24 ]
+#      │
+#  134 │     Some(alt_prefix(m, b"\e"))
+#      │                        ┬  
+#      │                        ╰── 
+# ─────╯
+#    = help: did you mean `m`?
+#
+# error[E0211]: cannot find type `Mods` in this scope
+#      ╭─[ src/key/encode.emel:138:11 ]
+#      │
+#  138 │ fn tab(m: Mods, other_keys: OtherKeys) -> Option[Bytes] {
+#      │           ──┬─  
+#      │             ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Bytes` in this scope
+#      ╭─[ src/key/encode.emel:138:50 ]
+#      │
+#  138 │ fn tab(m: Mods, other_keys: OtherKeys) -> Option[Bytes] {
+#      │                                                  ──┬──  
+#      │                                                    ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find value `NO_MODS` in this scope
+#      ╭─[ src/key/encode.emel:140:9 ]
+#      │
+#  140 │     (_, NO_MODS) -> Some(b"\t")
+#      │         ───┬───  
+#      │            ╰───── 
+# ─────╯
+#
+# error[E0211]: cannot find value `b` in this scope
+#      ╭─[ src/key/encode.emel:140:26 ]
+#      │
+#  140 │     (_, NO_MODS) -> Some(b"\t")
+#      │                          ┬  
+#      │                          ╰── 
+# ─────╯
+#    = help: did you mean `m`?
+#
+# error[E0211]: cannot find constructor `On` in this scope
+#      ╭─[ src/key/encode.emel:141:6 ]
+#      │
+#  141 │     (On(_), _) -> Some(other_key(9, m))
+#      │      ─┬  
+#      │       ╰── 
+# ─────╯
+#    = help: did you mean `One`?
+#
+# error[E0211]: cannot find constructor `Mods` in this scope
+#      ╭─[ src/key/encode.emel:142:11 ]
+#      │
+#  142 │     (Off, Mods(ctrl: true, shift: true, ..)) -> Some(alt_prefix(m, b"\e[1;5Z"))
+#      │           ──┬─  
+#      │             ╰─── 
+# ─────╯
+#
+# error[E0220]: `true` is bound more than once in the same pattern
+#      ╭─[ src/key/encode.emel:142:35 ]
+#      │
+#  142 │     (Off, Mods(ctrl: true, shift: true, ..)) -> Some(alt_prefix(m, b"\e[1;5Z"))
+#      │                      ──┬─         ──┬─  
+#      │                        ╰──────────────── `true` is first bound here
+#      │                                     │   
+#      │                                     ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `b` in this scope
+#      ╭─[ src/key/encode.emel:142:68 ]
+#      │
+#  142 │     (Off, Mods(ctrl: true, shift: true, ..)) -> Some(alt_prefix(m, b"\e[1;5Z"))
+#      │                                                                    ┬  
+#      │                                                                    ╰── 
+# ─────╯
+#    = help: did you mean `m`?
+#
+# error[E0211]: cannot find constructor `Mods` in this scope
+#      ╭─[ src/key/encode.emel:143:11 ]
+#      │
+#  143 │     (Off, Mods(ctrl: true, ..)) -> Some(alt_prefix(m, b"\e[9;5u"))
+#      │           ──┬─  
+#      │             ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `b` in this scope
+#      ╭─[ src/key/encode.emel:143:55 ]
+#      │
+#  143 │     (Off, Mods(ctrl: true, ..)) -> Some(alt_prefix(m, b"\e[9;5u"))
+#      │                                                       ┬  
+#      │                                                       ╰── 
+# ─────╯
+#    = help: did you mean `m`?
+#
+# error[E0211]: cannot find constructor `Mods` in this scope
+#      ╭─[ src/key/encode.emel:144:11 ]
+#      │
+#  144 │     (Off, Mods(shift: true, ..)) -> Some(alt_prefix(m, b"\e[Z"))
+#      │           ──┬─  
+#      │             ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `b` in this scope
+#      ╭─[ src/key/encode.emel:144:56 ]
+#      │
+#  144 │     (Off, Mods(shift: true, ..)) -> Some(alt_prefix(m, b"\e[Z"))
+#      │                                                        ┬  
+#      │                                                        ╰── 
+# ─────╯
+#    = help: did you mean `m`?
+#
+# error[E0211]: cannot find value `b` in this scope
+#      ╭─[ src/key/encode.emel:145:36 ]
+#      │
+#  145 │     (Off, _) -> Some(alt_prefix(m, b"\t"))
+#      │                                    ┬  
+#      │                                    ╰── 
+# ─────╯
+#    = help: did you mean `m`?
+#
+# error[E0211]: cannot find type `Mods` in this scope
+#      ╭─[ src/key/encode.emel:149:17 ]
+#      │
+#  149 │ fn backspace(m: Mods, other_keys: OtherKeys) -> Option[Bytes] {
+#      │                 ──┬─  
+#      │                   ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Bytes` in this scope
+#      ╭─[ src/key/encode.emel:149:56 ]
+#      │
+#  149 │ fn backspace(m: Mods, other_keys: OtherKeys) -> Option[Bytes] {
+#      │                                                        ──┬──  
+#      │                                                          ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Mods` in this scope
+#      ╭─[ src/key/encode.emel:151:6 ]
+#      │
+#  151 │     (Mods(ctrl: true, ..), On(Two)) -> Some(other_key(8, m))
+#      │      ──┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `On` in this scope
+#      ╭─[ src/key/encode.emel:151:28 ]
+#      │
+#  151 │     (Mods(ctrl: true, ..), On(Two)) -> Some(other_key(8, m))
+#      │                            ─┬  
+#      │                             ╰── 
+# ─────╯
+#    = help: did you mean `One`?
+#
+# error[E0211]: cannot find constructor `Two` in this scope
+#      ╭─[ src/key/encode.emel:151:31 ]
+#      │
+#  151 │     (Mods(ctrl: true, ..), On(Two)) -> Some(other_key(8, m))
+#      │                               ─┬─  
+#      │                                ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Mods` in this scope
+#      ╭─[ src/key/encode.emel:152:6 ]
+#      │
+#  152 │     (Mods(shift: true, ..), On(Two)) -> Some(other_key(127, m))
+#      │      ──┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `On` in this scope
+#      ╭─[ src/key/encode.emel:152:29 ]
+#      │
+#  152 │     (Mods(shift: true, ..), On(Two)) -> Some(other_key(127, m))
+#      │                             ─┬  
+#      │                              ╰── 
+# ─────╯
+#    = help: did you mean `One`?
+#
+# error[E0211]: cannot find constructor `Two` in this scope
+#      ╭─[ src/key/encode.emel:152:32 ]
+#      │
+#  152 │     (Mods(shift: true, ..), On(Two)) -> Some(other_key(127, m))
+#      │                                ─┬─  
+#      │                                 ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Mods` in this scope
+#      ╭─[ src/key/encode.emel:153:6 ]
+#      │
+#  153 │     (Mods(shift: true, ..), _) -> None
+#      │      ──┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Mods` in this scope
+#      ╭─[ src/key/encode.emel:154:6 ]
+#      │
+#  154 │     (Mods(ctrl: true, ..), _) -> Some(alt_prefix(m, [0x08]))
+#      │      ──┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Mods` in this scope
+#      ╭─[ src/key/encode.emel:159:29 ]
+#      │
+#  159 │ fn cursor(final: String, m: Mods, cursor_keys: CursorKeys) -> Bytes {
+#      │                             ──┬─  
+#      │                               ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Bytes` in this scope
+#      ╭─[ src/key/encode.emel:159:63 ]
+#      │
+#  159 │ fn cursor(final: String, m: Mods, cursor_keys: CursorKeys) -> Bytes {
+#      │                                                               ──┬──  
+#      │                                                                 ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find value `NO_MODS` in this scope
+#      ╭─[ src/key/encode.emel:161:6 ]
+#      │
+#  161 │     (NO_MODS, Normal) -> "\e[{final}".to_bytes()
+#      │      ───┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0211]: cannot find value `NO_MODS` in this scope
+#      ╭─[ src/key/encode.emel:162:6 ]
+#      │
+#  162 │     (NO_MODS, Application) -> "\eO{final}".to_bytes()
+#      │      ───┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Application` in this scope
+#      ╭─[ src/key/encode.emel:162:15 ]
+#      │
+#  162 │     (NO_MODS, Application) -> "\eO{final}".to_bytes()
+#      │               ─────┬─────  
+#      │                    ╰─────── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Mods` in this scope
+#      ╭─[ src/key/encode.emel:167:21 ]
+#      │
+#  167 │ fn tilde(n: Int, m: Mods) -> Bytes {
+#      │                     ──┬─  
+#      │                       ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Bytes` in this scope
+#      ╭─[ src/key/encode.emel:167:30 ]
+#      │
+#  167 │ fn tilde(n: Int, m: Mods) -> Bytes {
+#      │                              ──┬──  
+#      │                                ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find value `NO_MODS` in this scope
+#      ╭─[ src/key/encode.emel:168:11 ]
+#      │
+#  168 │   if m == NO_MODS { "\e[{n}~".to_bytes() } else { "\e[{n};{modifier_number(m)}~".to_bytes() }
+#      │           ───┬───  
+#      │              ╰───── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Mods` in this scope
+#      ╭─[ src/key/encode.emel:171:24 ]
+#      │
+#  171 │ fn function(n: Int, m: Mods) -> Bytes {
+#      │                        ──┬─  
+#      │                          ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Bytes` in this scope
+#      ╭─[ src/key/encode.emel:171:33 ]
+#      │
+#  171 │ fn function(n: Int, m: Mods) -> Bytes {
+#      │                                 ──┬──  
+#      │                                   ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Mods` in this scope
+#      ╭─[ src/key/encode.emel:182:25 ]
+#      │
+#  182 │ fn other_key(c: Int, m: Mods) -> Bytes {
+#      │                         ──┬─  
+#      │                           ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Bytes` in this scope
+#      ╭─[ src/key/encode.emel:182:34 ]
+#      │
+#  182 │ fn other_key(c: Int, m: Mods) -> Bytes {
+#      │                                  ──┬──  
+#      │                                    ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Mods` in this scope
+#      ╭─[ src/key/encode.emel:186:18 ]
+#      │
+#  186 │ fn alt_prefix(m: Mods, b: Bytes) -> Bytes {
+#      │                  ──┬─  
+#      │                    ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Bytes` in this scope
+#      ╭─[ src/key/encode.emel:186:27 ]
+#      │
+#  186 │ fn alt_prefix(m: Mods, b: Bytes) -> Bytes {
+#      │                           ──┬──  
+#      │                             ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Bytes` in this scope
+#      ╭─[ src/key/encode.emel:186:37 ]
+#      │
+#  186 │ fn alt_prefix(m: Mods, b: Bytes) -> Bytes {
+#      │                                     ──┬──  
+#      │                                       ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Mods` in this scope
+#      ╭─[ src/key/encode.emel:191:23 ]
+#      │
+#  191 │ fn modifier_number(m: Mods) -> Int {
+#      │                       ──┬─  
+#      │                         ╰─── 
+# ─────╯
+#
+# error[E0312]: no field `code` for type `Key`
+#     ╭─[ src/key/encode.emel:49:13 ]
+#     │
+#  49 │   match key.code {
+#     │             ──┬─  
+#     │               ╰─── 
+# ────╯
+#    = help: call it as `key.code(...)`
+#
+# error[E0313]: type `Int` has no field or function `to_utf8`
+#     ╭─[ src/key/encode.emel:71:28 ]
+#     │
+#  71 │     (NO_MODS, _) -> Some(c.to_utf8())
+#     │                            ───┬───  
+#     │                               ╰───── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/key/encode.emel:72:5 ]
+#     │
+#  72 │     (Mods(ctrl: true, ..), On(Two)) -> Some(other_key(c, m))
+#     │     ───────────────┬───────────────  
+#     │                    ╰───────────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/key/encode.emel:73:5 ]
+#     │
+#  73 │     (Mods(ctrl: true, ..), _) -> ctrl_char(c, m, other_keys)
+#     │     ────────────┬────────────  
+#     │                 ╰────────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/key/encode.emel:75:5 ]
+#     │
+#  75 │     (Mods(alt: true, shift, ..), _) if is_ascii_graphic(c) ->
+#     │     ───────────────┬───────────────  
+#     │                    ╰───────────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/key/encode.emel:76:7 ]
+#     │
+#  76 │       if shift { None } else { Some(b"\e" ++ c.to_utf8()) }
+#     │       ────────┬────────  
+#     │               ╰────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/key/encode.emel:77:5 ]
+#     │
+#  77 │     (_, On(_)) -> Some(other_key(c, m))
+#     │     ─────┬────  
+#     │          ╰────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/key/encode.emel:78:5 ]
+#     │
+#  78 │     (Mods(shift: true, ..), Off) -> None
+#     │     ──────────────┬─────────────  
+#     │                   ╰─────────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/key/encode.emel:79:5 ]
+#     │
+#  79 │     (Mods(alt: true, ..), Off) -> Some(b"\e" ++ c.to_utf8())
+#     │     ─────────────┬────────────  
+#     │                  ╰────────────── 
+# ────╯
+#
+# error[E0326]: type `OtherKeys` does not implement `Eq`
+#     ╭─[ src/key/encode.emel:93:16 ]
+#     │
+#  93 │     None -> if other_keys == On(One) { Some(other_key(c, m)) } else { None }
+#     │                ──────────┬──────────  
+#     │                          ╰──────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:100:5 ]
+#      │
+#  100 │     'a'..='z' -> Some(c - 'a' + 1)
+#      │     ─┬  
+#      │      ╰── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:101:5 ]
+#      │
+#  101 │     'A'..='Z' -> Some(c - 'A' + 1)
+#      │     ─┬  
+#      │      ╰── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:102:5 ]
+#      │
+#  102 │     '[' | '3' | '{' -> Some(0x1b)
+#      │     ─┬─  
+#      │      ╰─── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `Option[Int]`, found `List[?0]`
+#      ╭─[ src/key/encode.emel:102:6 ]
+#      │
+#  102 │     '[' | '3' | '{' -> Some(0x1b)
+#      │      ─┬  
+#      │       ╰── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:105:5 ]
+#      │
+#  105 │     '^' | '6' | '~' -> Some(0x1e)
+#      │     ─┬  
+#      │      ╰── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:106:5 ]
+#      │
+#  106 │     '_' | '7' | '/' -> Some(0x1f)
+#      │     ─┬  
+#      │      ╰── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:107:5 ]
+#      │
+#  107 │     '8' | '?' -> Some(0x7f)
+#      │     ─┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `Option[Int]`, found `Int`
+#      ╭─[ src/key/encode.emel:107:6 ]
+#      │
+#  107 │     '8' | '?' -> Some(0x7f)
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:108:5 ]
+#      │
+#  108 │     _ -> None
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:120:7 ]
+#      │
+#  120 │       On(_) -> Some(other_key(13, m))
+#      │       ──┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:131:7 ]
+#      │
+#  131 │       _ -> None
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:141:5 ]
+#      │
+#  141 │     (On(_), _) -> Some(other_key(9, m))
+#      │     ─────┬────  
+#      │          ╰────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:142:5 ]
+#      │
+#  142 │     (Off, Mods(ctrl: true, shift: true, ..)) -> Some(alt_prefix(m, b"\e[1;5Z"))
+#      │     ────────────────────┬───────────────────  
+#      │                         ╰───────────────────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:143:5 ]
+#      │
+#  143 │     (Off, Mods(ctrl: true, ..)) -> Some(alt_prefix(m, b"\e[9;5u"))
+#      │     ─────────────┬─────────────  
+#      │                  ╰─────────────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:144:5 ]
+#      │
+#  144 │     (Off, Mods(shift: true, ..)) -> Some(alt_prefix(m, b"\e[Z"))
+#      │     ──────────────┬─────────────  
+#      │                   ╰─────────────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:145:5 ]
+#      │
+#  145 │     (Off, _) -> Some(alt_prefix(m, b"\t"))
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:152:5 ]
+#      │
+#  152 │     (Mods(shift: true, ..), On(Two)) -> Some(other_key(127, m))
+#      │     ────────────────┬───────────────  
+#      │                     ╰───────────────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:153:5 ]
+#      │
+#  153 │     (Mods(shift: true, ..), _) -> None
+#      │     ─────────────┬────────────  
+#      │                  ╰────────────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:154:5 ]
+#      │
+#  154 │     (Mods(ctrl: true, ..), _) -> Some(alt_prefix(m, [0x08]))
+#      │     ────────────┬────────────  
+#      │                 ╰────────────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:155:5 ]
+#      │
+#  155 │     _ -> Some(alt_prefix(m, [0x7f]))
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0313]: type `String` has no field or function `to_bytes`
+#      ╭─[ src/key/encode.emel:161:39 ]
+#      │
+#  161 │     (NO_MODS, Normal) -> "\e[{final}".to_bytes()
+#      │                                       ────┬───  
+#      │                                           ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:162:5 ]
+#      │
+#  162 │     (NO_MODS, Application) -> "\eO{final}".to_bytes()
+#      │     ───────────┬──────────  
+#      │                ╰──────────── 
+# ─────╯
+#
+# error[E0313]: type `String` has no field or function `to_bytes`
+#      ╭─[ src/key/encode.emel:162:44 ]
+#      │
+#  162 │     (NO_MODS, Application) -> "\eO{final}".to_bytes()
+#      │                                            ────┬───  
+#      │                                                ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/encode.emel:163:5 ]
+#      │
+#  163 │     _ -> "\e[1;{modifier_number(m)}{final}".to_bytes()
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0313]: type `String` has no field or function `to_bytes`
+#      ╭─[ src/key/encode.emel:163:45 ]
+#      │
+#  163 │     _ -> "\e[1;{modifier_number(m)}{final}".to_bytes()
+#      │                                             ────┬───  
+#      │                                                 ╰───── 
+# ─────╯
+#
+# error[E0313]: type `String` has no field or function `to_bytes`
+#      ╭─[ src/key/encode.emel:168:31 ]
+#      │
+#  168 │   if m == NO_MODS { "\e[{n}~".to_bytes() } else { "\e[{n};{modifier_number(m)}~".to_bytes() }
+#      │                               ────┬───  
+#      │                                   ╰───── 
+# ─────╯
+#
+# error[E0313]: type `String` has no field or function `to_bytes`
+#      ╭─[ src/key/encode.emel:168:82 ]
+#      │
+#  168 │   if m == NO_MODS { "\e[{n}~".to_bytes() } else { "\e[{n};{modifier_number(m)}~".to_bytes() }
+#      │                                                                                  ────┬───  
+#      │                                                                                      ╰───── 
+# ─────╯
+#
+# error[E0305]: wrong number of arguments: `tilde` takes 2, found 1
+#      ╭─[ src/key/encode.emel:177:10 ]
+#      │
+#  177 │     _ -> tilde([15, 17, 18, 19, 20, 21, 23, 24][n - 5], m)
+#      │          ───────────────────┬──────────────────  
+#      │                             ╰──────────────────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `Int`, found `List[Int]`
+#      ╭─[ src/key/encode.emel:177:16 ]
+#      │
+#  177 │     _ -> tilde([15, 17, 18, 19, 20, 21, 23, 24][n - 5], m)
+#      │                ────────────────┬───────────────  
+#      │                                ╰───────────────── 
+# ─────╯
+#
+# error[E0313]: type `String` has no field or function `to_bytes`
+#      ╭─[ src/key/encode.emel:183:37 ]
+#      │
+#  183 │   "\e[27;{modifier_number(m)};{c}~".to_bytes()
+#      │                                     ────┬───  
+#      │                                         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `Bool`, found `()`
+#      ╭─[ src/key/encode.emel:195:37 ]
+#      │
+#  195 │ ╭─▶ fn is_ascii_graphic(c: Int) -> Bool {
+#      ┆ ┆   
+#  197 │ ├─▶ }
+#      │ │       
+#      │ ╰─────── 
+# ─────╯
+#
+# 295 errors, 28 warnings
+# --- end wish check ---

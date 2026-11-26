@@ -1,0 +1,182 @@
+# The keys and modes of the golden table (`key_golden.emel`), and what encode does with a key, for
+# the tests of decode and encode.
+
+import Key.{
+  Key,
+  KeyCode,
+  Mods,
+  Char,
+  Enter,
+  Esc,
+  Tab,
+  Backspace,
+  Delete,
+  Insert,
+  Up,
+  Down,
+  Left,
+  Right,
+  Home,
+  End,
+  PageUp,
+  PageDown,
+  Function,
+}
+import Key.Encode.{
+  InputModes,
+  OtherKeys,
+  Unencodable,
+  Reason,
+  Normal,
+  Application,
+  Cr,
+  CrLf,
+  Off,
+  On,
+  One,
+  Two,
+}
+import Key.Notation.{NotationError}
+
+## The key of a row of `KeyGolden.ROWS`, made by `Key.key` from what tools/termwiz-golden gave
+## termwiz: `name` is one character or the name of a special key, and `bits` the xterm modifier
+## bits (1 Shift, 2 Alt, 4 Ctrl). A defect if no key of the table has the name `name`.
+pub fn row_key(name: String, bits: Int) -> Key {
+  mods = Mods(
+    ctrl: bits.bit_and(4) != 0,
+    alt: bits.bit_and(2) != 0,
+    shift: bits.bit_and(1) != 0,
+    super: False,
+  )
+  code(name).and_then(|c| Key.key(c, mods))
+    |> expect("no key of the golden table is named #{inspect(name)}")
+}
+
+# What the key named `name` makes. `None` if no key of the table has that name.
+fn code(name: String) -> Option[KeyCode] {
+  name match {
+    "Enter"     -> Some(Enter)
+    "Esc"       -> Some(Esc)
+    "Tab"       -> Some(Tab)
+    "Backspace" -> Some(Backspace)
+    "Delete"    -> Some(Delete)
+    "Insert"    -> Some(Insert)
+    "Up"        -> Some(Up)
+    "Down"      -> Some(Down)
+    "Left"      -> Some(Left)
+    "Right"     -> Some(Right)
+    "Home"      -> Some(Home)
+    "End"       -> Some(End)
+    "PageUp"    -> Some(PageUp)
+    "PageDown"  -> Some(PageDown)
+    # FRICTION(016): there is no pattern that splits off the `F` of `F12`, so each name has an arm.
+    "F1"        -> function_key(1)
+    "F2"        -> function_key(2)
+    "F3"        -> function_key(3)
+    "F4"        -> function_key(4)
+    "F5"        -> function_key(5)
+    "F6"        -> function_key(6)
+    "F7"        -> function_key(7)
+    "F8"        -> function_key(8)
+    "F9"        -> function_key(9)
+    "F10"       -> function_key(10)
+    "F11"       -> function_key(11)
+    "F12"       -> function_key(12)
+    _ -> name.code_points() match {
+      [c] -> Some(Char(c))
+      _   -> None
+    }
+  }
+}
+
+fn function_key(n: Int) -> Option[KeyCode] {
+  Key.f_key(n).map(|f| Function(f))
+}
+
+## The modes of the mode index `index` of a row of `KeyGolden.ROWS`, in the order of
+## tools/termwiz-golden: 6 × DECCKM + 3 × LNM + modifyOtherKeys (0 off, 1 level 1, 2 level 2).
+pub fn row_modes(index: Int) -> InputModes {
+  cursor_keys = if index / 6 == 0 { Normal } else { Application }
+  newline = if index / 3 % 2 == 0 { Cr } else { CrLf }
+  other_keys = index % 3 match {
+    0 -> Off
+    1 -> On(One)
+    _ -> On(Two)
+  }
+  InputModes(cursor_keys:, newline:, other_keys:)
+}
+
+## The representative of `k` (spec §6) when modifyOtherKeys is `other_keys`: the key that decode
+## reads from what the terminal sends for `k`. In level 2, Ctrl with a character is sent as
+## `CSI 27;m;c~`, so every key is its own representative. Otherwise a key that sends the same
+## control character as another key has that key as its representative, and Alt stays on it.
+pub fn representative(k: Key, other_keys: OtherKeys) -> Key {
+  other_keys match {
+    On(Two) -> k
+    _ -> {
+      mods = k.mods()
+      without_alt = Mods(alt: False, ..mods)
+      SAME_CONTROL_CHARACTER.find(
+        |(member, _)| member.code() == k.code() && member.mods() == without_alt,
+      ) match {
+        Some((_, rep)) -> Key.key(rep.code(), Mods(alt: mods.alt, ..rep.mods()))
+          |> expect("the code of a representative is a Char of a scalar value or no Char")
+        None -> k
+      }
+    }
+  }
+}
+
+## What `encode` does with a key.
+pub enum Outcome {
+  ## It sends the bytes written in hexadecimal.
+  Sent(String)
+  ## It cannot send the key, for the reason.
+  Refused(Reason)
+} derive Eq, Show
+
+## What `encode` does with `k` in `modes`. The Unencodable holds `k`.
+pub fn outcome(k: Key, modes: InputModes) -> Outcome {
+  Sent(Encode.encode(k, modes).to_hex()) escape {
+    Unencodable(key:, reason:) -> {
+      assert key == k
+      Refused(reason)
+    }
+  }
+}
+
+# The keys that send the same control character as another key in modifyOtherKeys off and level
+# 1, each with that key, their representative (the table of spec §6). In each string the
+# representative comes first.
+const SAME_CONTROL_CHARACTER: List[(Key, Key)] = [
+  "<C-Space><C-@><C-`><C-2>",
+  "<BS><C-h><C-BS><C-8><C-?>",
+  "<Tab><C-i>",
+  "<CR><C-m>",
+  "<Esc><C-[><C-3><C-{>",
+  "<C-\\><C-4><C-|>",
+  "<C-]><C-5><C-}>",
+  "<C-^><C-6><C-~>",
+  "<C-_><C-7><C-/>",
+].flat_map(|group| {
+  parsed(group) match {
+    [rep, ..members] -> members.map(|member| (member, rep))
+    []               -> panic("parse reads no key from #{inspect(group)}")
+  }
+})
+
+# The keys that `parse` reads from `notation`, a string of the table above. A defect if parse
+# rejects it.
+fn parsed(notation: String) -> List[Key] {
+  Notation.parse(notation) escape {
+    NotationError(message:, ..) -> panic("parse rejects #{inspect(notation)}: #{message}")
+  }
+}
+
+# FRICTION(040): Option has no `expect`, so a None that cannot happen is a match with a panic.
+fn expect[A](opt: Option[A], why: String) -> A {
+  opt match {
+    Some(a) -> a
+    None    -> panic("None, but #{why}")
+  }
+}

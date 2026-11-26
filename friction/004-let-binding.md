@@ -11,6 +11,11 @@
   let start = Int.clamp(from, 0, len)
   let stop = Int.clamp(to, start, len)
   ```
+  key codec の型の wish（`wish/key.emel:35`、サブプロジェクト 2 の計画の Task 2）でも、組を束ねる `let (rep, rep_mods) = control_representative(c)` を書いた
+  key codec の表記の wish（`wish/notation.emel`、サブプロジェクト 2 の計画の Task 3）でも、12 行に `let` を書いた（`:43-44`、`:47`、`:59`、`:74`、`:122-123`、`:132`、`:142-145`）
+  key codec の decode の wish（`wish/decode.emel`、サブプロジェクト 2 の計画の Task 4）でも、8 行に `let` を書いた（`:31`、`:56`、`:83-85`、`:96-97`、`:119`）
+  key codec の golden の補助の wish（`wish/golden.emel`、サブプロジェクト 2 の計画の Task 5）でも、2 行に `let` を書いた（`:8`、`:9`）
+  key codec の encode の wish（`wish/encode.emel`、サブプロジェクト 2 の計画の Task 6）でも、4 行に `let` を書いた（`:32`、`:45`、`:113`、`:174`）
 - 診断:
   wish check（emela 0.28.2、`wish/text.emel:52-155`）。`let` の行ごとに 2 つ出る:
   - `let` に ``error[E0118]: expected expression``
@@ -25,7 +30,18 @@
   regex の vm と公開 API の wish（`wish/vm.emel`、`wish/lib.emel`、計画の Task 6）でも `let` を書いた。vm は 9 行（`:75`、`:79`、`:105-108`、`:131`、`:155`、`:161`）で、診断が届いた 5 行に E0118 と E0122 が 1 つずつ（10）。残りの 4 行（`:105-108`）は `=>` の腕（E0110）の中で読まれなかった。lib は 2 行（`:24`、`:38`）に 4 つ。束縛されなかった名前の E0211 が 4 続いた（`next`、`groups`、`ast`、`input`）
 
   regex の差分テストの生成器の wish（`wish/pattern_gen.emel`、計画の Task 8）でも、10 行に `let` を書いた（`:69`、`:104`、`:108-109`、`:113-114`、`:118`、`:122`、`:126` と、`wish/differential.emel:29`）。届いた行ごとに E0118 と E0122 が 1 つずつ。束縛されなかった名前の E0211 が続いた（`sub` が 6、`atom`、`a`）。`:114` の行では、or-pattern（015）の診断が `let` の 2 つに埋もれた（字句の誤りの `;` の E0105 だけは出た、016）
-- 回避策: `let` を消して `start = Int.max(from, 0)` と書いた（`text/src/lib.emel` の `slice`）。regex の `regex/src/syntax.emel`、`regex/src/class.emel`、`regex/src/vm.emel`、`regex/src/lib.emel`、テストの `regex/test/pattern_gen.emel` も同じく `let` を消した。正しい構文に直しただけなので、コードに印は付けない
+
+  key の wish（Task 2）では、`let` の行は `=` で書いた関数の本体（020）の中にあり、本体ごと読まれなかった（診断は 0）
+
+  表記の wish（Task 3）では、届いた 9 行（`:43-44`、`:122-123`、`:132`、`:142-145`）に E0118 と E0122 が 1 つずつ（18）。束縛されなかった名前の E0211 が 6 続いた（`shape`、`mods` が 2、`m` が 3）。残りの 3 行（`:47`、`:59`、`:74`）は前置の match（E0142）の腕の中にあり、届かなかった
+
+  decode の wish（Task 4）では、届いた 7 行に E0118 と E0122 が 1 つずつ（14）。束縛されなかった名前の E0211 が 7 続いた（`bits` が 3、`d`、`more`、`code`、`mods`）。残りの 1 行（`:56`）は前置の match（E0142）の腕の中にあり、届かなかった
+
+  golden の補助の wish（Task 5）では、2 行に E0118 と E0122 が 1 つずつ（4）。束縛されなかった名前の E0211 が 2 続いた（`code`、`mods`）。`:9` の `let` の右辺の前置の match の腕（`:10-25`）は読まれず、E0142 も、腕の中の 016、040、047 の誤りの診断も出なかった。11 の診断のうち 6 がこの 1 つの誤りから出ている
+
+  encode の wish（Task 6）では、届いた 3 行（`:32`、`:45`、`:113`）に E0118 と E0122 が 1 つずつ（6）。束縛されなかった名前の E0211 が 19 続いた（`m` が 17、`higher`、`cr`）。`m` は修飾で、キーの種類ごとの規則のどの腕でも使うので、1 行の `let m = key.mods` が 19 の診断になった。残りの 1 行（`:174`）は、範囲パターン（038）で崩れた腕の中にあり、届かなかった
+- 回避策: `let` を消して `start = Int.max(from, 0)` と書いた（`text/src/lib.emel` の `slice`）。regex の `regex/src/syntax.emel`、`regex/src/class.emel`、`regex/src/vm.emel`、`regex/src/lib.emel`、テストの `regex/test/pattern_gen.emel`、key の `src/key.emel`（`(rep_code, rep_mods) = representative(c)`）、表記の `src/key/notation.emel`、decode の `src/key/decode.emel`、golden の補助の `test/golden.emel` も同じく `let` を消した。正しい構文に直しただけなので、コードに印は付けない
+  encode（Task 6、`src/key/encode.emel`）も同じく `let` を消した（`higher = ...`、`m = key.mods()`、`cr = ...`。`:174` の `final` は、F1〜F4 を腕に分けたので（009）束縛が要らなくなった）
 - コスト:
   コードのコストは無い。直すには spec を引く必要があった。診断から分かるのは `let` が式として読めないことだけで、wish-first（AGENTS.md 規則 1）では spec を読む前に wish を書くので、そのときの手がかりは診断しかない。後に続く 4 つの E0211 は束縛の失敗の後追いで、wish の本当の診断（`String.from_scalars` の E0212、003）を埋もれさせる
 - spec:

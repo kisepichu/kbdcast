@@ -1,0 +1,2738 @@
+# wish-target: src/key/decode.emel
+
+## `i` イベントの bytes を、キーと貼り付けと読めない bytes の列に戻す。
+## 1 つのイベントの中だけを読み、イベントの間で状態を持たない。
+
+import Key.{Key, KeyCode, Mods, NO_MODS, key, f_key}
+import Key.KeyCode.*
+
+pub enum Decoded {
+  Key(Key)
+  | Paste(String)
+  | Unknown(Bytes)
+} derive (Eq, Show)
+
+pub fn decode(b: Bytes) -> List[Decoded] {
+  read(b.to_list())
+}
+
+const PASTE_START: List[Int] = [0x1b, '[', '2', '0', '0', '~']
+const PASTE_END: List[Int] = [0x1b, '[', '2', '0', '1', '~']
+
+fn read(bs: List[Int]) -> List[Decoded] {
+  match bs {
+    [] -> []
+    # ESC の後に 1 つのキーが続けば、そのキーに Alt を付ける
+    [0x1b, ..rest] if rest != [] && !starts_sequence(rest) -> match one(rest, alt: true) {
+      (Key(k), more) -> [Key(k), ..read(more)]
+      (d, more) -> [Key(key(Esc, NO_MODS)), d, ..read(more)]
+    }
+    _ -> {
+      let (d, more) = one(bs, alt: false)
+      [d, ..read(more)]
+    }
+  }
+}
+
+# ESC の直後が CSI か SS3 の列を始めるか
+fn starts_sequence(rest: List[Int]) -> Bool {
+  match rest {
+    ['[', _, ..] -> true
+    ['O', c, ..] -> is_ss3_final(c)
+    _ -> false
+  }
+}
+
+fn one(bs: List[Int], alt: Bool) -> (Decoded, List[Int]) {
+  match bs {
+    [..PASTE_START, ..rest] -> paste(rest)
+    [0x1b, '[', ..rest] -> csi(rest, alt)
+    [0x1b, 'O', c, ..rest] if is_ss3_final(c) -> (built(ss3(c), NO_MODS, alt), rest)
+    [0x0d, 0x0a, ..rest] -> (built(Enter, NO_MODS, alt), rest)
+    _ -> match bs.decode_utf8_char() {
+      # 制御文字は Key.key が §6 の代表にする
+      Some((c, rest)) -> (built(Char(c), NO_MODS, alt), rest)
+      None -> {
+        let (bad, rest) = bs.span(fn(_, tail) { tail.decode_utf8_char() == None })
+        (Unknown(Bytes.from_list(bad)), rest)
+      }
+    }
+  }
+}
+
+# 作る code は scalar value の Char か特殊キーなので、key は失敗しない
+fn built(code: KeyCode, mods: Mods, alt: Bool) -> Decoded {
+  Key(key(code, mods with { alt: mods.alt || alt }).expect("scalar value"))
+}
+
+fn paste(rest: List[Int]) -> (Decoded, List[Int]) {
+  match rest.split_once(PASTE_END) {
+    Some((text, more)) -> match Bytes.from_list(text).decode_utf8() {
+      Ok(s) -> (Paste(s), more)
+      Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ text ++ PASTE_END)), more)
+    }
+    None -> match Bytes.from_list(rest).decode_utf8() {
+      Ok(s) -> (Paste(s), [])
+      Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ rest)), [])
+    }
+  }
+}
+
+# ECMA-48 の形: 引数（0x30〜0x3f）、中間の文字（0x20〜0x2f）、終わりの文字（0x40〜0x7e）
+fn csi(rest: List[Int], alt: Bool) -> (Decoded, List[Int]) {
+  let (params, after_params) = rest.span(fn(b) { b in 0x30..=0x3f })
+  let (inter, after_inter) = after_params.span(fn(b) { b in 0x20..=0x2f })
+  let seen = [0x1b, '[', ..params, ..inter]
+  match after_inter {
+    [f, ..more] if f in 0x40..=0x7e -> match csi_key(params, inter, f, alt) {
+      Some(k) -> (Key(k), more)
+      None -> (Unknown(Bytes.from_list(seen ++ [f])), more)
+    }
+    _ -> (Unknown(Bytes.from_list(seen)), after_inter)
+  }
+}
+
+fn csi_key(params: List[Int], inter: List[Int], f: Int, alt: Bool) -> Option[Key] {
+  let ns = fields(params)?
+  let (code, mods) = match (inter, ns, f) {
+    ([], [], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), NO_MODS)
+    ([], [1, m], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), modifiers(m)?)
+    ([], [1, m], 'P' | 'Q' | 'R' | 'S') -> (Function(f_key(f - 'P' + 1)?), modifiers(m)?)
+    ([], [], 'Z') -> (Tab, NO_MODS with { shift: true })
+    ([], [1, m], 'Z') -> (Tab, modifiers(m)? with { shift: true })
+    ([], [27, m, c], '~') -> (other(c), modifiers(m)?)
+    ([], [n], '~') -> (tilde(n)?, NO_MODS)
+    ([], [n, m], '~') -> (tilde(n)?, modifiers(m)?)
+    ([], [c, m], 'u') -> (other(c), modifiers(m)?)
+    _ -> return None
+  }
+  key(code, mods with { alt: mods.alt || alt })
+}
+
+# `1;5` を [1, 5] に。数字と `;` のほかの文字（`?`、`:` など）があれば読めない
+fn fields(params: List[Int]) -> Option[List[Int]] {
+  params.split(';').map(fn(ds) { Int.parse_digits(ds) }).all()
+}
+
+# 修飾の番号は 1 + Shift(1) + Alt(2) + Ctrl(4)
+fn modifiers(m: Int) -> Option[Mods] {
+  let bits = m - 1
+  if bits < 0 || bits > 7 {
+    None
+  } else {
+    Some(Mods(ctrl: bits & 4 != 0, alt: bits & 2 != 0, shift: bits & 1 != 0, super: false))
+  }
+}
+
+fn cursor(f: Int) -> KeyCode {
+  match f {
+    'A' -> Up
+    'B' -> Down
+    'C' -> Right
+    'D' -> Left
+    'H' -> Home
+    'F' -> End
+  }
+}
+
+fn is_ss3_final(c: Int) -> Bool {
+  c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+}
+
+fn ss3(c: Int) -> KeyCode {
+  match c {
+    'P' | 'Q' | 'R' | 'S' -> Function(f_key(c - 'P' + 1).unwrap())
+    _ -> cursor(c)
+  }
+}
+
+fn tilde(n: Int) -> Option[KeyCode] {
+  match n {
+    2 -> Some(Insert)
+    3 -> Some(Delete)
+    5 -> Some(PageUp)
+    6 -> Some(PageDown)
+    15 -> Some(Function(f_key(5)?))
+    17..=21 -> Some(Function(f_key(n - 11)?))
+    23 | 24 -> Some(Function(f_key(n - 12)?))
+    _ -> None
+  }
+}
+
+# modifyOtherKeys と `c;m u` の c
+fn other(c: Int) -> KeyCode {
+  match c {
+    9 -> Tab
+    13 -> Enter
+    27 -> Esc
+    127 | 8 -> Backspace
+    _ -> Char(c)
+  }
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:19:39 ]
+#     │
+#  19 │ const PASTE_START: List[Int] = [0x1b, '[', '2', '0', '0', '~']
+#     │                                       ┬  
+#     │                                       ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:19:41 ]
+#     │
+#  19 │ const PASTE_START: List[Int] = [0x1b, '[', '2', '0', '0', '~']
+#     │                                         ┬  
+#     │                                         ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:19:44 ]
+#     │
+#  19 │ const PASTE_START: List[Int] = [0x1b, '[', '2', '0', '0', '~']
+#     │                                            ┬  
+#     │                                            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:19:46 ]
+#     │
+#  19 │ const PASTE_START: List[Int] = [0x1b, '[', '2', '0', '0', '~']
+#     │                                              ┬  
+#     │                                              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:19:49 ]
+#     │
+#  19 │ const PASTE_START: List[Int] = [0x1b, '[', '2', '0', '0', '~']
+#     │                                                 ┬  
+#     │                                                 ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:19:51 ]
+#     │
+#  19 │ const PASTE_START: List[Int] = [0x1b, '[', '2', '0', '0', '~']
+#     │                                                   ┬  
+#     │                                                   ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:19:54 ]
+#     │
+#  19 │ const PASTE_START: List[Int] = [0x1b, '[', '2', '0', '0', '~']
+#     │                                                      ┬  
+#     │                                                      ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:19:56 ]
+#     │
+#  19 │ const PASTE_START: List[Int] = [0x1b, '[', '2', '0', '0', '~']
+#     │                                                        ┬  
+#     │                                                        ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:19:59 ]
+#     │
+#  19 │ const PASTE_START: List[Int] = [0x1b, '[', '2', '0', '0', '~']
+#     │                                                           ┬  
+#     │                                                           ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `~`
+#     ╭─[ src/key/decode.emel:19:60 ]
+#     │
+#  19 │ const PASTE_START: List[Int] = [0x1b, '[', '2', '0', '0', '~']
+#     │                                                            ┬  
+#     │                                                            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:19:61 ]
+#     │
+#  19 │ const PASTE_START: List[Int] = [0x1b, '[', '2', '0', '0', '~']
+#     │                                                             ┬  
+#     │                                                             ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:20:37 ]
+#     │
+#  20 │ const PASTE_END: List[Int] = [0x1b, '[', '2', '0', '1', '~']
+#     │                                     ┬  
+#     │                                     ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:20:39 ]
+#     │
+#  20 │ const PASTE_END: List[Int] = [0x1b, '[', '2', '0', '1', '~']
+#     │                                       ┬  
+#     │                                       ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:20:42 ]
+#     │
+#  20 │ const PASTE_END: List[Int] = [0x1b, '[', '2', '0', '1', '~']
+#     │                                          ┬  
+#     │                                          ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:20:44 ]
+#     │
+#  20 │ const PASTE_END: List[Int] = [0x1b, '[', '2', '0', '1', '~']
+#     │                                            ┬  
+#     │                                            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:20:47 ]
+#     │
+#  20 │ const PASTE_END: List[Int] = [0x1b, '[', '2', '0', '1', '~']
+#     │                                               ┬  
+#     │                                               ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:20:49 ]
+#     │
+#  20 │ const PASTE_END: List[Int] = [0x1b, '[', '2', '0', '1', '~']
+#     │                                                 ┬  
+#     │                                                 ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:20:52 ]
+#     │
+#  20 │ const PASTE_END: List[Int] = [0x1b, '[', '2', '0', '1', '~']
+#     │                                                    ┬  
+#     │                                                    ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:20:54 ]
+#     │
+#  20 │ const PASTE_END: List[Int] = [0x1b, '[', '2', '0', '1', '~']
+#     │                                                      ┬  
+#     │                                                      ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:20:57 ]
+#     │
+#  20 │ const PASTE_END: List[Int] = [0x1b, '[', '2', '0', '1', '~']
+#     │                                                         ┬  
+#     │                                                         ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `~`
+#     ╭─[ src/key/decode.emel:20:58 ]
+#     │
+#  20 │ const PASTE_END: List[Int] = [0x1b, '[', '2', '0', '1', '~']
+#     │                                                          ┬  
+#     │                                                          ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:20:59 ]
+#     │
+#  20 │ const PASTE_END: List[Int] = [0x1b, '[', '2', '0', '1', '~']
+#     │                                                           ┬  
+#     │                                                           ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:40:6 ]
+#     │
+#  40 │     ['[', _, ..] -> true
+#     │      ┬  
+#     │      ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:40:8 ]
+#     │
+#  40 │     ['[', _, ..] -> true
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:41:6 ]
+#     │
+#  41 │     ['O', c, ..] -> is_ss3_final(c)
+#     │      ┬  
+#     │      ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:41:8 ]
+#     │
+#  41 │     ['O', c, ..] -> is_ss3_final(c)
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:49:12 ]
+#     │
+#  49 │     [0x1b, '[', ..rest] -> csi(rest, alt)
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:49:14 ]
+#     │
+#  49 │     [0x1b, '[', ..rest] -> csi(rest, alt)
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:50:12 ]
+#     │
+#  50 │     [0x1b, 'O', c, ..rest] if is_ss3_final(c) -> (built(ss3(c), NO_MODS, alt), rest)
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:50:14 ]
+#     │
+#  50 │     [0x1b, 'O', c, ..rest] if is_ss3_final(c) -> (built(ss3(c), NO_MODS, alt), rest)
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:85:21 ]
+#     │
+#  85 │   let seen = [0x1b, '[', ..params, ..inter]
+#     │                     ┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:85:23 ]
+#     │
+#  85 │   let seen = [0x1b, '[', ..params, ..inter]
+#     │                       ┬  
+#     │                       ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `?`
+#     ╭─[ src/key/decode.emel:96:26 ]
+#     │
+#  96 │   let ns = fields(params)?
+#     │                          ┬  
+#     │                          ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:98:14 ]
+#     │
+#  98 │     ([], [], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), NO_MODS)
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:98:16 ]
+#     │
+#  98 │     ([], [], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), NO_MODS)
+#     │                ┬  
+#     │                ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:98:20 ]
+#     │
+#  98 │     ([], [], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), NO_MODS)
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:98:22 ]
+#     │
+#  98 │     ([], [], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), NO_MODS)
+#     │                      ┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:98:26 ]
+#     │
+#  98 │     ([], [], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), NO_MODS)
+#     │                          ┬  
+#     │                          ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:98:28 ]
+#     │
+#  98 │     ([], [], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), NO_MODS)
+#     │                            ┬  
+#     │                            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:98:32 ]
+#     │
+#  98 │     ([], [], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), NO_MODS)
+#     │                                ┬  
+#     │                                ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:98:34 ]
+#     │
+#  98 │     ([], [], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), NO_MODS)
+#     │                                  ┬  
+#     │                                  ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:98:38 ]
+#     │
+#  98 │     ([], [], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), NO_MODS)
+#     │                                      ┬  
+#     │                                      ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:98:40 ]
+#     │
+#  98 │     ([], [], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), NO_MODS)
+#     │                                        ┬  
+#     │                                        ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:98:44 ]
+#     │
+#  98 │     ([], [], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), NO_MODS)
+#     │                                            ┬  
+#     │                                            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:98:46 ]
+#     │
+#  98 │     ([], [], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), NO_MODS)
+#     │                                              ┬  
+#     │                                              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:99:18 ]
+#     │
+#  99 │     ([], [1, m], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), modifiers(m)?)
+#     │                  ┬  
+#     │                  ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:99:20 ]
+#     │
+#  99 │     ([], [1, m], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), modifiers(m)?)
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:99:24 ]
+#     │
+#  99 │     ([], [1, m], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), modifiers(m)?)
+#     │                        ┬  
+#     │                        ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:99:26 ]
+#     │
+#  99 │     ([], [1, m], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), modifiers(m)?)
+#     │                          ┬  
+#     │                          ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:99:30 ]
+#     │
+#  99 │     ([], [1, m], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), modifiers(m)?)
+#     │                              ┬  
+#     │                              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:99:32 ]
+#     │
+#  99 │     ([], [1, m], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), modifiers(m)?)
+#     │                                ┬  
+#     │                                ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:99:36 ]
+#     │
+#  99 │     ([], [1, m], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), modifiers(m)?)
+#     │                                    ┬  
+#     │                                    ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:99:38 ]
+#     │
+#  99 │     ([], [1, m], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), modifiers(m)?)
+#     │                                      ┬  
+#     │                                      ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:99:42 ]
+#     │
+#  99 │     ([], [1, m], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), modifiers(m)?)
+#     │                                          ┬  
+#     │                                          ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:99:44 ]
+#     │
+#  99 │     ([], [1, m], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), modifiers(m)?)
+#     │                                            ┬  
+#     │                                            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:99:48 ]
+#     │
+#  99 │     ([], [1, m], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), modifiers(m)?)
+#     │                                                ┬  
+#     │                                                ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/decode.emel:99:50 ]
+#     │
+#  99 │     ([], [1, m], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), modifiers(m)?)
+#     │                                                  ┬  
+#     │                                                  ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `?`
+#     ╭─[ src/key/decode.emel:99:80 ]
+#     │
+#  99 │     ([], [1, m], 'A' | 'B' | 'C' | 'D' | 'H' | 'F') -> (cursor(f), modifiers(m)?)
+#     │                                                                                ┬  
+#     │                                                                                ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:100:18 ]
+#      │
+#  100 │     ([], [1, m], 'P' | 'Q' | 'R' | 'S') -> (Function(f_key(f - 'P' + 1)?), modifiers(m)?)
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:100:20 ]
+#      │
+#  100 │     ([], [1, m], 'P' | 'Q' | 'R' | 'S') -> (Function(f_key(f - 'P' + 1)?), modifiers(m)?)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:100:24 ]
+#      │
+#  100 │     ([], [1, m], 'P' | 'Q' | 'R' | 'S') -> (Function(f_key(f - 'P' + 1)?), modifiers(m)?)
+#      │                        ┬  
+#      │                        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:100:26 ]
+#      │
+#  100 │     ([], [1, m], 'P' | 'Q' | 'R' | 'S') -> (Function(f_key(f - 'P' + 1)?), modifiers(m)?)
+#      │                          ┬  
+#      │                          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:100:30 ]
+#      │
+#  100 │     ([], [1, m], 'P' | 'Q' | 'R' | 'S') -> (Function(f_key(f - 'P' + 1)?), modifiers(m)?)
+#      │                              ┬  
+#      │                              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:100:32 ]
+#      │
+#  100 │     ([], [1, m], 'P' | 'Q' | 'R' | 'S') -> (Function(f_key(f - 'P' + 1)?), modifiers(m)?)
+#      │                                ┬  
+#      │                                ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:100:36 ]
+#      │
+#  100 │     ([], [1, m], 'P' | 'Q' | 'R' | 'S') -> (Function(f_key(f - 'P' + 1)?), modifiers(m)?)
+#      │                                    ┬  
+#      │                                    ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:100:38 ]
+#      │
+#  100 │     ([], [1, m], 'P' | 'Q' | 'R' | 'S') -> (Function(f_key(f - 'P' + 1)?), modifiers(m)?)
+#      │                                      ┬  
+#      │                                      ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:100:64 ]
+#      │
+#  100 │     ([], [1, m], 'P' | 'Q' | 'R' | 'S') -> (Function(f_key(f - 'P' + 1)?), modifiers(m)?)
+#      │                                                                ┬  
+#      │                                                                ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:100:66 ]
+#      │
+#  100 │     ([], [1, m], 'P' | 'Q' | 'R' | 'S') -> (Function(f_key(f - 'P' + 1)?), modifiers(m)?)
+#      │                                                                  ┬  
+#      │                                                                  ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/key/decode.emel:100:72 ]
+#      │
+#  100 │     ([], [1, m], 'P' | 'Q' | 'R' | 'S') -> (Function(f_key(f - 'P' + 1)?), modifiers(m)?)
+#      │                                                                        ┬  
+#      │                                                                        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/key/decode.emel:100:88 ]
+#      │
+#  100 │     ([], [1, m], 'P' | 'Q' | 'R' | 'S') -> (Function(f_key(f - 'P' + 1)?), modifiers(m)?)
+#      │                                                                                        ┬  
+#      │                                                                                        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:101:14 ]
+#      │
+#  101 │     ([], [], 'Z') -> (Tab, NO_MODS with { shift: true })
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:101:16 ]
+#      │
+#  101 │     ([], [], 'Z') -> (Tab, NO_MODS with { shift: true })
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:102:18 ]
+#      │
+#  102 │     ([], [1, m], 'Z') -> (Tab, modifiers(m)? with { shift: true })
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:102:20 ]
+#      │
+#  102 │     ([], [1, m], 'Z') -> (Tab, modifiers(m)? with { shift: true })
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/key/decode.emel:102:44 ]
+#      │
+#  102 │     ([], [1, m], 'Z') -> (Tab, modifiers(m)? with { shift: true })
+#      │                                            ┬  
+#      │                                            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:103:22 ]
+#      │
+#  103 │     ([], [27, m, c], '~') -> (other(c), modifiers(m)?)
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `~`
+#      ╭─[ src/key/decode.emel:103:23 ]
+#      │
+#  103 │     ([], [27, m, c], '~') -> (other(c), modifiers(m)?)
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:103:24 ]
+#      │
+#  103 │     ([], [27, m, c], '~') -> (other(c), modifiers(m)?)
+#      │                        ┬  
+#      │                        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/key/decode.emel:103:53 ]
+#      │
+#  103 │     ([], [27, m, c], '~') -> (other(c), modifiers(m)?)
+#      │                                                     ┬  
+#      │                                                     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:104:15 ]
+#      │
+#  104 │     ([], [n], '~') -> (tilde(n)?, NO_MODS)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `~`
+#      ╭─[ src/key/decode.emel:104:16 ]
+#      │
+#  104 │     ([], [n], '~') -> (tilde(n)?, NO_MODS)
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:104:17 ]
+#      │
+#  104 │     ([], [n], '~') -> (tilde(n)?, NO_MODS)
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/key/decode.emel:104:32 ]
+#      │
+#  104 │     ([], [n], '~') -> (tilde(n)?, NO_MODS)
+#      │                                ┬  
+#      │                                ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:105:18 ]
+#      │
+#  105 │     ([], [n, m], '~') -> (tilde(n)?, modifiers(m)?)
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `~`
+#      ╭─[ src/key/decode.emel:105:19 ]
+#      │
+#  105 │     ([], [n, m], '~') -> (tilde(n)?, modifiers(m)?)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:105:20 ]
+#      │
+#  105 │     ([], [n, m], '~') -> (tilde(n)?, modifiers(m)?)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/key/decode.emel:105:35 ]
+#      │
+#  105 │     ([], [n, m], '~') -> (tilde(n)?, modifiers(m)?)
+#      │                                   ┬  
+#      │                                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/key/decode.emel:105:50 ]
+#      │
+#  105 │     ([], [n, m], '~') -> (tilde(n)?, modifiers(m)?)
+#      │                                                  ┬  
+#      │                                                  ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:106:18 ]
+#      │
+#  106 │     ([], [c, m], 'u') -> (other(c), modifiers(m)?)
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:106:20 ]
+#      │
+#  106 │     ([], [c, m], 'u') -> (other(c), modifiers(m)?)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/key/decode.emel:106:49 ]
+#      │
+#  106 │     ([], [c, m], 'u') -> (other(c), modifiers(m)?)
+#      │                                                 ┬  
+#      │                                                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:114:16 ]
+#      │
+#  114 │   params.split(';').map(fn(ds) { Int.parse_digits(ds) }).all()
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `;`
+#      ╭─[ src/key/decode.emel:114:17 ]
+#      │
+#  114 │   params.split(';').map(fn(ds) { Int.parse_digits(ds) }).all()
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:114:18 ]
+#      │
+#  114 │   params.split(';').map(fn(ds) { Int.parse_digits(ds) }).all()
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `&`
+#      ╭─[ src/key/decode.emel:123:26 ]
+#      │
+#  123 │     Some(Mods(ctrl: bits & 4 != 0, alt: bits & 2 != 0, shift: bits & 1 != 0, super: false))
+#      │                          ┬  
+#      │                          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `&`
+#      ╭─[ src/key/decode.emel:123:46 ]
+#      │
+#  123 │     Some(Mods(ctrl: bits & 4 != 0, alt: bits & 2 != 0, shift: bits & 1 != 0, super: false))
+#      │                                              ┬  
+#      │                                              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `&`
+#      ╭─[ src/key/decode.emel:123:68 ]
+#      │
+#  123 │     Some(Mods(ctrl: bits & 4 != 0, alt: bits & 2 != 0, shift: bits & 1 != 0, super: false))
+#      │                                                                    ┬  
+#      │                                                                    ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:129:5 ]
+#      │
+#  129 │     'A' -> Up
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:129:7 ]
+#      │
+#  129 │     'A' -> Up
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:130:5 ]
+#      │
+#  130 │     'B' -> Down
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:130:7 ]
+#      │
+#  130 │     'B' -> Down
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:131:5 ]
+#      │
+#  131 │     'C' -> Right
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:131:7 ]
+#      │
+#  131 │     'C' -> Right
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:132:5 ]
+#      │
+#  132 │     'D' -> Left
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:132:7 ]
+#      │
+#  132 │     'D' -> Left
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:133:5 ]
+#      │
+#  133 │     'H' -> Home
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:133:7 ]
+#      │
+#  133 │     'H' -> Home
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:134:5 ]
+#      │
+#  134 │     'F' -> End
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:134:7 ]
+#      │
+#  134 │     'F' -> End
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:9 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:11 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:14 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:16 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:19 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:21 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │                     ┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:24 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │                        ┬  
+#      │                        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:26 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │                          ┬  
+#      │                          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:29 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │                             ┬  
+#      │                             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:31 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │                               ┬  
+#      │                               ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:34 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │                                  ┬  
+#      │                                  ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:36 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │                                    ┬  
+#      │                                    ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:39 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │                                       ┬  
+#      │                                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:41 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │                                         ┬  
+#      │                                         ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:44 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │                                            ┬  
+#      │                                            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:46 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │                                              ┬  
+#      │                                              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:49 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │                                                 ┬  
+#      │                                                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:51 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │                                                   ┬  
+#      │                                                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:54 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │                                                      ┬  
+#      │                                                      ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:139:56 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │                                                        ┬  
+#      │                                                        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:144:5 ]
+#      │
+#  144 │     'P' | 'Q' | 'R' | 'S' -> Function(f_key(c - 'P' + 1).unwrap())
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:144:7 ]
+#      │
+#  144 │     'P' | 'Q' | 'R' | 'S' -> Function(f_key(c - 'P' + 1).unwrap())
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:144:11 ]
+#      │
+#  144 │     'P' | 'Q' | 'R' | 'S' -> Function(f_key(c - 'P' + 1).unwrap())
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:144:13 ]
+#      │
+#  144 │     'P' | 'Q' | 'R' | 'S' -> Function(f_key(c - 'P' + 1).unwrap())
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:144:17 ]
+#      │
+#  144 │     'P' | 'Q' | 'R' | 'S' -> Function(f_key(c - 'P' + 1).unwrap())
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:144:19 ]
+#      │
+#  144 │     'P' | 'Q' | 'R' | 'S' -> Function(f_key(c - 'P' + 1).unwrap())
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:144:23 ]
+#      │
+#  144 │     'P' | 'Q' | 'R' | 'S' -> Function(f_key(c - 'P' + 1).unwrap())
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:144:25 ]
+#      │
+#  144 │     'P' | 'Q' | 'R' | 'S' -> Function(f_key(c - 'P' + 1).unwrap())
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:144:49 ]
+#      │
+#  144 │     'P' | 'Q' | 'R' | 'S' -> Function(f_key(c - 'P' + 1).unwrap())
+#      │                                                 ┬  
+#      │                                                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/decode.emel:144:51 ]
+#      │
+#  144 │     'P' | 'Q' | 'R' | 'S' -> Function(f_key(c - 'P' + 1).unwrap())
+#      │                                                   ┬  
+#      │                                                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/key/decode.emel:155:33 ]
+#      │
+#  155 │     15 -> Some(Function(f_key(5)?))
+#      │                                 ┬  
+#      │                                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/key/decode.emel:156:43 ]
+#      │
+#  156 │     17..=21 -> Some(Function(f_key(n - 11)?))
+#      │                                           ┬  
+#      │                                           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/key/decode.emel:157:43 ]
+#      │
+#  157 │     23 | 24 -> Some(Function(f_key(n - 12)?))
+#      │                                           ┬  
+#      │                                           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline after declaration
+#    ╭─[ src/key/decode.emel:7:19 ]
+#    │
+#  7 │ import Key.KeyCode.*
+#    │                   ┬  
+#    │                   ╰── 
+# ───╯
+#
+# error[E0110]: expected variant name
+#     ╭─[ src/key/decode.emel:11:3 ]
+#     │
+#  11 │   | Paste(String)
+#     │   ┬  
+#     │   ╰── 
+# ────╯
+#
+# error[E0110]: expected `,` or newline between variants
+#     ╭─[ src/key/decode.emel:11:5 ]
+#     │
+#  11 │   | Paste(String)
+#     │     ──┬──  
+#     │       ╰──── 
+# ────╯
+#
+# error[E0110]: expected variant name
+#     ╭─[ src/key/decode.emel:12:3 ]
+#     │
+#  12 │   | Unknown(Bytes)
+#     │   ┬  
+#     │   ╰── 
+# ────╯
+#
+# error[E0110]: expected `,` or newline between variants
+#     ╭─[ src/key/decode.emel:12:5 ]
+#     │
+#  12 │   | Unknown(Bytes)
+#     │     ───┬───  
+#     │        ╰───── 
+# ────╯
+#
+# error[E0110]: expected type name
+#     ╭─[ src/key/decode.emel:13:10 ]
+#     │
+#  13 │ } derive (Eq, Show)
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/key/decode.emel:13:10 ]
+#     │
+#  13 │ } derive (Eq, Show)
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/decode.emel:19:39 ]
+#     │
+#  19 │ const PASTE_START: List[Int] = [0x1b, '[', '2', '0', '0', '~']
+#     │                                       ┬  
+#     │                                       ╰── 
+# ────╯
+#
+# error[E0110]: expected `]`
+#     ╭─[ src/key/decode.emel:19:40 ]
+#     │
+#  19 │ const PASTE_START: List[Int] = [0x1b, '[', '2', '0', '0', '~']
+#     │                                        ┬  
+#     │                                        ╰── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/key/decode.emel:19:40 ]
+#     │
+#  19 │ const PASTE_START: List[Int] = [0x1b, '[', '2', '0', '0', '~']
+#     │                                        ┬  
+#     │                                        ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/decode.emel:20:37 ]
+#     │
+#  20 │ const PASTE_END: List[Int] = [0x1b, '[', '2', '0', '1', '~']
+#     │                                     ┬  
+#     │                                     ╰── 
+# ────╯
+#
+# error[E0110]: expected `]`
+#     ╭─[ src/key/decode.emel:20:38 ]
+#     │
+#  20 │ const PASTE_END: List[Int] = [0x1b, '[', '2', '0', '1', '~']
+#     │                                      ┬  
+#     │                                      ╰── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/key/decode.emel:20:38 ]
+#     │
+#  20 │ const PASTE_END: List[Int] = [0x1b, '[', '2', '0', '1', '~']
+#     │                                      ┬  
+#     │                                      ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/key/decode.emel:23:3 ]
+#     │
+#  23 │   match bs {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/key/decode.emel:26:63 ]
+#     │
+#  26 │     [0x1b, ..rest] if rest != [] && !starts_sequence(rest) -> match one(rest, alt: true) {
+#     │                                                               ──┬──  
+#     │                                                                 ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/decode.emel:31:7 ]
+#     │
+#  31 │       let (d, more) = one(bs, alt: false)
+#     │       ─┬─  
+#     │        ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/key/decode.emel:31:11 ]
+#     │
+#  31 │       let (d, more) = one(bs, alt: false)
+#     │           ┬  
+#     │           ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/key/decode.emel:39:3 ]
+#     │
+#  39 │   match rest {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/key/decode.emel:40:6 ]
+#     │
+#  40 │     ['[', _, ..] -> true
+#     │      ┬  
+#     │      ╰── 
+# ────╯
+#
+# error[E0110]: expected `]`
+#     ╭─[ src/key/decode.emel:40:7 ]
+#     │
+#  40 │     ['[', _, ..] -> true
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/decode.emel:40:7 ]
+#     │
+#  40 │     ['[', _, ..] -> true
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/decode.emel:40:8 ]
+#     │
+#  40 │     ['[', _, ..] -> true
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0123]: `_` can only be used in patterns
+#     ╭─[ src/key/decode.emel:40:11 ]
+#     │
+#  40 │     ['[', _, ..] -> true
+#     │           ┬  
+#     │           ╰── 
+# ────╯
+#
+# error[E0124]: `..` without an expression can only be used in patterns
+#     ╭─[ src/key/decode.emel:40:14 ]
+#     │
+#  40 │     ['[', _, ..] -> true
+#     │              ─┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/decode.emel:40:18 ]
+#     │
+#  40 │     ['[', _, ..] -> true
+#     │                  ─┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/key/decode.emel:47:3 ]
+#     │
+#  47 │   match bs {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0115]: `..` needs at least one element before it
+#     ╭─[ src/key/decode.emel:48:6 ]
+#     │
+#  48 │     [..PASTE_START, ..rest] -> paste(rest)
+#     │      ─┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0110]: expected `]`
+#     ╭─[ src/key/decode.emel:48:8 ]
+#     │
+#  48 │     [..PASTE_START, ..rest] -> paste(rest)
+#     │        ─────┬─────  
+#     │             ╰─────── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/decode.emel:48:8 ]
+#     │
+#  48 │     [..PASTE_START, ..rest] -> paste(rest)
+#     │        ─────┬─────  
+#     │             ╰─────── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/decode.emel:48:19 ]
+#     │
+#  48 │     [..PASTE_START, ..rest] -> paste(rest)
+#     │                   ┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/key/decode.emel:49:12 ]
+#     │
+#  49 │     [0x1b, '[', ..rest] -> csi(rest, alt)
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0110]: expected `]`
+#     ╭─[ src/key/decode.emel:49:13 ]
+#     │
+#  49 │     [0x1b, '[', ..rest] -> csi(rest, alt)
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/decode.emel:49:13 ]
+#     │
+#  49 │     [0x1b, '[', ..rest] -> csi(rest, alt)
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/decode.emel:49:14 ]
+#     │
+#  49 │     [0x1b, '[', ..rest] -> csi(rest, alt)
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/decode.emel:49:25 ]
+#     │
+#  49 │     [0x1b, '[', ..rest] -> csi(rest, alt)
+#     │                         ─┬  
+#     │                          ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/key/decode.emel:65:22 ]
+#     │
+#  65 │   Key(key(code, mods with { alt: mods.alt || alt }).expect("scalar value"))
+#     │                      ──┬─  
+#     │                        ╰─── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/key/decode.emel:65:22 ]
+#     │
+#  65 │   Key(key(code, mods with { alt: mods.alt || alt }).expect("scalar value"))
+#     │                      ──┬─  
+#     │                        ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/key/decode.emel:65:22 ]
+#     │
+#  65 │   Key(key(code, mods with { alt: mods.alt || alt }).expect("scalar value"))
+#     │                      ──┬─  
+#     │                        ╰─── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/key/decode.emel:69:3 ]
+#     │
+#  69 │   match rest.split_once(PASTE_END) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/key/decode.emel:70:27 ]
+#     │
+#  70 │     Some((text, more)) -> match Bytes.from_list(text).decode_utf8() {
+#     │                           ──┬──  
+#     │                             ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/decode.emel:72:55 ]
+#     │
+#  72 │       Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ text ++ PASTE_END)), more)
+#     │                                                       ┬  
+#     │                                                       ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/key/decode.emel:72:57 ]
+#     │
+#  72 │       Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ text ++ PASTE_END)), more)
+#     │                                                         ──┬─  
+#     │                                                           ╰─── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/key/decode.emel:72:57 ]
+#     │
+#  72 │       Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ text ++ PASTE_END)), more)
+#     │                                                         ──┬─  
+#     │                                                           ╰─── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/key/decode.emel:72:57 ]
+#     │
+#  72 │       Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ text ++ PASTE_END)), more)
+#     │                                                         ──┬─  
+#     │                                                           ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/decode.emel:72:57 ]
+#     │
+#  72 │       Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ text ++ PASTE_END)), more)
+#     │                                                         ──┬─  
+#     │                                                           ╰─── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/key/decode.emel:74:13 ]
+#     │
+#  74 │     None -> match Bytes.from_list(rest).decode_utf8() {
+#     │             ──┬──  
+#     │               ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/decode.emel:76:55 ]
+#     │
+#  76 │       Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ rest)), [])
+#     │                                                       ┬  
+#     │                                                       ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/key/decode.emel:76:57 ]
+#     │
+#  76 │       Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ rest)), [])
+#     │                                                         ──┬─  
+#     │                                                           ╰─── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/key/decode.emel:76:57 ]
+#     │
+#  76 │       Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ rest)), [])
+#     │                                                         ──┬─  
+#     │                                                           ╰─── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/key/decode.emel:76:57 ]
+#     │
+#  76 │       Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ rest)), [])
+#     │                                                         ──┬─  
+#     │                                                           ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/decode.emel:76:57 ]
+#     │
+#  76 │       Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ rest)), [])
+#     │                                                         ──┬─  
+#     │                                                           ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/decode.emel:83:3 ]
+#     │
+#  83 │   let (params, after_params) = rest.span(fn(b) { b in 0x30..=0x3f })
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/key/decode.emel:83:7 ]
+#     │
+#  83 │   let (params, after_params) = rest.span(fn(b) { b in 0x30..=0x3f })
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/decode.emel:84:3 ]
+#     │
+#  84 │   let (inter, after_inter) = after_params.span(fn(b) { b in 0x20..=0x2f })
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/key/decode.emel:84:7 ]
+#     │
+#  84 │   let (inter, after_inter) = after_params.span(fn(b) { b in 0x20..=0x2f })
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/decode.emel:85:3 ]
+#     │
+#  85 │   let seen = [0x1b, '[', ..params, ..inter]
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/key/decode.emel:85:7 ]
+#     │
+#  85 │   let seen = [0x1b, '[', ..params, ..inter]
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/decode.emel:96:3 ]
+#     │
+#  96 │   let ns = fields(params)?
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/key/decode.emel:96:7 ]
+#     │
+#  96 │   let ns = fields(params)?
+#     │       ─┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/decode.emel:97:3 ]
+#     │
+#  97 │   let (code, mods) = match (inter, ns, f) {
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/key/decode.emel:97:7 ]
+#     │
+#  97 │   let (code, mods) = match (inter, ns, f) {
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/decode.emel:109:18 ]
+#      │
+#  109 │   key(code, mods with { alt: mods.alt || alt })
+#      │                  ──┬─  
+#      │                    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/key/decode.emel:109:18 ]
+#      │
+#  109 │   key(code, mods with { alt: mods.alt || alt })
+#      │                  ──┬─  
+#      │                    ╰─── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/decode.emel:114:16 ]
+#      │
+#  114 │   params.split(';').map(fn(ds) { Int.parse_digits(ds) }).all()
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/decode.emel:114:17 ]
+#      │
+#  114 │   params.split(';').map(fn(ds) { Int.parse_digits(ds) }).all()
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/key/decode.emel:114:17 ]
+#      │
+#  114 │   params.split(';').map(fn(ds) { Int.parse_digits(ds) }).all()
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/decode.emel:119:3 ]
+#      │
+#  119 │   let bits = m - 1
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/key/decode.emel:119:7 ]
+#      │
+#  119 │   let bits = m - 1
+#      │       ──┬─  
+#      │         ╰─── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/decode.emel:123:26 ]
+#      │
+#  123 │     Some(Mods(ctrl: bits & 4 != 0, alt: bits & 2 != 0, shift: bits & 1 != 0, super: false))
+#      │                          ┬  
+#      │                          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/decode.emel:123:26 ]
+#      │
+#  123 │     Some(Mods(ctrl: bits & 4 != 0, alt: bits & 2 != 0, shift: bits & 1 != 0, super: false))
+#      │                          ┬  
+#      │                          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/key/decode.emel:123:26 ]
+#      │
+#  123 │     Some(Mods(ctrl: bits & 4 != 0, alt: bits & 2 != 0, shift: bits & 1 != 0, super: false))
+#      │                          ┬  
+#      │                          ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/key/decode.emel:128:3 ]
+#      │
+#  128 │   match f {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/key/decode.emel:129:5 ]
+#      │
+#  129 │     'A' -> Up
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/decode.emel:129:6 ]
+#      │
+#  129 │     'A' -> Up
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/decode.emel:129:7 ]
+#      │
+#  129 │     'A' -> Up
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/key/decode.emel:130:5 ]
+#      │
+#  130 │     'B' -> Down
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/decode.emel:130:6 ]
+#      │
+#  130 │     'B' -> Down
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/decode.emel:130:7 ]
+#      │
+#  130 │     'B' -> Down
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/key/decode.emel:131:5 ]
+#      │
+#  131 │     'C' -> Right
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/decode.emel:131:6 ]
+#      │
+#  131 │     'C' -> Right
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/decode.emel:131:7 ]
+#      │
+#  131 │     'C' -> Right
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/key/decode.emel:132:5 ]
+#      │
+#  132 │     'D' -> Left
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/decode.emel:132:6 ]
+#      │
+#  132 │     'D' -> Left
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/decode.emel:132:7 ]
+#      │
+#  132 │     'D' -> Left
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/key/decode.emel:133:5 ]
+#      │
+#  133 │     'H' -> Home
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/decode.emel:133:6 ]
+#      │
+#  133 │     'H' -> Home
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/decode.emel:133:7 ]
+#      │
+#  133 │     'H' -> Home
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/key/decode.emel:134:5 ]
+#      │
+#  134 │     'F' -> End
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/decode.emel:134:6 ]
+#      │
+#  134 │     'F' -> End
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/decode.emel:134:7 ]
+#      │
+#  134 │     'F' -> End
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/key/decode.emel:139:5 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │     ─┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/key/decode.emel:143:3 ]
+#      │
+#  143 │   match c {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/key/decode.emel:144:5 ]
+#      │
+#  144 │     'P' | 'Q' | 'R' | 'S' -> Function(f_key(c - 'P' + 1).unwrap())
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/decode.emel:144:6 ]
+#      │
+#  144 │     'P' | 'Q' | 'R' | 'S' -> Function(f_key(c - 'P' + 1).unwrap())
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/decode.emel:144:7 ]
+#      │
+#  144 │     'P' | 'Q' | 'R' | 'S' -> Function(f_key(c - 'P' + 1).unwrap())
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/key/decode.emel:150:3 ]
+#      │
+#  150 │   match n {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/decode.emel:155:33 ]
+#      │
+#  155 │     15 -> Some(Function(f_key(5)?))
+#      │                                 ┬  
+#      │                                 ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/decode.emel:155:33 ]
+#      │
+#  155 │     15 -> Some(Function(f_key(5)?))
+#      │                                 ┬  
+#      │                                 ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/decode.emel:155:33 ]
+#      │
+#  155 │     15 -> Some(Function(f_key(5)?))
+#      │                                 ┬  
+#      │                                 ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/decode.emel:156:7 ]
+#      │
+#  156 │     17..=21 -> Some(Function(f_key(n - 11)?))
+#      │       ─┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/decode.emel:156:7 ]
+#      │
+#  156 │     17..=21 -> Some(Function(f_key(n - 11)?))
+#      │       ─┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/decode.emel:156:9 ]
+#      │
+#  156 │     17..=21 -> Some(Function(f_key(n - 11)?))
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/decode.emel:157:8 ]
+#      │
+#  157 │     23 | 24 -> Some(Function(f_key(n - 12)?))
+#      │        ┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0110]: expected `|`
+#      ╭─[ src/key/decode.emel:157:13 ]
+#      │
+#  157 │     23 | 24 -> Some(Function(f_key(n - 12)?))
+#      │             ─┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/decode.emel:157:13 ]
+#      │
+#  157 │     23 | 24 -> Some(Function(f_key(n - 12)?))
+#      │             ─┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/decode.emel:157:13 ]
+#      │
+#  157 │     23 | 24 -> Some(Function(f_key(n - 12)?))
+#      │             ─┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/key/decode.emel:164:3 ]
+#      │
+#  164 │   match c {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/decode.emel:168:9 ]
+#      │
+#  168 │     127 | 8 -> Backspace
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0110]: expected `|`
+#      ╭─[ src/key/decode.emel:168:13 ]
+#      │
+#  168 │     127 | 8 -> Backspace
+#      │             ─┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/decode.emel:168:13 ]
+#      │
+#  168 │     127 | 8 -> Backspace
+#      │             ─┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/decode.emel:168:13 ]
+#      │
+#  168 │     127 | 8 -> Backspace
+#      │             ─┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0213]: `Key` is defined more than once
+#     ╭─[ src/key/decode.emel:6:13 ]
+#     │
+#   6 │ import Key.{Key, KeyCode, Mods, NO_MODS, key, f_key}
+#     │             ─┬─  
+#     │              ╰─── 
+#     │ 
+#  10 │   Key(Key)
+#     │   ─┬─  
+#     │    ╰─── `Key` is first defined here
+# ────╯
+#
+# error[E0211]: cannot find type `Bytes` in this scope
+#     ╭─[ src/key/decode.emel:15:18 ]
+#     │
+#  15 │ pub fn decode(b: Bytes) -> List[Decoded] {
+#     │                  ──┬──  
+#     │                    ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `true` in this scope
+#     ╭─[ src/key/decode.emel:26:84 ]
+#     │
+#  26 │     [0x1b, ..rest] if rest != [] && !starts_sequence(rest) -> match one(rest, alt: true) {
+#     │                                                                                    ──┬─  
+#     │                                                                                      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Esc` in this scope
+#     ╭─[ src/key/decode.emel:28:29 ]
+#     │
+#  28 │       (d, more) -> [Key(key(Esc, NO_MODS)), d, ..read(more)]
+#     │                             ─┬─  
+#     │                              ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `d` in this scope
+#     ╭─[ src/key/decode.emel:32:8 ]
+#     │
+#  32 │       [d, ..read(more)]
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0211]: cannot find value `more` in this scope
+#     ╭─[ src/key/decode.emel:32:18 ]
+#     │
+#  32 │       [d, ..read(more)]
+#     │                  ──┬─  
+#     │                    ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `rest` in this scope
+#     ╭─[ src/key/decode.emel:49:19 ]
+#     │
+#  49 │     [0x1b, '[', ..rest] -> csi(rest, alt)
+#     │                   ──┬─  
+#     │                     ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Bytes` in this scope
+#     ╭─[ src/key/decode.emel:70:33 ]
+#     │
+#  70 │     Some((text, more)) -> match Bytes.from_list(text).decode_utf8() {
+#     │                                 ──┬──  
+#     │                                   ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Ok` in this scope
+#     ╭─[ src/key/decode.emel:71:7 ]
+#     │
+#  71 │       Ok(s) -> (Paste(s), more)
+#     │       ─┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Paste` in this scope
+#     ╭─[ src/key/decode.emel:71:17 ]
+#     │
+#  71 │       Ok(s) -> (Paste(s), more)
+#     │                 ──┬──  
+#     │                   ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Err` in this scope
+#     ╭─[ src/key/decode.emel:72:7 ]
+#     │
+#  72 │       Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ text ++ PASTE_END)), more)
+#     │       ─┬─  
+#     │        ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Unknown` in this scope
+#     ╭─[ src/key/decode.emel:72:18 ]
+#     │
+#  72 │       Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ text ++ PASTE_END)), more)
+#     │                  ───┬───  
+#     │                     ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Bytes` in this scope
+#     ╭─[ src/key/decode.emel:72:26 ]
+#     │
+#  72 │       Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ text ++ PASTE_END)), more)
+#     │                          ──┬──  
+#     │                            ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Bytes` in this scope
+#     ╭─[ src/key/decode.emel:74:19 ]
+#     │
+#  74 │     None -> match Bytes.from_list(rest).decode_utf8() {
+#     │                   ──┬──  
+#     │                     ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Ok` in this scope
+#     ╭─[ src/key/decode.emel:75:7 ]
+#     │
+#  75 │       Ok(s) -> (Paste(s), [])
+#     │       ─┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Paste` in this scope
+#     ╭─[ src/key/decode.emel:75:17 ]
+#     │
+#  75 │       Ok(s) -> (Paste(s), [])
+#     │                 ──┬──  
+#     │                   ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Err` in this scope
+#     ╭─[ src/key/decode.emel:76:7 ]
+#     │
+#  76 │       Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ rest)), [])
+#     │       ─┬─  
+#     │        ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Unknown` in this scope
+#     ╭─[ src/key/decode.emel:76:18 ]
+#     │
+#  76 │       Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ rest)), [])
+#     │                  ───┬───  
+#     │                     ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Bytes` in this scope
+#     ╭─[ src/key/decode.emel:76:26 ]
+#     │
+#  76 │       Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ rest)), [])
+#     │                          ──┬──  
+#     │                            ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `code` in this scope
+#      ╭─[ src/key/decode.emel:109:7 ]
+#      │
+#  109 │   key(code, mods with { alt: mods.alt || alt })
+#      │       ──┬─  
+#      │         ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `mods` in this scope
+#      ╭─[ src/key/decode.emel:109:13 ]
+#      │
+#  109 │   key(code, mods with { alt: mods.alt || alt })
+#      │             ──┬─  
+#      │               ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `bits` in this scope
+#      ╭─[ src/key/decode.emel:120:6 ]
+#      │
+#  120 │   if bits < 0 || bits > 7 {
+#      │      ──┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `bits` in this scope
+#      ╭─[ src/key/decode.emel:120:18 ]
+#      │
+#  120 │   if bits < 0 || bits > 7 {
+#      │                  ──┬─  
+#      │                    ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `bits` in this scope
+#      ╭─[ src/key/decode.emel:123:21 ]
+#      │
+#  123 │     Some(Mods(ctrl: bits & 4 != 0, alt: bits & 2 != 0, shift: bits & 1 != 0, super: false))
+#      │                     ──┬─  
+#      │                       ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `A` in this scope
+#      ╭─[ src/key/decode.emel:129:6 ]
+#      │
+#  129 │     'A' -> Up
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#    = help: did you mean `f`?
+#
+# error[E0211]: cannot find value `B` in this scope
+#      ╭─[ src/key/decode.emel:130:6 ]
+#      │
+#  130 │     'B' -> Down
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#    = help: did you mean `f`?
+#
+# error[E0211]: cannot find value `C` in this scope
+#      ╭─[ src/key/decode.emel:131:6 ]
+#      │
+#  131 │     'C' -> Right
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#    = help: did you mean `f`?
+#
+# error[E0211]: cannot find value `D` in this scope
+#      ╭─[ src/key/decode.emel:132:6 ]
+#      │
+#  132 │     'D' -> Left
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#    = help: did you mean `f`?
+#
+# error[E0211]: cannot find value `H` in this scope
+#      ╭─[ src/key/decode.emel:133:6 ]
+#      │
+#  133 │     'H' -> Home
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#    = help: did you mean `f`?
+#
+# error[E0211]: cannot find value `F` in this scope
+#      ╭─[ src/key/decode.emel:134:6 ]
+#      │
+#  134 │     'F' -> End
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#    = help: did you mean `f`?
+#
+# error[E0211]: cannot find value `P` in this scope
+#      ╭─[ src/key/decode.emel:144:6 ]
+#      │
+#  144 │     'P' | 'Q' | 'R' | 'S' -> Function(f_key(c - 'P' + 1).unwrap())
+#      │      ┬  
+#      │      ╰── 
+# ─────╯
+#    = help: did you mean `c`?
+#
+# error[E0211]: cannot find constructor `Insert` in this scope
+#      ╭─[ src/key/decode.emel:151:15 ]
+#      │
+#  151 │     2 -> Some(Insert)
+#      │               ───┬──  
+#      │                  ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Delete` in this scope
+#      ╭─[ src/key/decode.emel:152:15 ]
+#      │
+#  152 │     3 -> Some(Delete)
+#      │               ───┬──  
+#      │                  ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `PageUp` in this scope
+#      ╭─[ src/key/decode.emel:153:15 ]
+#      │
+#  153 │     5 -> Some(PageUp)
+#      │               ───┬──  
+#      │                  ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `PageDown` in this scope
+#      ╭─[ src/key/decode.emel:154:15 ]
+#      │
+#  154 │     6 -> Some(PageDown)
+#      │               ────┬───  
+#      │                   ╰───── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Function` in this scope
+#      ╭─[ src/key/decode.emel:155:16 ]
+#      │
+#  155 │     15 -> Some(Function(f_key(5)?))
+#      │                ────┬───  
+#      │                    ╰───── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Tab` in this scope
+#      ╭─[ src/key/decode.emel:165:10 ]
+#      │
+#  165 │     9 -> Tab
+#      │          ─┬─  
+#      │           ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Enter` in this scope
+#      ╭─[ src/key/decode.emel:166:11 ]
+#      │
+#  166 │     13 -> Enter
+#      │           ──┬──  
+#      │             ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Esc` in this scope
+#      ╭─[ src/key/decode.emel:167:11 ]
+#      │
+#  167 │     27 -> Esc
+#      │           ─┬─  
+#      │            ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Char` in this scope
+#      ╭─[ src/key/decode.emel:169:10 ]
+#      │
+#  169 │     _ -> Char(c)
+#      │          ──┬─  
+#      │            ╰─── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/key/decode.emel:28:7 ]
+#     │
+#  28 │       (d, more) -> [Key(key(Esc, NO_MODS)), d, ..read(more)]
+#     │       ────┬────  
+#     │           ╰────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `Key`, found `Option[Key]`
+#     ╭─[ src/key/decode.emel:28:25 ]
+#     │
+#  28 │       (d, more) -> [Key(key(Esc, NO_MODS)), d, ..read(more)]
+#     │                         ────────┬────────  
+#     │                                 ╰────────── 
+# ────╯
+#
+# error[E0303]: non-exhaustive match: pattern `[_, ..]` not covered
+#     ╭─[ src/key/decode.emel:39:9 ]
+#     │
+#  39 │   match rest {
+#     │         ──┬─  
+#     │           ╰─── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `Bool`, found `List[{unknown}]`
+#     ╭─[ src/key/decode.emel:40:7 ]
+#     │
+#  40 │     ['[', _, ..] -> true
+#     │       ─────┬────  
+#     │            ╰────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Decoded, List[Int])`, found `List[Int]`
+#     ╭─[ src/key/decode.emel:48:8 ]
+#     │
+#  48 │     [..PASTE_START, ..rest] -> paste(rest)
+#     │        ─────┬─────  
+#     │             ╰─────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/key/decode.emel:49:5 ]
+#     │
+#  49 │     [0x1b, '[', ..rest] -> csi(rest, alt)
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Decoded, List[Int])`, found `List[?3]`
+#     ╭─[ src/key/decode.emel:49:13 ]
+#     │
+#  49 │     [0x1b, '[', ..rest] -> csi(rest, alt)
+#     │             ─────┬─────  
+#     │                  ╰─────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `Key`, found `Option[Key]`
+#     ╭─[ src/key/decode.emel:65:7 ]
+#     │
+#  65 │   Key(key(code, mods with { alt: mods.alt || alt }).expect("scalar value"))
+#     │       ───────┬──────  
+#     │              ╰──────── 
+# ────╯
+#
+# error[E0313]: type `List[Int]` has no field or function `split_once`
+#     ╭─[ src/key/decode.emel:69:14 ]
+#     │
+#  69 │   match rest.split_once(PASTE_END) {
+#     │              ─────┬────  
+#     │                   ╰────── 
+# ────╯
+#
+# error[E0310]: expected a number (`Int`, `Int64` or `Float`), found `List[Int]`
+#     ╭─[ src/key/decode.emel:72:42 ]
+#     │
+#  72 │       Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ text ++ PASTE_END)), more)
+#     │                                          ───────┬──────  
+#     │                                                 ╰──────── 
+# ────╯
+#
+# error[E0310]: expected a number (`Int`, `Int64` or `Float`), found `List[Int]`
+#     ╭─[ src/key/decode.emel:76:42 ]
+#     │
+#  76 │       Err(_) -> (Unknown(Bytes.from_list(PASTE_START ++ rest)), [])
+#     │                                          ───────┬──────  
+#     │                                                 ╰──────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Decoded, List[Int])`, found `()`
+#     ╭─[ src/key/decode.emel:82:60 ]
+#     │
+#  82 │ ╭─▶ fn csi(rest: List[Int], alt: Bool) -> (Decoded, List[Int]) {
+#     ┆ ┆   
+#  93 │ ├─▶ }
+#     │ │       
+#     │ ╰─────── 
+# ────╯
+#
+# error[E0313]: type `List[Int]` has no field or function `split`
+#      ╭─[ src/key/decode.emel:114:10 ]
+#      │
+#  114 │   params.split(';').map(fn(ds) { Int.parse_digits(ds) }).all()
+#      │          ──┬──  
+#      │            ╰──── 
+# ─────╯
+#
+# error[E0305]: wrong number of arguments: `Mods` takes 4, found 1
+#      ╭─[ src/key/decode.emel:123:10 ]
+#      │
+#  123 │     Some(Mods(ctrl: bits & 4 != 0, alt: bits & 2 != 0, shift: bits & 1 != 0, super: false))
+#      │          ───────┬───────  
+#      │                 ╰───────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/decode.emel:130:5 ]
+#      │
+#  130 │     'B' -> Down
+#      │     ─┬  
+#      │      ╰── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/decode.emel:131:5 ]
+#      │
+#  131 │     'C' -> Right
+#      │     ─┬  
+#      │      ╰── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/decode.emel:132:5 ]
+#      │
+#  132 │     'D' -> Left
+#      │     ─┬  
+#      │      ╰── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/decode.emel:133:5 ]
+#      │
+#  133 │     'H' -> Home
+#      │     ─┬  
+#      │      ╰── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/decode.emel:134:5 ]
+#      │
+#  134 │     'F' -> End
+#      │     ─┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `Bool`, found `Int`
+#      ╭─[ src/key/decode.emel:139:3 ]
+#      │
+#  139 │   c in ['A', 'B', 'C', 'D', 'H', 'F', 'P', 'Q', 'R', 'S']
+#      │   ┬  
+#      │   ╰── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/decode.emel:145:5 ]
+#      │
+#  145 │     _ -> cursor(c)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `Option[KeyCode]`, found `fn(Int) -> {unknown}`
+#      ╭─[ src/key/decode.emel:157:8 ]
+#      │
+#  157 │     23 | 24 -> Some(Function(f_key(n - 12)?))
+#      │        ──┬─  
+#      │          ╰─── 
+# ─────╯
+#
+# error[E0317]: refutable pattern in binding: pattern `_` not covered
+#      ╭─[ src/key/decode.emel:157:10 ]
+#      │
+#  157 │     23 | 24 -> Some(Function(f_key(n - 12)?))
+#      │          ─┬  
+#      │           ╰── 
+# ─────╯
+#    = help: use `match` to handle the other cases
+#
+# error[E0301]: type mismatch: expected `KeyCode`, found `fn(Int) -> {unknown}`
+#      ╭─[ src/key/decode.emel:168:9 ]
+#      │
+#  168 │     127 | 8 -> Backspace
+#      │         ─┬─  
+#      │          ╰─── 
+# ─────╯
+#
+# error[E0317]: refutable pattern in binding: pattern `_` not covered
+#      ╭─[ src/key/decode.emel:168:11 ]
+#      │
+#  168 │     127 | 8 -> Backspace
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#    = help: use `match` to handle the other cases
+#
+# 310 errors, 9 warnings
+# --- end wish check ---
