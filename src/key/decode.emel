@@ -69,16 +69,23 @@ const SHIFT: Mods = Mods(shift: True, ..NO_MODS)
 ##
 ## 1. `CSI 200~` starts a paste of the text up to `CSI 201~`, or to the end of `b` if no
 ##    `CSI 201~` comes. If that text is not UTF-8, the whole paste is unknown.
-## 2. `ESC [` starts a sequence of parameter bytes (0x30 to 0x3F), intermediate bytes (0x20 to
-##    0x2F) and a final byte (0x40 to 0x7E), as in ECMA-48. It is a cursor key, Home or End
-##    (`A B C D H F`, with modifiers after `1;`), Insert, Delete, PageUp, PageDown or F5 to F12
-##    (`n~` and `n;m~`), F1 to F4 with modifiers (`1;m P` to `S`), Tab with Shift (`Z`, and
-##    `1;m Z`), or a key of modifyOtherKeys (`27;m;c~`) or of `c;m u`. Any other sequence, and one
-##    whose modifier number holds a bit other than Shift, Alt and Ctrl, is unknown. If `b` ends
-##    before the final byte, the bytes from `ESC [` are unknown.
+## 2. `ESC [` and a byte after it start a sequence of parameter bytes (0x30 to 0x3F),
+##    intermediate bytes (0x20 to 0x2F) and a final byte (0x40 to 0x7E), as in ECMA-48. It is a
+##    cursor key, Home or End (`A B C D H F`, with modifiers after `1;`), Insert, Delete, PageUp,
+##    PageDown or F5 to F12 (`n~` and `n;m~`), F1 to F4 with modifiers (`1;m P` to `S`), Tab with
+##    Shift (`Z`, and `1;m Z`), or a key of modifyOtherKeys (`27;m;c~`) or of `c;m u`. Any other
+##    sequence is unknown, and so is one whose modifier number holds a bit other than Shift, Alt
+##    and Ctrl. So a `CSI u` with an extension of kitty is unknown: values after `:` (such as an
+##    event type), or a `c` in the private use area 0xE000 to 0xF8FF, where kitty numbers its
+##    own keys (such a `c` makes `27;m;c~` unknown too). If `b` ends before the final byte, the
+##    bytes from `ESC [` are unknown. If a byte outside the three ranges comes before the final
+##    byte, the bytes from `ESC [` up to it are unknown, and that byte starts the next item.
 ## 3. `ESC O` before one of `A B C D H F P Q R S` is SS3 (a cursor key, Home, End, F1 to F4).
-## 4. `ESC` before a key is that key with Alt (`ESC [` and `ESC O` that end `b` are `<M-[>` and
-##    `<M-O>`). `ESC` before anything else, or at the end, is `<Esc>`.
+## 4. `ESC` before a key is that key with Alt (`ESC a` is `<M-a>`, `ESC ESC` is `<M-Esc>`). The
+##    key after the `ESC` is read by the other rules, not by this one: `ESC ESC [ A` is `<M-Up>`,
+##    and `ESC ESC [` is `<M-Esc>` and `[`. So an `ESC [` or `ESC O` that ends `b` is `<M-[>` or
+##    `<M-O>` only at the start of an item. `ESC` before anything else, or at the end, is
+##    `<Esc>`.
 ## 5. A control character is its representative (`Key.key`). A 0x0A right after 0x0D is part of
 ##    that Enter.
 ## 6. Anything else is UTF-8: each code point is a character, and each run of bytes at which no
@@ -127,13 +134,14 @@ fn opens_sequence(rest: List[Int]) -> Bool {
 fn unprefixed(b: Bytes, at: Int, bs: List[Int], alt: Bool) -> (Decoded, Int) {
   bs match {
     [ESC, LEFT_BRACKET, ..] if b.slice(at, at + PASTE_START.size()) == PASTE_START -> paste(b, at)
-    [ESC, LEFT_BRACKET, ..rest] -> csi(b, at, rest, alt)
+    # `ESC [` that ends `b` starts no sequence.
+    [ESC, LEFT_BRACKET, ..rest] if !rest.is_empty() -> csi(b, at, rest, alt)
     [ESC, CAPITAL_O, c, ..] -> letter(c) match {
-      Some(code) -> keyed(pressed(code, NO_MODS, alt), b, at, 3)
+      Some(code) -> (Key(pressed(code, NO_MODS, alt)), 3)
       None       -> character(b, at, alt)
     }
-    [CR, LF, ..]                -> keyed(pressed(Enter, NO_MODS, alt), b, at, 2)
-    _                           -> character(b, at, alt)
+    [CR, LF, ..]                                    -> (Key(pressed(Enter, NO_MODS, alt)), 2)
+    _                                               -> character(b, at, alt)
   }
 }
 
@@ -177,9 +185,13 @@ fn csi(b: Bytes, at: Int, rest: List[Int], alt: Bool) -> (Decoded, Int) {
       } else {
         None
       }
-      keyed(found, b, at, length + 1)
+      found match {
+        Some(k) -> (Key(k), length + 1)
+        None    -> (Unknown(b.slice(at, at + length + 1)), length + 1)
+      }
     }
-    # `b` ends, or a byte that no sequence holds comes, before the final byte.
+    # `b` ends, or a byte that no sequence holds comes, before the final byte. That byte starts
+    # the next item.
     _ -> (Unknown(b.slice(at, at + length)), length)
   }
 }
@@ -197,16 +209,19 @@ fn numbers(parameters: Bytes) -> Option[List[Int]] {
   if parameters.is_empty() {
     Some([])
   } else {
-    parameters.decode_utf8().and_then(|text| {
-      fields = text.split(";")
-      # FRICTION(006): there is no function that makes a List of Options an Option of a List, so
-      # a field that is no number is one that `filter_map` drops.
-      ns = fields.filter_map(number)
-      if ns.length() == fields.length() { Some(ns) } else { None }
-    })
+    # FRICTION(046): Bytes and List have no `split`, and Int has no parse of digit bytes, so the
+    # parameter bytes, which are ASCII, are read as a String.
+    text = parameters.decode_utf8() |> expect("the parameter bytes are ASCII")
+    fields = text.split(";")
+    # FRICTION(006): there is no function that makes a List of Options an Option of a List, so a
+    # field that is no number is one that `filter_map` drops.
+    ns = fields.filter_map(number)
+    if ns.length() == fields.length() { Some(ns) } else { None }
   }
 }
 
+# The number in `field`, a field of the parameter bytes of a CSI sequence. `None` if it is empty,
+# holds a byte other than a digit, or is too large for an Int.
 fn number(field: String) -> Option[Int] {
   Some(Int.parse(field)) escape {
     ParseError(_) -> None
@@ -214,20 +229,17 @@ fn number(field: String) -> Option[Int] {
 }
 
 # FRICTION(017): there is no `?` on an Option, so the parts that can be missing are chained with
-# `and_then`.
+# `and_then` and `map`.
 # The key of the CSI sequence with the numbers `ns` and the final byte `f`, with Alt if `alt`.
 fn csi_key(ns: List[Int], f: Int, alt: Bool) -> Option[Key.Key] {
   (ns, f) match {
-    # `Key.key` makes a control character its representative: 9 is Tab, 8 and 127 are Backspace.
-    ([27, m, c], TILDE) -> held(Char(c), m, alt)
-    ([n], TILDE)        -> tilde(n).and_then(|code| pressed(code, NO_MODS, alt))
+    ([27, m, c], TILDE) -> typed(c, m, alt)
+    ([n], TILDE)        -> tilde(n).map(|code| pressed(code, NO_MODS, alt))
     ([n, m], TILDE)     -> tilde(n).and_then(|code| held(code, m, alt))
-    ([c, m], SMALL_U)   -> held(Char(c), m, alt)
-    ([], CAPITAL_Z)     -> pressed(Tab, SHIFT, alt)
-    ([1, m], CAPITAL_Z) -> modifiers(m).and_then(
-      |mods| pressed(Tab, Mods(shift: True, ..mods), alt),
-    )
-    ([], _)             -> cursor(f).and_then(|code| pressed(code, NO_MODS, alt))
+    ([c, m], SMALL_U)   -> typed(c, m, alt)
+    ([], CAPITAL_Z)     -> Some(pressed(Tab, SHIFT, alt))
+    ([1, m], CAPITAL_Z) -> modifiers(m).map(|mods| pressed(Tab, Mods(shift: True, ..mods), alt))
+    ([], _)             -> cursor(f).map(|code| pressed(code, NO_MODS, alt))
     ([1, m], _)         -> letter(f).and_then(|code| held(code, m, alt))
     _                   -> None
   }
@@ -298,24 +310,29 @@ fn modifiers(m: Int) -> Option[Mods] {
   }
 }
 
-# `code` with the modifiers of the xterm modifier number `m`, and with Alt if `alt`.
+# `code`, which is no `Char`, with the modifiers of the xterm modifier number `m`, and with Alt if
+# `alt`.
 fn held(code: KeyCode, m: Int, alt: Bool) -> Option[Key.Key] {
-  modifiers(m).and_then(|mods| pressed(code, mods, alt))
+  modifiers(m).map(|mods| pressed(code, mods, alt))
 }
 
-# `code` with `mods`, and with Alt if `alt`. `None` if `code` is a `Char` that is not a scalar
-# value.
-fn pressed(code: KeyCode, mods: Mods, alt: Bool) -> Option[Key.Key] {
-  Key.key(code, Mods(alt: mods.alt || alt, ..mods))
-}
-
-# The item of the `length` bytes at `at` of `b`: `found`, or the bytes as unknown if no key was
-# found.
-fn keyed(found: Option[Key.Key], b: Bytes, at: Int, length: Int) -> (Decoded, Int) {
-  found match {
-    Some(k) -> (Key(k), length)
-    None    -> (Unknown(b.slice(at, at + length)), length)
+# The key of the code `c` of `CSI 27;m;c~` and `CSI c;m u`, with the modifiers of the xterm
+# modifier number `m`, and with Alt if `alt`. `Key.key` makes a control character its
+# representative: 9 is Tab, 8 and 127 are Backspace. `None` if `c` is in the private use area
+# 0xE000 to 0xF8FF, where kitty numbers its own keys, or is not a scalar value.
+fn typed(c: Int, m: Int, alt: Bool) -> Option[Key.Key] {
+  if c >= 0xE000 && c <= 0xF8FF {
+    None
+  } else {
+    modifiers(m).and_then(|mods| Key.key(Char(c), Mods(alt: mods.alt || alt, ..mods)))
   }
+}
+
+# `code` with `mods`, and with Alt if `alt`. `code` is no `Char`, or a `Char` of a code point read
+# from UTF-8, so `Key.key` makes a key of it.
+fn pressed(code: KeyCode, mods: Mods, alt: Bool) -> Key.Key {
+  Key.key(code, Mods(alt: mods.alt || alt, ..mods))
+    |> expect("the code is no Char, or a Char of a code point read from UTF-8")
 }
 
 # The code point at `at` of `b` as a character, with Alt if `alt`, and the number of bytes it
@@ -323,7 +340,7 @@ fn keyed(found: Option[Key.Key], b: Bytes, at: Int, length: Int) -> (Decoded, In
 # unknown.
 fn character(b: Bytes, at: Int, alt: Bool) -> (Decoded, Int) {
   code_point(b, at, 1) match {
-    Some((c, length)) -> keyed(pressed(Char(c), NO_MODS, alt), b, at, length)
+    Some((c, length)) -> (Key(pressed(Char(c), NO_MODS, alt)), length)
     None -> {
       end = not_utf8_end(b, at + 1)
       (Unknown(b.slice(at, end)), end - at)
@@ -349,5 +366,13 @@ fn code_point(b: Bytes, at: Int, length: Int) -> Option[(Int, Int)] {
       Some(s) -> s.code_points().head().map(|c| (c, length))
       None    -> code_point(b, at, length + 1)
     }
+  }
+}
+
+# FRICTION(040): Option has no `expect`, so a None that cannot happen is a match with a panic.
+fn expect[A](opt: Option[A], why: String) -> A {
+  opt match {
+    Some(a) -> a
+    None    -> panic("None, but #{why}")
   }
 }

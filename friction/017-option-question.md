@@ -16,10 +16,10 @@
 - 回避策:
   - `braces`: 2 つの `?` を、それぞれ `Option.and_then` にした（closure が 2 段の入れ子、`FRICTION(017)` の印）
   - `hex_digits` と `hex_until_brace`: `hex_value(c) match { Some(d) -> 続ける; None -> None }` にした（`FRICTION(017)` の印）。`and_then` の closure の中の呼び出しは自分への末尾呼び出しにならない（`[fn.loop]`）ので、`\u{0000…0041}` のように長さに上限の無い繰り返しには使えない
-  - decode（`src/key/decode.emel` の `csi_key`、`FRICTION(017)` の印）: 腕ごとに `Option[Key.Key]` を返し、欠けうる部分を `and_then` でつないだ（`tilde(n).and_then(|code| held(code, m, alt))`、`modifiers(m).and_then(|mods| pressed(...))`）。修飾の番号から `Key` を作るまでを補助関数 `held(code, m, alt)` にまとめた。引数を読む所は `numbers(...).and_then(|ns| csi_key(ns, f, alt))`、F キーは `Key.f_key(n).map(...)`。closure の入れ子は 1 段まで
+  - decode（`src/key/decode.emel` の `csi_key`、`FRICTION(017)` の印）: 腕ごとに `Option[Key.Key]` を返し、欠けうる部分を `and_then` と `map` でつないだ（`tilde(n).and_then(|code| held(code, m, alt))`、`modifiers(m).map(|mods| pressed(...))`）。修飾の番号から `Key` を作るまでを補助関数 `held(code, m, alt)`（`Char` でない code）にまとめた。`27;m;c~` と `c;m u` の `c` は `typed(c, m, alt)` が読む。引数を読む所は `numbers(...).and_then(|ns| csi_key(ns, f, alt))`、F キーは `Key.f_key(n).map(...)`。closure の入れ子は 1 段まで
 - コスト:
   行数は wish とほぼ同じ（`None -> None` の腕が 2 つ増えた）。`braces` は closure の入れ子が 2 段になり、後半が右へずれる。上限の無い繰り返しでは `and_then` を選べず、match で書く必要がある。普段のコードに基盤レベルは漏れていない（`Option.or_fail` で error に変えて `escape` で受ける形は、ただの「読めなかった」に error を作ることになるので選ばなかった）
-  decode: wish では最後に 1 回だった `key(...)` の呼び出しが、腕ごとの `pressed` か `held` の呼び出しになった（9 つの腕のうち 8 つ）。補助関数 `held` を足した（3 行）。繰り返しではないので、`and_then` の closure が末尾呼び出しにならないこと（`[fn.loop]`）は効かない
+  decode: wish では最後に 1 回だった `key(...)` の呼び出しが、腕ごとの `pressed`、`held`、`typed` の呼び出しになった（9 つの腕のうち 8 つ）。補助関数 `held` を足した（3 行）。繰り返しではないので、`and_then` の closure が末尾呼び出しにならないこと（`[fn.loop]`）は効かない
 - spec:
   `[error.not]`（「There is no Result type, `?` operator, try / catch, or mapError. Conversion from an Option to a failure is written with an ordinary function such as `Option.or_fail(opt, NotFound(id:))`.」）、`[api.option]`（`and_then`、`or_fail`）、`[fn.loop]`、`spec/diagnostics.md` の E0105
 - 既存:

@@ -18,7 +18,7 @@
   wish check（v0.28.2）: ``error[E0213]: `Key` is defined more than once``。import の `Key` を指し、`Decoded` の `Key(Key)` に「`Key` is first defined here」の label が付く。help も note も付かない
   repo の外の使い捨ての Pome での最小の形（2026-11-27）: module `Thing` の `pub opaque type Thing(n: Int)` を `import Thing.{Thing}` し、同じファイルに `pub enum Wrapped { Thing(Thing)  Other }` を置くと、同じ E0213 の 1 つ。同じ import の後で `Thing(n: 1)` と書くと ``error[E0215]: cannot construct opaque `Thing` outside module `Thing` ``（``= help: `Thing` is opaque: use the functions of module `Thing` to make one``）になるので、import は、外では使えない構成子も名前空間に入れている。`import Thing` だけにして型を `Thing.Thing` と書くと、診断なしに通る
 - 回避策:
-  型 `Key` を import せず、`Key(Key.Key)` と module で修飾して書いた（`src/key/decode.emel` の `Decoded`、`FRICTION(042)` の印）。同じ module の関数の型も `Option[Key.Key]` と書く（`csi_key`、`held`、`pressed`、`keyed`）。`Key.key` と `Key.f_key` は、表記（`src/key/notation.emel`）と同じく module で修飾して呼ぶ
+  型 `Key` を import せず、`Key(Key.Key)` と module で修飾して書いた（`src/key/decode.emel` の `Decoded`、`FRICTION(042)` の印）。同じ module の関数の型も `Key.Key` と書く（`Option[Key.Key]` を返す `csi_key`、`held`、`typed` と、`Key.Key` を返す `pressed`）。`Key.key` と `Key.f_key` は、表記（`src/key/notation.emel`）と同じく module で修飾して呼ぶ
 - コスト:
   型を書く 5 か所が `Key.Key` になる。構成子の `Key(k)`、module の関数の `Key.key(...)`、型の `Key.Key` が同じファイルに並び、読む人が二度見する（030 の読みやすさのコストと同じ形）。consumer（overlay、テスト）も、`Decoded` の構成子 `Key` を import するなら、型の `Key` は import できない。普段のコードに基盤レベルは漏れていない
 - spec:

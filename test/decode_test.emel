@@ -60,6 +60,10 @@ fn decode_reads_esc_before_a_key_as_alt_with_that_key() {
   # `ESC [` and `ESC O` that end the bytes start no sequence.
   assert decoded("1b5b") == ["<M-[>"]
   assert decoded("1b4f") == ["<M-O>"]
+  # After another ESC they start no sequence either: that ESC is the key that the first one gives
+  # Alt.
+  assert decoded("1b1b5b") == ["<M-Esc>", "["]
+  assert decoded("1b1b4f") == ["<M-Esc>", "O"]
   assert decoded("1bff") == ["<Esc>", "unknown(ff)"]
 }
 
@@ -123,6 +127,8 @@ fn decode_reads_modify_other_keys_and_csi_u() {
   assert decoded("1b5b32373b323b3132377e") == ["<S-BS>"]
   assert decoded("1b5b32373b353b387e") == ["<C-BS>"]
   assert decoded("1b5b32373b333b3233337e") == ["<M-é>"]
+  # 63744, the first number after the private use area that kitty gives its keys.
+  assert decoded("1b5b36333734343b3575") == ["<C-\u{F900}>"]
 }
 
 @test
@@ -141,13 +147,21 @@ fn decode_keeps_each_sequence_it_cannot_read_as_unknown() {
   assert decoded("1b5b3f317561") == ["unknown(1b5b3f3175)", "a"]
   # `CSI 97:65;2u`: an extension of kitty, with `:`.
   assert decoded("1b5b39373a36353b3275") == ["unknown(1b5b39373a36353b3275)"]
-  # `CSI 57399 u`: a number in the private use area of kitty.
+  # `CSI 57399 u`: no `;m`. 57399 is also in the private use area that kitty gives its keys
+  # (57344 to 63743), whose numbers are unreadable in `CSI c;m u` and `CSI 27;m;c~`.
   assert decoded("1b5b353733393975") == ["unknown(1b5b353733393975)"]
+  assert decoded("1b5b35373339393b3575") == ["unknown(1b5b35373339393b3575)"]
+  assert decoded("1b5b32373b353b35373339397e") == ["unknown(1b5b32373b353b35373339397e)"]
+  assert decoded("1b5b35373334343b3575") == ["unknown(1b5b35373334343b3575)"]
+  assert decoded("1b5b36333734333b3575") == ["unknown(1b5b36333734333b3575)"]
   # Modifier number 9: a bit other than Shift, Alt and Ctrl.
   assert decoded("1b5b313b3941") == ["unknown(1b5b313b3941)"]
   # A sequence that the bytes end before its final byte.
   assert decoded("1b5b31") == ["unknown(1b5b31)"]
   assert decoded("611b5b313b") == ["a", "unknown(1b5b313b)"]
+  # A sequence that a byte outside the ranges of ECMA-48 cuts before its final byte. That byte
+  # starts the next item.
+  assert decoded("1b5b0d") == ["unknown(1b5b)", "<CR>"]
 }
 
 @test
