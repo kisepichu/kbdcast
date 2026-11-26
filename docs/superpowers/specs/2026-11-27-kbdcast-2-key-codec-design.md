@@ -34,10 +34,10 @@ root に最初の Pome を作る。
 |---|---|---|
 | `Pome.toml` | — | `github.com/kisepichu/kbdcast`。`emela` の欄は `mise.toml` で固定した版。依存はテストの brix だけ |
 | `src/lib.emel` | `Kbdcast`（library root） | library root として置く。2 では中身を持たない |
-| `src/key.emel` | `Key` | `Key`、`KeyCode`、`Mods`、`FKey`、`Decoded` |
+| `src/key.emel` | `Key` | `Key`、`KeyCode`、`Mods`、`FKey` |
 | `src/key/notation.emel` | `Key.Notation` | `parse`、`print`、`NotationError` |
 | `src/key/encode.emel` | `Key.Encode` | `InputModes`、`encode`、`Unencodable` |
-| `src/key/decode.emel` | `Key.Decode` | `decode` |
+| `src/key/decode.emel` | `Key.Decode` | `Decoded`、`decode` |
 | `test/` | — | 表記、encode、decode のテストと、生成した `key_golden.emel` |
 | `tools/termwiz-golden/` | — | 表を生成する Rust の harness |
 
@@ -51,7 +51,6 @@ pub enum KeyCode { Char(Int) | Enter | Esc | Tab | Backspace | Delete | Insert
                  | Up | Down | Left | Right | Home | End | PageUp | PageDown | F(FKey) }
 pub type Mods(ctrl: Bool, alt: Bool, shift: Bool, super: Bool)
 pub opaque type FKey                              # 1 から 12
-pub enum Decoded { Key(Key) | Paste(String) | Unknown(Bytes) }
 ```
 
 - `Char` は、Shift を効かせた後に出る文字の code point を持つ。空白と `<` も `Char` である。
@@ -94,11 +93,14 @@ pub fn print(k: Key) -> String
 pub type InputModes(cursor_keys: CursorKeys, newline: Newline, other_keys: OtherKeys)
 pub enum CursorKeys { Normal | Application }     # DECCKM（CSI ? 1 h / l）
 pub enum Newline { Cr | CrLf }                   # LNM（CSI 20 h / l）
-pub enum OtherKeys { Off | Level1 | Level2 }     # modifyOtherKeys（CSI > 4 ; n m）
+pub enum Level { One | Two }
+pub enum OtherKeys { Off | On(Level) }          # modifyOtherKeys（CSI > 4 ; n m）
 pub error Unencodable(key: Key, reason: Reason)
-pub enum Reason { NeedsOtherKeys(level) | NeedsKitty }   # level は Level1 か Level2 だけ
+pub enum Reason { NeedsOtherKeys(Level) | NeedsKitty }
 pub fn encode(key: Key, modes: InputModes) -> Bytes fails Unencodable
 ```
+
+以下、`On(One)` を Level1、`On(Two)` を Level2 と書く。`Level` を分けたのは、`NeedsOtherKeys` に Off を入れられないようにするため。構成子の名前は module の中で 1 つの名前空間にある（friction 030）ので、`Level1` という構成子を 2 つの enum に置くことはできない。
 
 - 既定の mode は `Normal`、`Cr`、`Off`。mode を保つのは VT（3）で、encoder は読むだけ。
 - `encode` は termwiz 0.22.0 の `KeyCode::encode`（`KeyboardEncoding::Xterm`）と同じ bytes を出す。ただし、出る bytes を decode すると代表に戻らないキーは `Unencodable` にする。
@@ -140,8 +142,11 @@ pub fn encode(key: Key, modes: InputModes) -> Bytes fails Unencodable
 ## 7. decode
 
 ```emela
+pub enum Decoded { Key(Key) | Paste(String) | Unknown(Bytes) }
 pub fn decode(b: Bytes) -> List[Decoded]
 ```
+
+`Decoded` を `key.emel` でなくここに置くのは、`Key` の record の構成子 `Key` と、`Decoded` の構成子 `Key` が同じ module で重なるため（friction 030）。
 
 失敗しない。1 つの `i` イベントの bytes を、前から次の順に読む。イベントの間で状態を持たない。
 
@@ -175,7 +180,7 @@ pub fn decode(b: Bytes) -> List[Decoded]
 
 golden の表:
 
-- 行は、キー 121 個 × Ctrl、Alt、Shift の組 8 通り × mode 12 通り（DECCKM 2 × LNM 2 × modifyOtherKeys 3）で、約 11,600 行。キーは、ASCII の印字できる文字 95 個（空白を含む）、特殊キー 14 個、F1〜F12。
+- 行は、キー 124 個 × Ctrl、Alt、Shift の組 8 通り（992 行）で、各行に mode 12 通り（DECCKM 2 × LNM 2 × modifyOtherKeys 3）の bytes を持つ。全部で 11,904 通り。キーは、ASCII の印字できる文字 95 個（空白を含む）、ASCII でない文字 3 個（`é`、`あ`、`😀`。UTF-8 で 2、3、4 byte）、特殊キー 14 個、F1〜F12。
 - harness は、termwiz の `KeyCode::Char(c)` などと `Modifiers` をそのまま渡し、正規化は termwiz に任せる。test の側は同じ入力から `Key` を作るので、正規化の規則（§4）も表で確かめられる。
 - termwiz は `=0.22.0` に固定し、`Cargo.lock` を commit する。0.22.0 と main（0.24.0）の `encode` の差は F13〜F24 だけで、`csi_u_encode`、`ctrl_mapping`、`encode_xterm` は同じ（2026-11-27 に確かめた）。
 - 真似るのは WezTerm の端末の層（`term/src/terminalstate/keyboard.rs` が termwiz の `encode` を呼ぶ所）だけ。GUI の層が物理キーを `KeyCode` にする部分（Windows の AltGr など）は扱わない。
@@ -205,6 +210,6 @@ golden の表:
 
 ## 12. リスク
 
-- 約 11,600 行の表を Emela のソースにすると、compile や `emela fmt` が遅くなるかもしれない。遅ければ、キーと修飾ごとに 12 の mode の bytes を 1 行にまとめる（約 970 行）か、mode ごとにファイルを分ける。
+- 表を Emela のソースにすると、compile や `emela fmt` が遅くなるかもしれない。→ 試作で確かめた。ASCII でない文字を足す前の 968 行（fmt の後 14,327 行）の表で、`emela fmt --check`、`emela check`、`emela test` はどれも 0.3 秒以内。
 - termwiz の細部が §6 の表と違うかもしれない。golden が正なので、違いは表に合わせて §6 を直す。
 - 手で録った入力（ConPTY と tmux を通ったもの）は golden に入っていないので、読めない列が `Unknown` になるかもしれない。4 で実際の cast を通すときに見る。
