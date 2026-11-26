@@ -31,12 +31,12 @@
   - `prog.enclosing[g]`: 設計を変え（量指定子に番号を振らず、消す group の範囲で名指す）、その表が無くなった
   テスト（`regex/test/linear_test.emel`）:
   - 中央値: `(Assert.some(sorted.get(4)) + Assert.some(sorted.get(5))) / 2`（`FRICTION(009)` の印）。`sorted` は 10 回の時間を `List.sort` したもので、4 と 5 は範囲内なので `None` は起きない。brix の `Assert.some` が `None` で panic する match を持つので、起きない分岐は自分では書いていない。読むのは Array ではなく List なので `Array.at` の提案の直接の例にはならないが、範囲内と分かっている位置を読むのに Option が返る形は同じ
-  encode（`src/key/encode.emel` の `function`、`FRICTION(009)` の印）: List を位置で読まず、F キーの番号ごとの match の腕にした（F1〜F4 の 4 つの腕が `f1_to_f4("P", m)` などを呼び、F5、F11、F12 は番号の腕、F6〜F10 は guard の腕（038））。`List.get` と起きない `None` の panic（040）を書くより、腕の方が短い。decode の `tilde` と `letter`（015、038）が逆向きの対応を同じ形で書いている
+  encode（`src/key/encode.emel` の `function`、`FRICTION(009)` の印）: List を位置で読まず、F キーの番号ごとの match の腕にした（F1〜F4 の 4 つの腕が `f1_to_f4("P", m)` などを呼び、F5 と F11 は番号の腕、F6〜F10 は guard の腕（038）、F12 は `_` の腕）。`List.get` と起きない `None` の panic（040）を書くより、腕の方が短い。decode の `tilde` と `letter`（015、038）が逆向きの対応を同じ形で書いている
 - コスト:
   起きない分岐 1 つ（3 行）。普段のコードに基盤レベルは漏れていない。std も同じ形を書いている: `Std.Array` の `bisect` と `binary_search`（`crates/emela-core/lib/std/array.emel:154-174`）は、範囲内と分かっている `get(a, mid)` の `None` を `_` の腕に混ぜる。`proposals/array.md:76` の例は `Array.get(counts, b) |> Option.or(0)` で既定値にする
   class でも vm でも、起きない分岐 1 つ（印のコメントを含めて 3 行）
   テストでは、`Assert.some(...)` で包むだけで式の行は増えない（印のコメント 1 行と、`Assert` のための `import Brix.Assert` 1 行）
-  encode では、2 つの List の literal と 2 つの添字の代わりに、9 つの腕と 3 行の `f1_to_f4`
+  encode では、2 つの List の literal と 2 つの添字の代わりに、8 つの腕と 3 行の `f1_to_f4`
 - spec:
   `[api.std.array]`（`get` は範囲外で `None`、`set` は範囲外で defect）、`[api.list]`（テストの List の所。`List.get` も範囲外と負の位置で `None`）、`[lib.api-rules]`（「Not found, or out of range: return an Option」と「A precondition of the caller is broken: it is a defect」）、`proposals/array.md:100`（読み出しの範囲外は not found、書き込みの範囲外は defect）と `:226`（`set` を Option にしなかった理由）、`[grammar.expr]`
 - 既存:

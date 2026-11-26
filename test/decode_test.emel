@@ -127,6 +127,10 @@ fn decode_reads_modify_other_keys_and_csi_u() {
   assert decoded("1b5b32373b323b3132377e") == ["<S-BS>"]
   assert decoded("1b5b32373b353b387e") == ["<C-BS>"]
   assert decoded("1b5b32373b333b3233337e") == ["<M-é>"]
+  # `CSI 27;m;c~` reads a `c` in the private use area that kitty gives its keys as the character,
+  # as it reads any other scalar value: in modifyOtherKeys, termwiz sends Ctrl or Alt with such a
+  # character so.
+  assert decoded("1b5b32373b353b35373339397e") == ["<C-\u{E037}>"]
   # 63744, the first number after the private use area that kitty gives its keys.
   assert decoded("1b5b36333734343b3575") == ["<C-\u{F900}>"]
 }
@@ -148,10 +152,9 @@ fn decode_keeps_each_sequence_it_cannot_read_as_unknown() {
   # `CSI 97:65;2u`: an extension of kitty, with `:`.
   assert decoded("1b5b39373a36353b3275") == ["unknown(1b5b39373a36353b3275)"]
   # `CSI 57399 u`: no `;m`. 57399 is also in the private use area that kitty gives its keys
-  # (57344 to 63743), whose numbers are unreadable in `CSI c;m u` and `CSI 27;m;c~`.
+  # (57344 to 63743), whose numbers are unreadable in `CSI c;m u`.
   assert decoded("1b5b353733393975") == ["unknown(1b5b353733393975)"]
   assert decoded("1b5b35373339393b3575") == ["unknown(1b5b35373339393b3575)"]
-  assert decoded("1b5b32373b353b35373339397e") == ["unknown(1b5b32373b353b35373339397e)"]
   assert decoded("1b5b35373334343b3575") == ["unknown(1b5b35373334343b3575)"]
   assert decoded("1b5b36333734333b3575") == ["unknown(1b5b36333734333b3575)"]
   # Modifier number 9: a bit other than Shift, Alt and Ctrl.

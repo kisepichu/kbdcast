@@ -27,9 +27,10 @@
   選ばなかった候補:
   - `derive Eq` だけにする: 警告は消えるが、失敗した assert が値を出さない
   - `pub type` にする: spec の言うとおり `pub` の型には W0303 が出ないが、他のモジュールから使わせるつもりの無いテストの型に `pub` を書くことになる
-  encode のテスト（`test/encode_test.emel` と `test/golden_test.emel` の `outcome`、どちらも `FRICTION(023)` の印）: enum をやめ、String にした。送った bytes は 16 進（`"1b5b41"`）、送れない理由は `Reason`（`pub` の enum で、導出した Show を持つ）を補間で書いたもの（`"#{reason}"`、`"NeedsOtherKeys(One)"`）。16 進の数字と `Needs` で始まる名前は重ならないので、区別は失われない。期待値は `"NeedsOtherKeys(One)"` と書く。golden のテストの表の側（`expected`）も、`"#{NeedsOtherKeys(level)}"` と `Reason` の値から作る
+  encode のテスト（`test/golden.emel` の `pub fn outcome`、`FRICTION(023)` の印。Task 6 では `test/encode_test.emel` と `test/golden_test.emel` に同じ private な `outcome` を 1 つずつ置いていた。review の後の fix で、manager の決定により `Golden` の `pub fn outcome(k, modes) -> String` に 1 つにまとめ、2 つのテストが呼ぶ）: enum をやめ、String にした。送った bytes は 16 進（`"1b5b41"`）、送れない理由は `Reason`（`pub` の enum で、導出した Show を持つ）を補間で書いたもの（`"#{reason}"`、`"NeedsOtherKeys(One)"`）。16 進の数字と `Needs` で始まる名前は重ならないので、区別は失われない。期待値は `"NeedsOtherKeys(One)"` と書く。golden のテストの表の側（`expected`）も、`"#{NeedsOtherKeys(level)}"` と `Reason` の値から作る
+  fix の後は、結果の型を `Golden` の `pub enum` にすれば W0303 は出ず、2 つのテストのモジュールがその型を使うので、上の「選ばなかった候補」の `pub type` の理由（他のモジュールから使わせるつもりが無い）も当たらない。String のままにしたのは、manager が決めた `outcome` の型（`-> String`）に従ったため。`Golden` に公開の名前（型と 2 つの構成子）を足すかどうかは、manager に返した
 - コスト: 期待値の 4 つの欄に名前が付かない（順序は `find` のコメントに書いた）。行数は同じ。普段のコードに基盤レベルは漏れていない
-  encode のテストでは、期待値の 2 つの形（bytes と理由）が型で分かれず、理由の綴りの誤りは型の検査でなくテストの失敗で分かる。find のテストのように組にすることはできない（欄の並びでなく、2 つの場合の和なので）。補間で作る所が 4 つ（2 つのファイルの `outcome` と、`expected` の 2 つの腕）。行数は同じ
+  encode のテストでは、期待値の 2 つの形（bytes と理由）が型で分かれず、理由の綴りの誤りは型の検査でなくテストの失敗で分かる。find のテストのように組にすることはできない（欄の並びでなく、2 つの場合の和なので）。補間で作る所が 3 つ（`Golden.outcome` と、`expected` の 2 つの腕。fix の前は `outcome` が 2 つのファイルにあって 4 つ）。行数は同じ
 - spec:
   `[trait.derive]`（`spec/language/10-traits.md:110`: 「The display of dbg and assert (10.6) does not require it, so it is not counted. For a `pub` type, other modules can use it, so the warning is not reported.」）、`[test.assert]`（「if the types of both sides of the comparison satisfy Show, the values of both sides follow」）、`spec/diagnostics.md` の W0303、`spec/history.md:283`（2026-10-20 に、main やテストに届いた error の表示に使う Show を同じ理由で W0303 から外した）
 - 既存:

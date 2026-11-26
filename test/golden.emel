@@ -1,4 +1,5 @@
-# The keys and modes of the golden table (`key_golden.emel`), for the tests of decode and encode.
+# The keys and modes of the golden table (`key_golden.emel`), and what encode does with a key, for
+# the tests of decode and encode.
 
 import Key.{
   Key,
@@ -21,7 +22,19 @@ import Key.{
   PageDown,
   Function,
 }
-import Key.Encode.{InputModes, OtherKeys, Normal, Application, Cr, CrLf, Off, On, One, Two}
+import Key.Encode.{
+  InputModes,
+  OtherKeys,
+  Unencodable,
+  Normal,
+  Application,
+  Cr,
+  CrLf,
+  Off,
+  On,
+  One,
+  Two,
+}
 import Key.Notation.{NotationError}
 
 ## The key of a row of `KeyGolden.ROWS`, made by `Key.key` from what tools/termwiz-golden gave
@@ -113,6 +126,19 @@ pub fn representative(k: Key, other_keys: OtherKeys) -> Key {
   }
 }
 
+# FRICTION(023): W0303 warns that the derived Show of a private type in a test is never used, when
+# only a failed assert shows it, so what encode does is a String, not an enum of the two cases.
+## What `encode` does with `k` in `modes`: the bytes it sends in hexadecimal, or the reason it
+## cannot send `k` as Show writes it (`NeedsOtherKeys(One)`). The Unencodable holds `k`.
+pub fn outcome(k: Key, modes: InputModes) -> String {
+  Encode.encode(k, modes).to_hex() escape {
+    Unencodable(key:, reason:) -> {
+      assert key == k
+      "#{reason}"
+    }
+  }
+}
+
 # The keys that send the same control character as another key in modifyOtherKeys off and level
 # 1, each with that key, their representative (the table of spec §6). In each string the
 # representative comes first.
@@ -129,7 +155,7 @@ const SAME_CONTROL_CHARACTER: List[(Key, Key)] = [
 ].flat_map(|group| {
   parsed(group) match {
     [rep, ..members] -> members.map(|member| (member, rep))
-    []               -> []
+    []               -> panic("parse reads no key from #{inspect(group)}")
   }
 })
 

@@ -1,8 +1,5 @@
 import Brix.Pbt.Gen
 import Brix.Pbt.Property.{Config}
-# FRICTION(042): importing the variant `Key` of Decoded keeps the type `Key` from being imported,
-# so the type is written through its module.
-import Key
 import Key.Decode.{Key}
 import Key.Encode.{InputModes, Unencodable, DEFAULT_MODES, Application, CrLf, On, One, Two}
 import Key.Notation.{NotationError}
@@ -18,21 +15,8 @@ const CRLF: InputModes = InputModes(newline: CrLf, ..DEFAULT_MODES)
 # What `encode` does in `modes` with the one key that `parse` reads from `s`.
 fn encoded(s: String, modes: InputModes) -> String fails NotationError {
   Notation.parse(s) match {
-    [k]  -> outcome(k, modes)
+    [k]  -> Golden.outcome(k, modes)
     keys -> panic("#{inspect(s)} is not one key but #{keys}")
-  }
-}
-
-# FRICTION(023): W0303 warns that the derived Show of a private type in a test is never used, when
-# only a failed assert shows it, so what encode does is a String, not an enum of the two cases.
-# What `encode` does with `k` in `modes`: the bytes it sends in hexadecimal, or the reason it
-# cannot send `k` as Show writes it (`NeedsOtherKeys(One)`). The Unencodable holds `k`.
-fn outcome(k: Key.Key, modes: InputModes) -> String {
-  Encode.encode(k, modes).to_hex() escape {
-    Unencodable(key:, reason:) -> {
-      assert key == k
-      "#{reason}"
-    }
   }
 }
 
@@ -53,8 +37,7 @@ fn encode_sends_ctrl_with_a_character_as_a_control_character_or_in_modify_other_
 }
 
 @test
-fn encode_needs_modify_other_keys_for_ctrl_with_a_character_that_has_no_control_character_of_its_own(
-) {
+fn encode_needs_modify_other_keys_when_the_control_character_would_drop_a_modifier() {
   # Ctrl with a capital letter is Ctrl and Shift.
   assert encoded("<C-S-a>", DEFAULT_MODES) == "NeedsOtherKeys(One)"
   assert encoded("<C-S-a>", LEVEL1) == "1b5b32373b353b36357e"
@@ -134,7 +117,7 @@ fn encode_needs_kitty_for_super_in_every_mode() {
 @test
 fn decode_reads_what_encode_sends_as_the_representative_of_the_key() {
   Property.check_with(
-    Gen.pair(KeyGen.keys(), KeyGen.modes()),
+    Gen.pair(KeyGen.keys_without_super(), KeyGen.modes()),
     Config(cases: 2000, ..Property.config()),
     |(k, m)| {
       sent = Some(Encode.encode(k, m)) escape {

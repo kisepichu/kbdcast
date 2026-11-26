@@ -77,7 +77,8 @@ const SHIFT: Mods = Mods(shift: True, ..NO_MODS)
 ##    sequence is unknown, and so is one whose modifier number holds a bit other than Shift, Alt
 ##    and Ctrl. So a `CSI u` with an extension of kitty is unknown: values after `:` (such as an
 ##    event type), or a `c` in the private use area 0xE000 to 0xF8FF, where kitty numbers its
-##    own keys (such a `c` makes `27;m;c~` unknown too). If `b` ends before the final byte, the
+##    own keys. In `27;m;c~` such a `c` is a character like any other, since modifyOtherKeys
+##    sends a character of that area with modifiers so. If `b` ends before the final byte, the
 ##    bytes from `ESC [` are unknown. If a byte outside the three ranges comes before the final
 ##    byte, the bytes from `ESC [` up to it are unknown, and that byte starts the next item.
 ## 3. `ESC O` before one of `A B C D H F P Q R S` is SS3 (a cursor key, Home, End, F1 to F4).
@@ -236,7 +237,8 @@ fn csi_key(ns: List[Int], f: Int, alt: Bool) -> Option[Key.Key] {
     ([27, m, c], TILDE) -> typed(c, m, alt)
     ([n], TILDE)        -> tilde(n).map(|code| pressed(code, NO_MODS, alt))
     ([n, m], TILDE)     -> tilde(n).and_then(|code| held(code, m, alt))
-    ([c, m], SMALL_U)   -> typed(c, m, alt)
+    # kitty numbers its own keys in the private use area 0xE000 to 0xF8FF.
+    ([c, m], SMALL_U)   -> if c >= 0xE000 && c <= 0xF8FF { None } else { typed(c, m, alt) }
     ([], CAPITAL_Z)     -> Some(pressed(Tab, SHIFT, alt))
     ([1, m], CAPITAL_Z) -> modifiers(m).map(|mods| pressed(Tab, Mods(shift: True, ..mods), alt))
     ([], _)             -> cursor(f).map(|code| pressed(code, NO_MODS, alt))
@@ -318,14 +320,9 @@ fn held(code: KeyCode, m: Int, alt: Bool) -> Option[Key.Key] {
 
 # The key of the code `c` of `CSI 27;m;c~` and `CSI c;m u`, with the modifiers of the xterm
 # modifier number `m`, and with Alt if `alt`. `Key.key` makes a control character its
-# representative: 9 is Tab, 8 and 127 are Backspace. `None` if `c` is in the private use area
-# 0xE000 to 0xF8FF, where kitty numbers its own keys, or is not a scalar value.
+# representative: 9 is Tab, 8 and 127 are Backspace. `None` if `c` is not a scalar value.
 fn typed(c: Int, m: Int, alt: Bool) -> Option[Key.Key] {
-  if c >= 0xE000 && c <= 0xF8FF {
-    None
-  } else {
-    modifiers(m).and_then(|mods| Key.key(Char(c), Mods(alt: mods.alt || alt, ..mods)))
-  }
+  modifiers(m).and_then(|mods| Key.key(Char(c), Mods(alt: mods.alt || alt, ..mods)))
 }
 
 # `code` with `mods`, and with Alt if `alt`. `code` is no `Char`, or a `Char` of a code point read

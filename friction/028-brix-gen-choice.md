@@ -28,6 +28,17 @@
   ```
   key codec のキーの生成器（`test/key_gen.emel`、サブプロジェクト 2 の計画の Task 3。テストの補助なので wish は書いていない）: 候補の List から選ぶ `element` を、`Gen.int_between(0, n - 1)` で引いた位置を `Gen.map` の中で `List.get` で読む形にした（`get` の起きない `None` は 040 の `expect`）。regex の生成器は別の Pome の `test/` にあって使えず、ここでは選んだ後に生成器を作り直す必要が無いので、`and_then` を通さない短い形にした。修飾の 4 つは `bool`（`Gen.int_between(0, 1)` を `n == 1` に写す）を `Gen.pair` で重ねた。印は先頭のコメントと、`element` と `bool` の直前のコメントの行の `FRICTION(028)`
   input modes の生成器（`test/key_gen.emel` の `modes`、サブプロジェクト 2 の計画の Task 6。テストの補助なので wish は書いていない）: DECCKM、LNM、modifyOtherKeys の状態を、同じ `element` で候補の List（`[Normal, Application]`、`[Cr, CrLf]`、`[Off, On(One), On(Two)]`）から選び、`Gen.pair` で重ねた。新しい補助関数は要らなかった
+  キーの文字を広げた所（`test/key_gen.emel` の `code`、Task 6 の review の後の fix。テストの補助なので wish は書いていない。印は `code` の直前のコメントの行の `FRICTION(028)` と、先頭のコメントに足した「生成器から選ぶ `one_of`、`frequency` が無い」）: manager の決定で、今の候補（`codes()`）に、scalar value の 4 つの範囲（BMP の surrogate より下の 0x80〜0xD7FF と上の 0xE000〜0xFFFF、私用領域 0xE000〜0xF8FF、補助面 0x10000〜0x10FFFF）を混ぜた。5 つの生成器から 1 つを選ぶ `one_of`／`frequency` が無いので、5 つの生成器のすべてから値を 1 つずつ引き、`Gen.int_between(0, 7)` で引いた `choice` の値で 1 つを選ぶ形にした（`Gen.pair` を 3 段重ね、`Gen.map` の中の match で選ぶ）。`and_then` を Gen の内部で書かずに済み、縮みは `choice` を 0（`codes()`）へ縮めるのと、それぞれの値を範囲の端へ縮めるのになる
+  ```emela
+  Gen.pair(
+    Gen.pair(Gen.int_between(0, 7), element(codes())),
+    Gen.pair(
+      Gen.pair(Gen.int_between(0x80, 0xD7FF), Gen.int_between(0xE000, 0xFFFF)),
+      Gen.pair(Gen.int_between(0xE000, 0xF8FF), Gen.int_between(0x10000, 0x10FFFF)),
+    ),
+  )
+    |> Gen.map(|((choice, listed), ((below, above), (private_use, supplementary)))| { choice match { ... } })
+  ```
 - コスト:
   - 行数: 生成器のモジュール 288 行のうち 74 行（コメントを含む。`and_then` と、その木を作る `bound`、`frequency` と `pick`、`one_of`、`element`、`option`、`list_between` と `copies`）
   - テストの側が brix の内部の表し方（`Tree` の子を遅延で作る closure、seed を返して次へ渡す形、`Gen.sample` の size の範囲）に依存する。brix がそれを変えると壊れる
@@ -36,6 +47,7 @@
   - 普段のコードに基盤レベルのキーワードが漏れた。`regex/test/pattern_gen.emel:222`（`and_then`）と `:235`（`bound`）は、引数 `f` の closure の型に `fails {} uses {}` を書いている。brix は `Gen` と `Tree` の中身を、行の閉じた closure の型（`Gen[A](run: fn(Int, Int) -> (Tree[A], Int))`、`Tree[A](value: A, children: fn() -> List[Tree[A]])`）で持ち、`f` はその closure に捕まる。そのため brix の `Gen.map` の `f: fn(A) -> B fails {} uses {}` と同じく、失敗も effect も無いことを型に書く必要がある。lint は `test/` を見ないが、規則 2 では回り道に当たる。この 2 か所は `:219` と `:248` の `FRICTION(028)` の印の間（`and_then` と、その木を作る `bound`）にあり、印が覆う。brix が `and_then` を持てば、2 か所とも消える
   - キーの生成器（Task 3）: 補助関数 2 つ（`element` と `bool`、コメントを含めて 10 行）と `expect`（040）。偏りは同じで、157 個の候補のうち最初の空白と最後の F12 が多く出る（`int_between` が min と max を 8 回に 1 回ずつ出す）。`bool` は `False`（min と 0）が約 9/16 で出る。縮みは位置を 0 へ縮めるので、反例は空白の方へ縮む
   - input modes の生成器（Task 6）: 補助関数は増えない。偏りは同じで、modifyOtherKeys は Off が約 11/24、level 2 が約 8/24、level 1 が約 5/24 で出る（3 つの段階のどれも、2000 の例のうちに数百ずつ出る）
+  - キーの文字を広げた所（fix）: 補助関数は増えない（`code` は生成器そのもの）。選ばれない 4 つの値も毎回引き、捨てる。重みは `choice` の値の割り当てで決めるしかなく、`int_between(0, 7)` の偏り（0 が 21/64、7 が 13/64、ほかは 5/64 ずつ）を見込んで、0 と 5〜7 を `codes()`（44/64、約 11/16）、1〜4 を 4 つの範囲（5/64 ずつ）にした。範囲の端は、同じ偏りで min が約 1/4、max が約 1/8 で出る（私用領域なら 0xE000 と 0xF8FF。decode の境と同じ）。性質テストの 2000 例で数えると、`codes()` の外の文字は notation の性質で 617（31%）、encode の性質で 635（32%）。`frequency([(44, listed), (5, below), ...])` があれば、重みを数で書け、捨てる値も無い
 - spec:
   `[test]`（「Helpers for comparing values, generators and property testing are not in std. They are distributed as the Pome `github.com/emela-lang/brix`」）、brix v0.4.0 の README の Modules の表（`Brix.Pbt.Gen` は `int`、`int_between`、`constant`、`map`、`pair`、`list`、`sample`）と `src/pbt/gen.emel`
 - 既存:
