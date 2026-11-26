@@ -49,6 +49,9 @@ fn parse_reads_modifiers_in_any_case_and_order() {
   assert printed("<C-S-x>") == ["<C-S-x>"]
   assert printed("<S-C-x>") == ["<C-S-x>"]
   assert printed("<C-S-X>") == ["<C-S-x>"]
+  # Only an ASCII capital letter: `É` keeps its case, with Shift or without.
+  assert printed("<C-É>") == ["<C-É>"]
+  assert printed("<C-S-É>") == ["<C-S-É>"]
   assert printed("<M-x>") == ["<M-x>"]
   assert printed("<A-x>") == ["<M-x>"]
   assert printed("<M-X>") == ["<M-X>"]

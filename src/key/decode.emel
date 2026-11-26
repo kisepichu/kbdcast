@@ -79,8 +79,9 @@ const SHIFT: Mods = Mods(shift: True, ..NO_MODS)
 ##    event type), or a `c` in the private use area 0xE000 to 0xF8FF, where kitty numbers its
 ##    own keys. In `27;m;c~` such a `c` is a character like any other, since modifyOtherKeys
 ##    sends a character of that area with modifiers so. If `b` ends before the final byte, the
-##    bytes from `ESC [` are unknown. If a byte outside the three ranges comes before the final
-##    byte, the bytes from `ESC [` up to it are unknown, and that byte starts the next item.
+##    bytes from `ESC [` are unknown. If a byte that cannot continue the sequence comes before the
+##    final byte (a byte outside the three ranges, or a parameter byte after an intermediate
+##    byte), the bytes from `ESC [` up to it are unknown, and that byte starts the next item.
 ## 3. `ESC O` before one of `A B C D H F P Q R S` is SS3 (a cursor key, Home, End, F1 to F4).
 ## 4. `ESC` before a key is that key with Alt (`ESC a` is `<M-a>`, `ESC ESC` is `<M-Esc>`). The
 ##    key after the `ESC` is read by the other rules, not by this one: `ESC ESC [ A` is `<M-Up>`,
@@ -191,7 +192,8 @@ fn csi(b: Bytes, at: Int, rest: List[Int], alt: Bool) -> (Decoded, Int) {
         None    -> (Unknown(b.slice(at, at + length + 1)), length + 1)
       }
     }
-    # `b` ends, or a byte that no sequence holds comes, before the final byte. That byte starts
+    # `b` ends, or a byte that cannot continue the sequence comes, before the final byte: a byte
+    # outside the three ranges, or a parameter byte after an intermediate byte. That byte starts
     # the next item.
     _ -> (Unknown(b.slice(at, at + length)), length)
   }
@@ -360,8 +362,12 @@ fn code_point(b: Bytes, at: Int, length: Int) -> Option[(Int, Int)] {
     None
   } else {
     b.slice(at, at + length).decode_utf8() match {
-      Some(s) -> s.code_points().head().map(|c| (c, length))
-      None    -> code_point(b, at, length + 1)
+      # FRICTION(040): `s`, decoded from 1 to 4 bytes, is not empty, so its first code point is
+      # never None.
+      Some(s) -> Some(
+        (s.code_points().head() |> expect("a String decoded from bytes is not empty"), length),
+      )
+      None -> code_point(b, at, length + 1)
     }
   }
 }

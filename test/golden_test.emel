@@ -1,8 +1,9 @@
 import Std.Bytes
+import Std.Set
 import Key.Decode.{Decoded, Key}
 import Key.Encode.{InputModes, OtherKeys, Level, Off, On, One, Two, NeedsOtherKeys, NeedsKitty}
 import KeyGolden.{ROWS}
-import Golden
+import Golden.{Outcome, Sent, Refused}
 
 # Each entry of the golden table: the name of the key, the modifier bits, the index of the mode,
 # the bytes that termwiz sends in hexadecimal, and what `decode` reads from them.
@@ -22,6 +23,10 @@ fn is_one_key(decoded: List[Decoded]) -> Bool {
 @test
 fn golden_has_the_bytes_of_12_modes_for_each_of_124_keys_with_8_modifier_combinations() {
   assert ROWS.length() == 992
+  # 992 distinct pairs of 124 names and the bits 0 to 7: each key with each combination once.
+  assert Set.from_list(ROWS.map(|(name, bits, _)| (name, bits))).size() == 992
+  assert Set.from_list(ROWS.map(|(name, _, _)| name)).size() == 124
+  assert ROWS.filter(|(_, bits, _)| bits < 0 || bits > 7) == []
   assert ROWS.filter(|(_, _, modes)| modes.length() != 12) == []
 }
 
@@ -45,8 +50,8 @@ fn encode_sends_what_termwiz_sends_exactly_when_decode_reads_it_as_the_represent
 
 # The entries of the golden table for which `encode` does not do what the table says (spec §8):
 # the name of the key, the modifier bits, the index of the mode, what the table says and what
-# `encode` does, each as `Golden.outcome` writes it.
-fn encode_differences() -> List[(String, Int, Int, String, String)] {
+# `encode` does.
+fn encode_differences() -> List[(String, Int, Int, Outcome, Outcome)] {
   ROWS.flat_map(|(name, bits, hexes)| {
     k = Golden.row_key(name, bits)
     row = hexes.enumerate().map(|(mode, hex)| {
@@ -61,22 +66,21 @@ fn encode_differences() -> List[(String, Int, Int, String, String)] {
   })
 }
 
-# What the golden table says `encode` does in `m` with the key of `row`, as `Golden.outcome` writes
-# it. `row` holds, for each mode of the row, its index, the modes, the bytes that termwiz sends in
-# it in hexadecimal, and whether decode reads them as the representative of the key. `encode`
-# sends those bytes if decode reads them so. If not, the reason is the lowest level of
-# modifyOtherKeys above that of `m` whose bytes decode reads so, with the other modes of `m` kept;
-# kitty if there is none.
-fn expected(m: InputModes, row: List[(Int, InputModes, String, Bool)]) -> String {
+# What the golden table says `encode` does in `m` with the key of `row`. `row` holds, for each mode
+# of the row, its index, the modes, the bytes that termwiz sends in it in hexadecimal, and whether
+# decode reads them as the representative of the key. `encode` sends those bytes if decode reads
+# them so. If not, the reason is the lowest level of modifyOtherKeys above that of `m` whose bytes
+# decode reads so, with the other modes of `m` kept; kitty if there is none.
+fn expected(m: InputModes, row: List[(Int, InputModes, String, Bool)]) -> Outcome {
   row.find(|(_, modes, _, represents)| modes == m && represents) match {
-    Some((_, _, hex, _)) -> hex
+    Some((_, _, hex, _)) -> Sent(hex)
     None -> raised(m.other_keys).find(|level| {
       row.any(
         |(_, modes, _, represents)| modes == InputModes(other_keys: On(level), ..m) && represents,
       )
     }) match {
-      Some(level) -> "#{NeedsOtherKeys(level)}"
-      None        -> "#{NeedsKitty}"
+      Some(level) -> Refused(NeedsOtherKeys(level))
+      None        -> Refused(NeedsKitty)
     }
   }
 }

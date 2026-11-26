@@ -26,6 +26,7 @@ import Key.Encode.{
   InputModes,
   OtherKeys,
   Unencodable,
+  Reason,
   Normal,
   Application,
   Cr,
@@ -126,15 +127,20 @@ pub fn representative(k: Key, other_keys: OtherKeys) -> Key {
   }
 }
 
-# FRICTION(023): W0303 warns that the derived Show of a private type in a test is never used, when
-# only a failed assert shows it, so what encode does is a String, not an enum of the two cases.
-## What `encode` does with `k` in `modes`: the bytes it sends in hexadecimal, or the reason it
-## cannot send `k` as Show writes it (`NeedsOtherKeys(One)`). The Unencodable holds `k`.
-pub fn outcome(k: Key, modes: InputModes) -> String {
-  Encode.encode(k, modes).to_hex() escape {
+## What `encode` does with a key.
+pub enum Outcome {
+  ## It sends the bytes written in hexadecimal.
+  Sent(String)
+  ## It cannot send the key, for the reason.
+  Refused(Reason)
+} derive Eq, Show
+
+## What `encode` does with `k` in `modes`. The Unencodable holds `k`.
+pub fn outcome(k: Key, modes: InputModes) -> Outcome {
+  Sent(Encode.encode(k, modes).to_hex()) escape {
     Unencodable(key:, reason:) -> {
       assert key == k
-      "#{reason}"
+      Refused(reason)
     }
   }
 }

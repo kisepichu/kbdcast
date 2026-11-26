@@ -19,12 +19,12 @@
   wish check（v0.28.2）では、前置の match（E0142）の行にあり、届かなかった
   repo の外の使い捨ての Pome での最小の形（`b.decode_utf8_char(0)`、`b` は Bytes、2026-11-27）: ``error[E0313]: type `Bytes` has no field or function `decode_utf8_char` ``。help は付かない
 - 回避策:
-  private な `code_point(b, at, length)` を書いた。offset `at` からの 1、2、3、4 byte を `Bytes.slice` で切って順に `Bytes.decode_utf8` にかけ、最初に `Some` になった長さを 1 つの code point の長さとする。code point は、できた 1 文字の String の `code_points().head()` で取り出す（`src/key/decode.emel` の `code_point`、`FRICTION(043)` の印）。短い列から試すので、最初に `Some` になった長さが 1 つの code point の長さになる（lead byte が ASCII でなければ、それより短い列は正しい UTF-8 にならない）
+  private な `code_point(b, at, length)` を書いた。offset `at` からの 1、2、3、4 byte を `Bytes.slice` で切って順に `Bytes.decode_utf8` にかけ、最初に `Some` になった長さを 1 つの code point の長さとする。code point は、できた 1 文字の String の `code_points().head()` で取り出す（`src/key/decode.emel` の `code_point`、`FRICTION(043)` の印。`head()` の起きない `None` は 040 の `expect` で defect にする）。短い列から試すので、最初に `Some` になった長さが 1 つの code point の長さになる（lead byte が ASCII でなければ、それより短い列は正しい UTF-8 にならない）
   UTF-8 の lead byte と continuation byte の規則は自分で書いていない（AGENTS.md 規則 2 の「UTF-8 を自前で読んだ」にはしていない）。使う UTF-8 の知識は、1 つの code point が 1〜4 byte であることだけ
 - コスト:
-  13 行。1 文字を読むのに `slice` と `decode_utf8` を最大 4 回呼び、成功すると 1 文字の String を作ってから code point の List に戻す。読めない byte では 4 回とも失敗する。読めない列の終わりを探す `not_utf8_end` は、offset ごとにこれを呼ぶ
+  17 行（コメントを含む。最終レビューの後の fix で、`head()` の起きない `None` を 040 の `expect` にし、その印のコメント 2 行と、fmt が折り返した 2 行が増えた。その前は 13 行）。1 文字を読むのに `slice` と `decode_utf8` を最大 4 回呼び、成功すると 1 文字の String を作ってから code point の List に戻す。読めない byte では 4 回とも失敗する。読めない列の終わりを探す `not_utf8_end` は、offset ごとにこれを呼ぶ
   std の `decode_utf8` の中には、知りたいことそのもの（offset から始まる正しい列の byte 数、無ければ 0）を返す private な `sequence_size(b, i, lead)` がある（v0.28.2 の `crates/emela-core/lib/std/bytes.emel:84-108`）
-  `head()` の `None`（1 文字の String なので起きない）は `map` でそのまま `None` に流れ、読めない byte として扱われる。普段のコードに基盤レベルは漏れていない
+  普段のコードに基盤レベルは漏れていない
 - spec: `[api.std.bytes]`（`decode_utf8` は全体を読むか `None` を返すだけで、位置や長さを返す関数は無い）、`[api.string]`（`code_points`）
 - 既存:
   `proposals/bytes.md`（#457、実装は #466）は、置き換え文字で読む `decode_utf8` を「Lossy decoding hides corrupted input; it can be written on top of the strict version later if needed.」として外した。その「上に書く」にも、どこまでが正しいかを返す関数か、1 つの code point を読む関数が要る。emela の issue と PR に無い（2026-11-27、`gh search issues --repo emela-lang/emela --include-prs` で「decode_utf8」「utf8 code point Bytes」を検索。当たったのは #457 と #466）

@@ -1,4 +1,6 @@
+import Brix.Pbt.Property.{Config}
 import Key.{KeyCode, Mods, NO_MODS, Char, Enter, Esc, Tab, Backspace, Up, Function}
+import KeyGen
 
 const SHIFT: Mods = Mods(shift: True, ..NO_MODS)
 const CTRL: Mods = Mods(ctrl: True, ..NO_MODS)
@@ -61,6 +63,13 @@ fn key_does_not_change_a_key_in_normal_form() {
   CASES.each(|((code, mods), _)| {
     k = Key.key(code, mods)
     assert k.and_then(|k| Key.key(k.code(), k.mods())) == k
+  })
+}
+
+@test
+fn key_does_not_change_any_key_in_normal_form() {
+  Property.check_with(KeyGen.keys(), Config(cases: 2000, ..Property.config()), |k| {
+    assert Key.key(k.code(), k.mods()) == Some(k)
   })
 }
 
