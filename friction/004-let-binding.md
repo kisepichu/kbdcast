@@ -14,6 +14,7 @@
   key codec の型の wish（`wish/key.emel:35`、サブプロジェクト 2 の計画の Task 2）でも、組を束ねる `let (rep, rep_mods) = control_representative(c)` を書いた
   key codec の表記の wish（`wish/notation.emel`、サブプロジェクト 2 の計画の Task 3）でも、12 行に `let` を書いた（`:43-44`、`:47`、`:59`、`:74`、`:122-123`、`:132`、`:142-145`）
   key codec の decode の wish（`wish/decode.emel`、サブプロジェクト 2 の計画の Task 4）でも、8 行に `let` を書いた（`:31`、`:56`、`:83-85`、`:96-97`、`:119`）
+  key codec の golden の補助の wish（`wish/golden.emel`、サブプロジェクト 2 の計画の Task 5）でも、2 行に `let` を書いた（`:8`、`:9`）
 - 診断:
   wish check（emela 0.28.2、`wish/text.emel:52-155`）。`let` の行ごとに 2 つ出る:
   - `let` に ``error[E0118]: expected expression``
@@ -34,7 +35,9 @@
   表記の wish（Task 3）では、届いた 9 行（`:43-44`、`:122-123`、`:132`、`:142-145`）に E0118 と E0122 が 1 つずつ（18）。束縛されなかった名前の E0211 が 6 続いた（`shape`、`mods` が 2、`m` が 3）。残りの 3 行（`:47`、`:59`、`:74`）は前置の match（E0142）の腕の中にあり、届かなかった
 
   decode の wish（Task 4）では、届いた 7 行に E0118 と E0122 が 1 つずつ（14）。束縛されなかった名前の E0211 が 7 続いた（`bits` が 3、`d`、`more`、`code`、`mods`）。残りの 1 行（`:56`）は前置の match（E0142）の腕の中にあり、届かなかった
-- 回避策: `let` を消して `start = Int.max(from, 0)` と書いた（`text/src/lib.emel` の `slice`）。regex の `regex/src/syntax.emel`、`regex/src/class.emel`、`regex/src/vm.emel`、`regex/src/lib.emel`、テストの `regex/test/pattern_gen.emel`、key の `src/key.emel`（`(rep_code, rep_mods) = representative(c)`）、表記の `src/key/notation.emel`、decode の `src/key/decode.emel` も同じく `let` を消した。正しい構文に直しただけなので、コードに印は付けない
+
+  golden の補助の wish（Task 5）では、2 行に E0118 と E0122 が 1 つずつ（4）。束縛されなかった名前の E0211 が 2 続いた（`code`、`mods`）。`:9` の `let` の右辺の前置の match の腕（`:10-25`）は読まれず、E0142 も、腕の中の 016、040、047 の誤りの診断も出なかった。11 の診断のうち 6 がこの 1 つの誤りから出ている
+- 回避策: `let` を消して `start = Int.max(from, 0)` と書いた（`text/src/lib.emel` の `slice`）。regex の `regex/src/syntax.emel`、`regex/src/class.emel`、`regex/src/vm.emel`、`regex/src/lib.emel`、テストの `regex/test/pattern_gen.emel`、key の `src/key.emel`（`(rep_code, rep_mods) = representative(c)`）、表記の `src/key/notation.emel`、decode の `src/key/decode.emel`、golden の補助の `test/golden.emel` も同じく `let` を消した。正しい構文に直しただけなので、コードに印は付けない
 - コスト:
   コードのコストは無い。直すには spec を引く必要があった。診断から分かるのは `let` が式として読めないことだけで、wish-first（AGENTS.md 規則 1）では spec を読む前に wish を書くので、そのときの手がかりは診断しかない。後に続く 4 つの E0211 は束縛の失敗の後追いで、wish の本当の診断（`String.from_scalars` の E0212、003）を埋もれさせる
 - spec:

@@ -1,0 +1,81 @@
+# The keys of the golden table (`key_golden.emel`), for the tests of decode and encode.
+
+import Key.{
+  Key,
+  KeyCode,
+  Mods,
+  Char,
+  Enter,
+  Esc,
+  Tab,
+  Backspace,
+  Delete,
+  Insert,
+  Up,
+  Down,
+  Left,
+  Right,
+  Home,
+  End,
+  PageUp,
+  PageDown,
+  Function,
+}
+
+## The key of a row of `KeyGolden.ROWS`, made by `Key.key` from what tools/termwiz-golden gave
+## termwiz: `name` is one character or the name of a special key, and `bits` the xterm modifier
+## bits (1 Shift, 2 Alt, 4 Ctrl). A defect if no key of the table has the name `name`.
+pub fn row_key(name: String, bits: Int) -> Key {
+  mods = Mods(
+    ctrl: bits.bit_and(4) != 0,
+    alt: bits.bit_and(2) != 0,
+    shift: bits.bit_and(1) != 0,
+    super: False,
+  )
+  # FRICTION(040): Option has no `expect`, so a None that cannot happen is a match with a panic.
+  code(name).and_then(|c| Key.key(c, mods)) match {
+    Some(k) -> k
+    None    -> panic("no key of the golden table is named #{inspect(name)}")
+  }
+}
+
+# What the key named `name` makes. `None` if no key of the table has that name.
+fn code(name: String) -> Option[KeyCode] {
+  name match {
+    "Enter"     -> Some(Enter)
+    "Esc"       -> Some(Esc)
+    "Tab"       -> Some(Tab)
+    "Backspace" -> Some(Backspace)
+    "Delete"    -> Some(Delete)
+    "Insert"    -> Some(Insert)
+    "Up"        -> Some(Up)
+    "Down"      -> Some(Down)
+    "Left"      -> Some(Left)
+    "Right"     -> Some(Right)
+    "Home"      -> Some(Home)
+    "End"       -> Some(End)
+    "PageUp"    -> Some(PageUp)
+    "PageDown"  -> Some(PageDown)
+    # FRICTION(016): there is no pattern that splits off the `F` of `F12`, so each name has an arm.
+    "F1"        -> function_key(1)
+    "F2"        -> function_key(2)
+    "F3"        -> function_key(3)
+    "F4"        -> function_key(4)
+    "F5"        -> function_key(5)
+    "F6"        -> function_key(6)
+    "F7"        -> function_key(7)
+    "F8"        -> function_key(8)
+    "F9"        -> function_key(9)
+    "F10"       -> function_key(10)
+    "F11"       -> function_key(11)
+    "F12"       -> function_key(12)
+    _ -> name.code_points() match {
+      [c] -> Some(Char(c))
+      _   -> None
+    }
+  }
+}
+
+fn function_key(n: Int) -> Option[KeyCode] {
+  Key.f_key(n).map(|f| Function(f))
+}

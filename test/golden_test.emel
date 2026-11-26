@@ -1,0 +1,38 @@
+import Std.Bytes
+import Key.Decode.{Decoded, Key}
+import KeyGolden.{ROWS}
+import Golden
+
+# Each entry of the golden table: the name of the key, the modifier bits, the index of the mode,
+# the bytes that termwiz sends in hexadecimal, and what `decode` reads from them.
+fn entries() -> List[(String, Int, Int, String, List[Decoded])] {
+  ROWS.flat_map(|(name, bits, modes)| {
+    modes.enumerate().map(|(mode, hex)| (name, bits, mode, hex, Decode.decode(Bytes.hex(hex))))
+  })
+}
+
+fn is_one_key(decoded: List[Decoded]) -> Bool {
+  decoded match {
+    [Key(_)] -> True
+    _        -> False
+  }
+}
+
+@test
+fn golden_has_the_bytes_of_12_modes_for_each_of_124_keys_with_8_modifier_combinations() {
+  assert ROWS.length() == 992
+  assert ROWS.filter(|(_, _, modes)| modes.length() != 12) == []
+}
+
+@test
+fn decode_reads_what_termwiz_sends_as_exactly_one_key() {
+  assert entries().filter(|(_, _, _, _, decoded)| !is_one_key(decoded)) == []
+}
+
+@test
+fn decode_reads_a_key_without_modifiers_back_as_itself_in_every_mode() {
+  assert entries().filter(
+    |(name, bits, _, _, decoded)| bits == 0 && decoded != [Key(Golden.row_key(name, 0))],
+  )
+    == []
+}
