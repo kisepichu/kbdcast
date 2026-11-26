@@ -121,7 +121,7 @@ sleep 1s
 - `>` の後の空白 1 つを区切りとし、その後ろを行末まで読む。2 つ目以降の空白は、空白のキーとして送る。キーが 1 つもない行はエラーにする。
 - vim の `:help key-notation` に合わせる。名前は大文字と小文字を区別しない。
   - 特殊キー: `<CR>`（別名 `<Enter>`、`<Return>`）、`<Esc>`、`<Tab>`、`<BS>`、`<Del>`、`<Space>`、`<Up>`、`<Down>`、`<Left>`、`<Right>`、`<Home>`、`<End>`、`<PageUp>`、`<PageDown>`、`<Insert>`、`<F1>` からの F キー、`<lt>`
-  - 修飾: `C-`、`M-`（別名 `A-`）、`S-`、`D-`（super）。重ねて書ける（`<C-S-x>`）
+  - 修飾: `C-`、`M-`（別名 `A-`）、`S-`、`D-`（super）。重ねて書ける（`<C-S-x>`）。super は kitty keyboard protocol を足すまで送れず、`Unencodable` になる（2 の spec §6）
 - 行末で Enter は送らない。mapping の右辺と同じく `<CR>` を明示する。
 - vim と違う点は 1 つ: `<`、英数字と `-` の並び、`>` という形なのに名前を知らないもの（`<Ecs>`）はエラーにする。この形にならない `<`（`a < b`）は文字として送る。
 - キー名の一覧と、修飾の組み合わせの規則（F キーの上限、`<S-a>` と `A` の関係など）は 2 の spec で決める。
@@ -203,7 +203,7 @@ opaque な型と構築関数の Emela での書き方は、R の段階で spec �
 | 型 | 中身 | 置き場所 |
 |---|---|---|
 | `Key(code, mods)` | `KeyCode` は `Char \| Enter \| Esc \| Tab \| ... \| F(n)` | 2 |
-| `InputModes` | `CursorKeys`、bracketed paste、kitty flags。VT が持ち、encoder が読む | 2 と 3 |
+| `InputModes` | `CursorKeys`（DECCKM）、LNM、modifyOtherKeys の段階。VT が持ち、encoder が読む（2 の spec §6） | 2 と 3 |
 | `encode(Key, InputModes) -> Bytes` | 今のモードで表せないキーは `fails Unencodable` | 2 |
 | `decode(Bytes) -> List[Decoded]` | `Decoded` は `Key \| Paste \| Unknown(Bytes)`。失敗しない | 2 |
 | `Terminal.feed(t, Bytes) -> (Terminal, List[Reply])` | UTF-8 のデコード、parser、screen の fold | 3 |
@@ -215,13 +215,13 @@ opaque な型と構築関数の Emela での書き方は、R の段階で spec �
 overlay に出すキーは、常に `i` イベントの bytes をデコードして作る。tape 由来と `asciinema rec --capture-input` 由来を同じ経路で扱うためである。
 
 - recorder は 1 キーを 1 つの `i` イベントにするので、単独の ESC か Alt の接頭かはイベントの切れ目で区別できる。
-- legacy の表現で区別できないもの（Tab と `<C-i>`、Enter と `<C-m>`、BS が 0x7f か 0x08 か）は、一般的な名前で表示する。
+- legacy の表現で区別できないもの（Tab と `<C-i>`、Enter と `<C-m>`、BS が 0x7f か 0x08 か）は、一般的な名前で表示する。名前（代表）の表は 2 の spec §6。
 
 ### 端末への返事
 
 crossterm などは起動時に、カーソル位置（`CSI 6n`）、DA1、kitty keyboard protocol の対応（`CSI ? u`）を端末に問い合わせ、返事を待って止まることがある。そのため `feed` は返事（`Reply`）も返し、recorder はそれを PTY に書き戻す。overlay は録画済みの cast を処理するだけなので、返事は捨てる。
 
-kitty の対応を「ある」と答えるとアプリが kitty flags を有効にし、それに合わせて encoder が CSI u を出すようになる。既定でどう答えるかは 3 の spec で決める。
+encoder は kitty keyboard protocol を扱わない（2 の spec §2。WezTerm の既定と同じ）ので、VT は kitty の問い合わせに「非対応」と答える。nvim などは、そのとき xterm の modifyOtherKeys を有効にする。kitty を足すときに、この答えを変える。
 
 ### cast
 
@@ -291,7 +291,7 @@ effect Driver {
 | 対象 | 主な手法 | 中身 |
 |---|---|---|
 | regex | 性質テスト + 差分テスト | 対応する範囲のパターンと文字列をランダムに作り、一致するかどうかを JS の RegExp と比べる。RegExp は `test/` の中で `@external` を通して正解役（oracle）として呼ぶだけで、製品のコードには入らない |
-| key codec | 性質テスト + golden | `parse(print(k)) == k`。モード m で表せる k について、`decode(encode(k, m))` が k の同値類に入る。golden の表は、WezTerm の上で `asciinema rec --capture-input` を使い、既知のキーを実際に打って作る |
+| key codec | 性質テスト + golden | `parse(print(k)) == [k]`。モード m で表せる k について、`decode(encode(k, m))` が k の代表に戻る。golden の表は、WezTerm が使う encoder（termwiz 0.22.0）を Rust の harness から呼んで生成する。手で打つと、Windows 版 WezTerm と WSL の間の ConPTY を通り、組み合わせも打ち切れないため（2 の spec §8） |
 | VT | 性質テスト + 差分テスト + golden | 入力をどこで分割しても結果が変わらない（`feed(feed(t, a), b) == feed(t, a ++ b)`）。UTF-8 やエスケープシーケンスの途中で切れる場合もまとめて検査できる。カーソルが画面の外に出ないことも見る。差分テストの参照は avt（agg が中で使う emulator）で、小さな Rust の harness でスナップショットを出す |
 | tape のパーサ | golden | パース結果と、エラーの行、列、文言 |
 | recorder | fake | `TestDriver` で、tape から操作の並び（キーを送る間隔を含む）を見る。`FakePty` と `TestClock` で、問い合わせへの返事、遅れて届く出力、途中での終了を決定的に再現する |
@@ -395,7 +395,7 @@ flowchart LR
 - Emela 0.29 で capture checking が既定になる予定（#666）。版を固定し、上げるときにメモを見直す。
 - JS ターゲットでは `Array.set` が常にコピーするので、VT の画面の更新が遅い可能性がある。3 で測る。
 - overlay が画面を描き直す出力は cast を大きくする。差分だけを出すかどうかは 4 で決める。
-- avt の harness のための Rust のビルド。3 で用意する。
+- Rust のビルド。2 の termwiz の harness で用意し（Rust の版は `mise.toml` で固定）、3 の avt の harness も同じ形で足す。
 
 ## 15. 決定の記録
 
@@ -411,3 +411,5 @@ flowchart LR
 | recorder の並行処理 | fiber 1 本で出力を読み続ける | 読み込み用の fiber と queue（状態を共有することになり、テストが決定的でなくなる） |
 | 順序 | 0、R、2、3、1、4 | recorder を先にする（`wait` を一度仮の意味で作り、後で意味を変えることになる） |
 | tools の言語 | Bun 上の TypeScript | Emela（Emela のコードより前に要り、そのときはまだ regex もない） |
+| key codec の encode | WezTerm の既定（普通のキー、DECCKM、LNM、modifyOtherKeys）を真似る。今の mode で表せないキーは `Unencodable` | kitty も扱う（flags の扱いが増え、golden に WezTerm の設定の変更が要る）、表せないキーは修飾を落として送る（書いた意図が黙って失われる） |
+| key codec の正解 | termwiz を Rust の harness から呼んで生成した表 | WezTerm で手で打って録る（ConPTY を通り、組み合わせを打ち切れない） |
