@@ -1,0 +1,2258 @@
+# wish-target: src/key/notation.emel
+
+## vim の表記と Key の間の変換。tape の `>` の行と overlay が使う。
+
+import Key.{Key, KeyCode, Mods, NO_MODS, f_key, Char, Enter, Esc, Tab, Backspace, Delete, Insert, Up, Down, Left, Right, Home, End, PageUp, PageDown, Function}
+
+## `offset` は入力の code point の offset で、問題のある `<` を指す。
+pub error NotationError(message: String, offset: Int)
+
+## `>` の行の内容を読む。
+pub fn parse(s: String) -> List[Key] fails NotationError {
+  parse_at(s.code_points(), 0)
+}
+
+## `<` の後ろの読み方は 3 通り。
+enum Angle {
+  Read(key: Key, length: Int)        # `>` までの code point の数
+  UnknownName(body: String)          # 英数字と `-` の並びと `>` だが、名前を知らない
+  DuplicateModifier(body: String)
+  NotAKey                            # `<` は文字
+}
+
+fn parse_at(cs: List[Int], offset: Int) -> List[Key] fails NotationError {
+  match cs {
+    [] => []
+    ['<', ..rest] => match angle(rest) {
+      Read(k, length) => [k, ..parse_at(rest.drop(length), offset + 1 + length)]
+      UnknownName(body) => fail NotationError("unknown key name: <${body}>", offset)
+      DuplicateModifier(body) => fail NotationError("duplicate modifier in <${body}>", offset)
+      NotAKey => [char_key('<'), ..parse_at(rest, offset + 1)]
+    }
+    [c, ..rest] => [char_key(c), ..parse_at(rest, offset + 1)]
+  }
+}
+
+## String の code point は scalar value なので、key は失敗しない。
+fn char_key(c: Int) -> Key {
+  Key.key(Char(c), NO_MODS).expect("a String holds only scalar values")
+}
+
+## `<` の後ろ（`cs`）を読む。修飾は前から貪欲に取る。
+fn angle(cs: List[Int]) -> Angle {
+  let (mods, rest) = modifiers(cs)
+  let shape = match rest {
+    [c, '>', ..] if !mods.is_empty() => Some((Char(c), mods.length() * 2 + 2))
+    _ => {
+      let name = rest.take_while(is_name_char)
+      match rest.drop(name.length()) {
+        ['>', ..] => named(String.from_code_points(name)).map(|code| (code, mods.length() * 2 + name.length() + 1))
+        _ => None
+      }
+    }
+  }
+  match shape {
+    Some((code, length)) if mods.has_duplicates() =>
+      DuplicateModifier(String.from_code_points(cs.take(length - 1)))
+    Some((code, length)) => Read(build(code, mods), length)
+    None => {
+      let body = cs.take_while(|c| is_name_char(c) || c == '-')
+      match cs.drop(body.length()) {
+        ['>', ..] if !body.is_empty() => UnknownName(String.from_code_points(body))
+        _ => NotAKey
+      }
+    }
+  }
+}
+
+enum Modifier { Ctrl | Alt | Shift | Super }
+
+fn modifiers(cs: List[Int]) -> (List[Modifier], List[Int]) {
+  match cs {
+    [m, '-', ..rest] => match modifier(m) {
+      Some(mod) => {
+        let (mods, after) = modifiers(rest)
+        ([mod, ..mods], after)
+      }
+      None => ([], cs)
+    }
+    _ => ([], cs)
+  }
+}
+
+fn modifier(c: Int) -> Option[Modifier] {
+  match c.to_ascii_lowercase() {
+    'c' => Some(Ctrl)
+    'm' | 'a' => Some(Alt)
+    's' => Some(Shift)
+    'd' => Some(Super)
+    _ => None
+  }
+}
+
+fn is_name_char(c: Int) -> Bool {
+  c.is_ascii_alphanumeric()
+}
+
+fn named(name: String) -> Option[KeyCode] {
+  match name.to_ascii_lowercase() {
+    "cr" | "enter" | "return" => Some(Enter)
+    "esc" => Some(Esc)
+    "tab" => Some(Tab)
+    "bs" => Some(Backspace)
+    "del" => Some(Delete)
+    "insert" => Some(Insert)
+    "up" => Some(Up)
+    "down" => Some(Down)
+    "left" => Some(Left)
+    "right" => Some(Right)
+    "home" => Some(Home)
+    "end" => Some(End)
+    "pageup" => Some(PageUp)
+    "pagedown" => Some(PageDown)
+    "space" => Some(Char(' '))
+    "lt" => Some(Char('<'))
+    "f" ++ n if !n.starts_with("0") => n.to_int().and_then(f_key).map(Function)
+    _ => None
+  }
+}
+
+## `<C-A>` は `<C-a>`（vim と同じ）。Ctrl があって Shift が無いときだけ、ASCII の英大文字を小文字にする。
+fn build(code: KeyCode, ms: List[Modifier]) -> Key {
+  let mods = Mods(ctrl: ms.contains(Ctrl), alt: ms.contains(Alt), shift: ms.contains(Shift), super: ms.contains(Super))
+  let code = match code {
+    Char(c) if mods.ctrl && !mods.shift && c.is_ascii_uppercase() => Char(c.to_ascii_lowercase())
+    _ => code
+  }
+  Key.key(code, mods).expect("names give only scalar values and F1 to F12")
+}
+
+## 正規の名前を出す。修飾の順は `C-M-S-D-`。
+pub fn print(k: Key) -> String {
+  let m = k.mods()
+  match k.code() {
+    Char(c) if m == NO_MODS && c != ' ' && c != '<' => String.from_code_point(c)
+    Char(c) if m.ctrl && c.is_ascii_uppercase() =>
+      bracket(Mods(..m, shift: true), String.from_code_point(c.to_ascii_lowercase()))
+    code => bracket(m, name(code))
+  }
+}
+
+fn bracket(m: Mods, name: String) -> String {
+  let c = if m.ctrl { "C-" } else { "" }
+  let a = if m.alt { "M-" } else { "" }
+  let s = if m.shift { "S-" } else { "" }
+  let d = if m.super { "D-" } else { "" }
+  "<${c}${a}${s}${d}${name}>"
+}
+
+fn name(code: KeyCode) -> String {
+  match code {
+    Char(' ') => "Space"
+    Char('<') => "lt"
+    Char(c) => String.from_code_point(c)
+    Enter => "CR"
+    Esc => "Esc"
+    Tab => "Tab"
+    Backspace => "BS"
+    Delete => "Del"
+    Insert => "Insert"
+    Up => "Up"
+    Down => "Down"
+    Left => "Left"
+    Right => "Right"
+    Home => "Home"
+    End => "End"
+    PageUp => "PageUp"
+    PageDown => "PageDown"
+    Function(f) => "F${f.f_number()}"
+  }
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:26:6 ]
+#     │
+#  26 │     ['<', ..rest] => match angle(rest) {
+#     │      ┬  
+#     │      ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:26:8 ]
+#     │
+#  26 │     ['<', ..rest] => match angle(rest) {
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:30:28 ]
+#     │
+#  30 │       NotAKey => [char_key('<'), ..parse_at(rest, offset + 1)]
+#     │                            ┬  
+#     │                            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:30:30 ]
+#     │
+#  30 │       NotAKey => [char_key('<'), ..parse_at(rest, offset + 1)]
+#     │                              ┬  
+#     │                              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:45:9 ]
+#     │
+#  45 │     [c, '>', ..] if !mods.is_empty() => Some((Char(c), mods.length() * 2 + 2))
+#     │         ┬  
+#     │         ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:45:11 ]
+#     │
+#  45 │     [c, '>', ..] if !mods.is_empty() => Some((Char(c), mods.length() * 2 + 2))
+#     │           ┬  
+#     │           ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:49:10 ]
+#     │
+#  49 │         ['>', ..] => named(String.from_code_points(name)).map(|code| (code, mods.length() * 2 + name.length() + 1))
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:49:12 ]
+#     │
+#  49 │         ['>', ..] => named(String.from_code_points(name)).map(|code| (code, mods.length() * 2 + name.length() + 1))
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:59:60 ]
+#     │
+#  59 │       let body = cs.take_while(|c| is_name_char(c) || c == '-')
+#     │                                                            ┬  
+#     │                                                            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:59:62 ]
+#     │
+#  59 │       let body = cs.take_while(|c| is_name_char(c) || c == '-')
+#     │                                                              ┬  
+#     │                                                              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:61:10 ]
+#     │
+#  61 │         ['>', ..] if !body.is_empty() => UnknownName(String.from_code_points(body))
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:61:12 ]
+#     │
+#  61 │         ['>', ..] if !body.is_empty() => UnknownName(String.from_code_points(body))
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:72:9 ]
+#     │
+#  72 │     [m, '-', ..rest] => match modifier(m) {
+#     │         ┬  
+#     │         ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:72:11 ]
+#     │
+#  72 │     [m, '-', ..rest] => match modifier(m) {
+#     │           ┬  
+#     │           ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:85:5 ]
+#     │
+#  85 │     'c' => Some(Ctrl)
+#     │     ┬  
+#     │     ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:85:7 ]
+#     │
+#  85 │     'c' => Some(Ctrl)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:86:5 ]
+#     │
+#  86 │     'm' | 'a' => Some(Alt)
+#     │     ┬  
+#     │     ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:86:7 ]
+#     │
+#  86 │     'm' | 'a' => Some(Alt)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:86:11 ]
+#     │
+#  86 │     'm' | 'a' => Some(Alt)
+#     │           ┬  
+#     │           ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:86:13 ]
+#     │
+#  86 │     'm' | 'a' => Some(Alt)
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:87:5 ]
+#     │
+#  87 │     's' => Some(Shift)
+#     │     ┬  
+#     │     ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:87:7 ]
+#     │
+#  87 │     's' => Some(Shift)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:88:5 ]
+#     │
+#  88 │     'd' => Some(Super)
+#     │     ┬  
+#     │     ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/key/notation.emel:88:7 ]
+#     │
+#  88 │     'd' => Some(Super)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/notation.emel:113:26 ]
+#      │
+#  113 │     "space" => Some(Char(' '))
+#      │                          ┬  
+#      │                          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/notation.emel:113:28 ]
+#      │
+#  113 │     "space" => Some(Char(' '))
+#      │                            ┬  
+#      │                            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/notation.emel:114:23 ]
+#      │
+#  114 │     "lt" => Some(Char('<'))
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/notation.emel:114:25 ]
+#      │
+#  114 │     "lt" => Some(Char('<'))
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/notation.emel:134:37 ]
+#      │
+#  134 │     Char(c) if m == NO_MODS && c != ' ' && c != '<' => String.from_code_point(c)
+#      │                                     ┬  
+#      │                                     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/notation.emel:134:39 ]
+#      │
+#  134 │     Char(c) if m == NO_MODS && c != ' ' && c != '<' => String.from_code_point(c)
+#      │                                       ┬  
+#      │                                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/notation.emel:134:49 ]
+#      │
+#  134 │     Char(c) if m == NO_MODS && c != ' ' && c != '<' => String.from_code_point(c)
+#      │                                                 ┬  
+#      │                                                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/notation.emel:134:51 ]
+#      │
+#  134 │     Char(c) if m == NO_MODS && c != ' ' && c != '<' => String.from_code_point(c)
+#      │                                                   ┬  
+#      │                                                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/notation.emel:151:10 ]
+#      │
+#  151 │     Char(' ') => "Space"
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/notation.emel:151:12 ]
+#      │
+#  151 │     Char(' ') => "Space"
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/notation.emel:152:10 ]
+#      │
+#  152 │     Char('<') => "lt"
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/key/notation.emel:152:12 ]
+#      │
+#  152 │     Char('<') => "lt"
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/key/notation.emel:24:3 ]
+#     │
+#  24 │   match cs {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/notation.emel:25:8 ]
+#     │
+#  25 │     [] => []
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/notation.emel:25:8 ]
+#     │
+#  25 │     [] => []
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/notation.emel:25:8 ]
+#     │
+#  25 │     [] => []
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/key/notation.emel:26:6 ]
+#     │
+#  26 │     ['<', ..rest] => match angle(rest) {
+#     │      ┬  
+#     │      ╰── 
+# ────╯
+#
+# error[E0110]: expected `]`
+#     ╭─[ src/key/notation.emel:26:7 ]
+#     │
+#  26 │     ['<', ..rest] => match angle(rest) {
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/notation.emel:26:7 ]
+#     │
+#  26 │     ['<', ..rest] => match angle(rest) {
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/notation.emel:26:7 ]
+#     │
+#  26 │     ['<', ..rest] => match angle(rest) {
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/notation.emel:26:8 ]
+#     │
+#  26 │     ['<', ..rest] => match angle(rest) {
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/notation.emel:32:17 ]
+#     │
+#  32 │     [c, ..rest] => [char_key(c), ..parse_at(rest, offset + 1)]
+#     │                 ┬  
+#     │                 ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/notation.emel:32:17 ]
+#     │
+#  32 │     [c, ..rest] => [char_key(c), ..parse_at(rest, offset + 1)]
+#     │                 ┬  
+#     │                 ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/notation.emel:32:17 ]
+#     │
+#  32 │     [c, ..rest] => [char_key(c), ..parse_at(rest, offset + 1)]
+#     │                 ┬  
+#     │                 ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/notation.emel:43:3 ]
+#     │
+#  43 │   let (mods, rest) = modifiers(cs)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/key/notation.emel:43:7 ]
+#     │
+#  43 │   let (mods, rest) = modifiers(cs)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/notation.emel:44:3 ]
+#     │
+#  44 │   let shape = match rest {
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/key/notation.emel:44:7 ]
+#     │
+#  44 │   let shape = match rest {
+#     │       ──┬──  
+#     │         ╰──── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/key/notation.emel:54:3 ]
+#     │
+#  54 │   match shape {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/notation.emel:55:51 ]
+#     │
+#  55 │     Some((code, length)) if mods.has_duplicates() =>
+#     │                                                   ┬  
+#     │                                                   ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/notation.emel:55:51 ]
+#     │
+#  55 │     Some((code, length)) if mods.has_duplicates() =>
+#     │                                                   ┬  
+#     │                                                   ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/notation.emel:55:51 ]
+#     │
+#  55 │     Some((code, length)) if mods.has_duplicates() =>
+#     │                                                   ┬  
+#     │                                                   ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/key/notation.emel:56:31 ]
+#     │
+#  56 │       DuplicateModifier(String.from_code_points(cs.take(length - 1)))
+#     │                               ┬  
+#     │                               ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/notation.emel:56:31 ]
+#     │
+#  56 │       DuplicateModifier(String.from_code_points(cs.take(length - 1)))
+#     │                               ┬  
+#     │                               ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/notation.emel:56:31 ]
+#     │
+#  56 │       DuplicateModifier(String.from_code_points(cs.take(length - 1)))
+#     │                               ┬  
+#     │                               ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/notation.emel:56:32 ]
+#     │
+#  56 │       DuplicateModifier(String.from_code_points(cs.take(length - 1)))
+#     │                                ────────┬───────  
+#     │                                        ╰───────── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/notation.emel:57:26 ]
+#     │
+#  57 │     Some((code, length)) => Read(build(code, mods), length)
+#     │                          ┬  
+#     │                          ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/notation.emel:57:26 ]
+#     │
+#  57 │     Some((code, length)) => Read(build(code, mods), length)
+#     │                          ┬  
+#     │                          ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/notation.emel:57:26 ]
+#     │
+#  57 │     Some((code, length)) => Read(build(code, mods), length)
+#     │                          ┬  
+#     │                          ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/notation.emel:58:10 ]
+#     │
+#  58 │     None => {
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/notation.emel:58:10 ]
+#     │
+#  58 │     None => {
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/notation.emel:58:10 ]
+#     │
+#  58 │     None => {
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0110]: expected `,` or newline between variants
+#     ╭─[ src/key/notation.emel:68:22 ]
+#     │
+#  68 │ enum Modifier { Ctrl | Alt | Shift | Super }
+#     │                      ┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/key/notation.emel:71:3 ]
+#     │
+#  71 │   match cs {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/key/notation.emel:72:9 ]
+#     │
+#  72 │     [m, '-', ..rest] => match modifier(m) {
+#     │         ┬  
+#     │         ╰── 
+# ────╯
+#
+# error[E0110]: expected `]`
+#     ╭─[ src/key/notation.emel:72:10 ]
+#     │
+#  72 │     [m, '-', ..rest] => match modifier(m) {
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/notation.emel:72:10 ]
+#     │
+#  72 │     [m, '-', ..rest] => match modifier(m) {
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/notation.emel:72:11 ]
+#     │
+#  72 │     [m, '-', ..rest] => match modifier(m) {
+#     │           ┬  
+#     │           ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/notation.emel:72:12 ]
+#     │
+#  72 │     [m, '-', ..rest] => match modifier(m) {
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/notation.emel:79:7 ]
+#     │
+#  79 │     _ => ([], cs)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/notation.emel:79:7 ]
+#     │
+#  79 │     _ => ([], cs)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/notation.emel:79:7 ]
+#     │
+#  79 │     _ => ([], cs)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/key/notation.emel:84:3 ]
+#     │
+#  84 │   match c.to_ascii_lowercase() {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/key/notation.emel:85:5 ]
+#     │
+#  85 │     'c' => Some(Ctrl)
+#     │     ┬  
+#     │     ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/notation.emel:85:6 ]
+#     │
+#  85 │     'c' => Some(Ctrl)
+#     │      ┬  
+#     │      ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/notation.emel:85:7 ]
+#     │
+#  85 │     'c' => Some(Ctrl)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/key/notation.emel:86:5 ]
+#     │
+#  86 │     'm' | 'a' => Some(Alt)
+#     │     ┬  
+#     │     ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/notation.emel:86:6 ]
+#     │
+#  86 │     'm' | 'a' => Some(Alt)
+#     │      ┬  
+#     │      ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/notation.emel:86:7 ]
+#     │
+#  86 │     'm' | 'a' => Some(Alt)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/key/notation.emel:87:5 ]
+#     │
+#  87 │     's' => Some(Shift)
+#     │     ┬  
+#     │     ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/notation.emel:87:6 ]
+#     │
+#  87 │     's' => Some(Shift)
+#     │      ┬  
+#     │      ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/notation.emel:87:7 ]
+#     │
+#  87 │     's' => Some(Shift)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/key/notation.emel:88:5 ]
+#     │
+#  88 │     'd' => Some(Super)
+#     │     ┬  
+#     │     ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/notation.emel:88:6 ]
+#     │
+#  88 │     'd' => Some(Super)
+#     │      ┬  
+#     │      ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/notation.emel:88:7 ]
+#     │
+#  88 │     'd' => Some(Super)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/notation.emel:89:7 ]
+#     │
+#  89 │     _ => None
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/key/notation.emel:89:7 ]
+#     │
+#  89 │     _ => None
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/notation.emel:89:7 ]
+#     │
+#  89 │     _ => None
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/key/notation.emel:98:3 ]
+#     │
+#  98 │   match name.to_ascii_lowercase() {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/key/notation.emel:99:10 ]
+#     │
+#  99 │     "cr" | "enter" | "return" => Some(Enter)
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/key/notation.emel:99:31 ]
+#     │
+#  99 │     "cr" | "enter" | "return" => Some(Enter)
+#     │                               ┬  
+#     │                               ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:100:11 ]
+#      │
+#  100 │     "esc" => Some(Esc)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:100:11 ]
+#      │
+#  100 │     "esc" => Some(Esc)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:100:11 ]
+#      │
+#  100 │     "esc" => Some(Esc)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:101:11 ]
+#      │
+#  101 │     "tab" => Some(Tab)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:101:11 ]
+#      │
+#  101 │     "tab" => Some(Tab)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:101:11 ]
+#      │
+#  101 │     "tab" => Some(Tab)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:102:10 ]
+#      │
+#  102 │     "bs" => Some(Backspace)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:102:10 ]
+#      │
+#  102 │     "bs" => Some(Backspace)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:102:10 ]
+#      │
+#  102 │     "bs" => Some(Backspace)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:103:11 ]
+#      │
+#  103 │     "del" => Some(Delete)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:103:11 ]
+#      │
+#  103 │     "del" => Some(Delete)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:103:11 ]
+#      │
+#  103 │     "del" => Some(Delete)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:104:14 ]
+#      │
+#  104 │     "insert" => Some(Insert)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:104:14 ]
+#      │
+#  104 │     "insert" => Some(Insert)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:104:14 ]
+#      │
+#  104 │     "insert" => Some(Insert)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:105:10 ]
+#      │
+#  105 │     "up" => Some(Up)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:105:10 ]
+#      │
+#  105 │     "up" => Some(Up)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:105:10 ]
+#      │
+#  105 │     "up" => Some(Up)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:106:12 ]
+#      │
+#  106 │     "down" => Some(Down)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:106:12 ]
+#      │
+#  106 │     "down" => Some(Down)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:106:12 ]
+#      │
+#  106 │     "down" => Some(Down)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:107:12 ]
+#      │
+#  107 │     "left" => Some(Left)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:107:12 ]
+#      │
+#  107 │     "left" => Some(Left)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:107:12 ]
+#      │
+#  107 │     "left" => Some(Left)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:108:13 ]
+#      │
+#  108 │     "right" => Some(Right)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:108:13 ]
+#      │
+#  108 │     "right" => Some(Right)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:108:13 ]
+#      │
+#  108 │     "right" => Some(Right)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:109:12 ]
+#      │
+#  109 │     "home" => Some(Home)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:109:12 ]
+#      │
+#  109 │     "home" => Some(Home)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:109:12 ]
+#      │
+#  109 │     "home" => Some(Home)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:110:11 ]
+#      │
+#  110 │     "end" => Some(End)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:110:11 ]
+#      │
+#  110 │     "end" => Some(End)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:110:11 ]
+#      │
+#  110 │     "end" => Some(End)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:111:14 ]
+#      │
+#  111 │     "pageup" => Some(PageUp)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:111:14 ]
+#      │
+#  111 │     "pageup" => Some(PageUp)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:111:14 ]
+#      │
+#  111 │     "pageup" => Some(PageUp)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:112:16 ]
+#      │
+#  112 │     "pagedown" => Some(PageDown)
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:112:16 ]
+#      │
+#  112 │     "pagedown" => Some(PageDown)
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:112:16 ]
+#      │
+#  112 │     "pagedown" => Some(PageDown)
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:113:13 ]
+#      │
+#  113 │     "space" => Some(Char(' '))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:113:13 ]
+#      │
+#  113 │     "space" => Some(Char(' '))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:113:13 ]
+#      │
+#  113 │     "space" => Some(Char(' '))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:114:10 ]
+#      │
+#  114 │     "lt" => Some(Char('<'))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:114:10 ]
+#      │
+#  114 │     "lt" => Some(Char('<'))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:114:10 ]
+#      │
+#  114 │     "lt" => Some(Char('<'))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:115:9 ]
+#      │
+#  115 │     "f" ++ n if !n.starts_with("0") => n.to_int().and_then(f_key).map(Function)
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:115:9 ]
+#      │
+#  115 │     "f" ++ n if !n.starts_with("0") => n.to_int().and_then(f_key).map(Function)
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:115:10 ]
+#      │
+#  115 │     "f" ++ n if !n.starts_with("0") => n.to_int().and_then(f_key).map(Function)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:116:7 ]
+#      │
+#  116 │     _ => None
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:116:7 ]
+#      │
+#  116 │     _ => None
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:116:7 ]
+#      │
+#  116 │     _ => None
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:122:3 ]
+#      │
+#  122 │   let mods = Mods(ctrl: ms.contains(Ctrl), alt: ms.contains(Alt), shift: ms.contains(Shift), super: ms.contains(Super))
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/key/notation.emel:122:7 ]
+#      │
+#  122 │   let mods = Mods(ctrl: ms.contains(Ctrl), alt: ms.contains(Alt), shift: ms.contains(Shift), super: ms.contains(Super))
+#      │       ──┬─  
+#      │         ╰─── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:123:3 ]
+#      │
+#  123 │   let code = match code {
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/key/notation.emel:123:7 ]
+#      │
+#  123 │   let code = match code {
+#      │       ──┬─  
+#      │         ╰─── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:132:3 ]
+#      │
+#  132 │   let m = k.mods()
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/key/notation.emel:132:7 ]
+#      │
+#  132 │   let m = k.mods()
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/key/notation.emel:133:3 ]
+#      │
+#  133 │   match k.code() {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:134:37 ]
+#      │
+#  134 │     Char(c) if m == NO_MODS && c != ' ' && c != '<' => String.from_code_point(c)
+#      │                                     ┬  
+#      │                                     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:134:39 ]
+#      │
+#  134 │     Char(c) if m == NO_MODS && c != ' ' && c != '<' => String.from_code_point(c)
+#      │                                       ┬  
+#      │                                       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:134:39 ]
+#      │
+#  134 │     Char(c) if m == NO_MODS && c != ' ' && c != '<' => String.from_code_point(c)
+#      │                                       ┬  
+#      │                                       ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:134:41 ]
+#      │
+#  134 │     Char(c) if m == NO_MODS && c != ' ' && c != '<' => String.from_code_point(c)
+#      │                                         ─┬  
+#      │                                          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:135:49 ]
+#      │
+#  135 │     Char(c) if m.ctrl && c.is_ascii_uppercase() =>
+#      │                                                 ┬  
+#      │                                                 ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:135:49 ]
+#      │
+#  135 │     Char(c) if m.ctrl && c.is_ascii_uppercase() =>
+#      │                                                 ┬  
+#      │                                                 ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:135:49 ]
+#      │
+#  135 │     Char(c) if m.ctrl && c.is_ascii_uppercase() =>
+#      │                                                 ┬  
+#      │                                                 ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:136:14 ]
+#      │
+#  136 │       bracket(Mods(..m, shift: true), String.from_code_point(c.to_ascii_lowercase()))
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0114]: `..` must come last
+#      ╭─[ src/key/notation.emel:136:25 ]
+#      │
+#  136 │       bracket(Mods(..m, shift: true), String.from_code_point(c.to_ascii_lowercase()))
+#      │                         ──┬──  
+#      │                           ╰──── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:137:10 ]
+#      │
+#  137 │     code => bracket(m, name(code))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:137:10 ]
+#      │
+#  137 │     code => bracket(m, name(code))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:137:10 ]
+#      │
+#  137 │     code => bracket(m, name(code))
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:142:3 ]
+#      │
+#  142 │   let c = if m.ctrl { "C-" } else { "" }
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/key/notation.emel:142:7 ]
+#      │
+#  142 │   let c = if m.ctrl { "C-" } else { "" }
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:143:3 ]
+#      │
+#  143 │   let a = if m.alt { "M-" } else { "" }
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/key/notation.emel:143:7 ]
+#      │
+#  143 │   let a = if m.alt { "M-" } else { "" }
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:144:3 ]
+#      │
+#  144 │   let s = if m.shift { "S-" } else { "" }
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/key/notation.emel:144:7 ]
+#      │
+#  144 │   let s = if m.shift { "S-" } else { "" }
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:145:3 ]
+#      │
+#  145 │   let d = if m.super { "D-" } else { "" }
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/key/notation.emel:145:7 ]
+#      │
+#  145 │   let d = if m.super { "D-" } else { "" }
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/key/notation.emel:150:3 ]
+#      │
+#  150 │   match code {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/key/notation.emel:151:10 ]
+#      │
+#  151 │     Char(' ') => "Space"
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/notation.emel:151:12 ]
+#      │
+#  151 │     Char(' ') => "Space"
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:151:12 ]
+#      │
+#  151 │     Char(' ') => "Space"
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:151:12 ]
+#      │
+#  151 │     Char(' ') => "Space"
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:151:13 ]
+#      │
+#  151 │     Char(' ') => "Space"
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/key/notation.emel:152:10 ]
+#      │
+#  152 │     Char('<') => "lt"
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/key/notation.emel:152:11 ]
+#      │
+#  152 │     Char('<') => "lt"
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:152:11 ]
+#      │
+#  152 │     Char('<') => "lt"
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:152:11 ]
+#      │
+#  152 │     Char('<') => "lt"
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:152:12 ]
+#      │
+#  152 │     Char('<') => "lt"
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:153:13 ]
+#      │
+#  153 │     Char(c) => String.from_code_point(c)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:153:13 ]
+#      │
+#  153 │     Char(c) => String.from_code_point(c)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:153:13 ]
+#      │
+#  153 │     Char(c) => String.from_code_point(c)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:154:11 ]
+#      │
+#  154 │     Enter => "CR"
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:154:11 ]
+#      │
+#  154 │     Enter => "CR"
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:154:11 ]
+#      │
+#  154 │     Enter => "CR"
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:155:9 ]
+#      │
+#  155 │     Esc => "Esc"
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:155:9 ]
+#      │
+#  155 │     Esc => "Esc"
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:155:9 ]
+#      │
+#  155 │     Esc => "Esc"
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:156:9 ]
+#      │
+#  156 │     Tab => "Tab"
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:156:9 ]
+#      │
+#  156 │     Tab => "Tab"
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:156:9 ]
+#      │
+#  156 │     Tab => "Tab"
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:157:15 ]
+#      │
+#  157 │     Backspace => "BS"
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:157:15 ]
+#      │
+#  157 │     Backspace => "BS"
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:157:15 ]
+#      │
+#  157 │     Backspace => "BS"
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:158:12 ]
+#      │
+#  158 │     Delete => "Del"
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:158:12 ]
+#      │
+#  158 │     Delete => "Del"
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:158:12 ]
+#      │
+#  158 │     Delete => "Del"
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:159:12 ]
+#      │
+#  159 │     Insert => "Insert"
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:159:12 ]
+#      │
+#  159 │     Insert => "Insert"
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:159:12 ]
+#      │
+#  159 │     Insert => "Insert"
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:160:8 ]
+#      │
+#  160 │     Up => "Up"
+#      │        ┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:160:8 ]
+#      │
+#  160 │     Up => "Up"
+#      │        ┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:160:8 ]
+#      │
+#  160 │     Up => "Up"
+#      │        ┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:161:10 ]
+#      │
+#  161 │     Down => "Down"
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:161:10 ]
+#      │
+#  161 │     Down => "Down"
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:161:10 ]
+#      │
+#  161 │     Down => "Down"
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:162:10 ]
+#      │
+#  162 │     Left => "Left"
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:162:10 ]
+#      │
+#  162 │     Left => "Left"
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:162:10 ]
+#      │
+#  162 │     Left => "Left"
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:163:11 ]
+#      │
+#  163 │     Right => "Right"
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:163:11 ]
+#      │
+#  163 │     Right => "Right"
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:163:11 ]
+#      │
+#  163 │     Right => "Right"
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:164:10 ]
+#      │
+#  164 │     Home => "Home"
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:164:10 ]
+#      │
+#  164 │     Home => "Home"
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:164:10 ]
+#      │
+#  164 │     Home => "Home"
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:165:9 ]
+#      │
+#  165 │     End => "End"
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:165:9 ]
+#      │
+#  165 │     End => "End"
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:165:9 ]
+#      │
+#  165 │     End => "End"
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:166:12 ]
+#      │
+#  166 │     PageUp => "PageUp"
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:166:12 ]
+#      │
+#  166 │     PageUp => "PageUp"
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:166:12 ]
+#      │
+#  166 │     PageUp => "PageUp"
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:167:14 ]
+#      │
+#  167 │     PageDown => "PageDown"
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:167:14 ]
+#      │
+#  167 │     PageDown => "PageDown"
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:167:14 ]
+#      │
+#  167 │     PageDown => "PageDown"
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/key/notation.emel:168:17 ]
+#      │
+#  168 │     Function(f) => "F${f.f_number()}"
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/key/notation.emel:168:17 ]
+#      │
+#  168 │     Function(f) => "F${f.f_number()}"
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/key/notation.emel:168:17 ]
+#      │
+#  168 │     Function(f) => "F${f.f_number()}"
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0211]: cannot find value `shape` in this scope
+#     ╭─[ src/key/notation.emel:54:9 ]
+#     │
+#  54 │   match shape {
+#     │         ──┬──  
+#     │           ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `mods` in this scope
+#     ╭─[ src/key/notation.emel:55:29 ]
+#     │
+#  55 │     Some((code, length)) if mods.has_duplicates() =>
+#     │                             ──┬─  
+#     │                               ╰─── 
+# ────╯
+#
+# error[E0217]: expected constructor, found type `String`
+#     ╭─[ src/key/notation.emel:56:25 ]
+#     │
+#  56 │       DuplicateModifier(String.from_code_points(cs.take(length - 1)))
+#     │                         ───┬──  
+#     │                            ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `m` in this scope
+#     ╭─[ src/key/notation.emel:86:6 ]
+#     │
+#  86 │     'm' | 'a' => Some(Alt)
+#     │      ┬  
+#     │      ╰── 
+# ────╯
+#    = help: did you mean `c`?
+#
+# error[E0211]: cannot find value `s` in this scope
+#     ╭─[ src/key/notation.emel:87:6 ]
+#     │
+#  87 │     's' => Some(Shift)
+#     │      ┬  
+#     │      ╰── 
+# ────╯
+#    = help: did you mean `c`?
+#
+# error[E0211]: cannot find value `d` in this scope
+#     ╭─[ src/key/notation.emel:88:6 ]
+#     │
+#  88 │     'd' => Some(Super)
+#     │      ┬  
+#     │      ╰── 
+# ────╯
+#    = help: did you mean `c`?
+#
+# error[E0211]: cannot find value `mods` in this scope
+#      ╭─[ src/key/notation.emel:127:17 ]
+#      │
+#  127 │   Key.key(code, mods).expect("names give only scalar values and F1 to F12")
+#      │                 ──┬─  
+#      │                   ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `m` in this scope
+#      ╭─[ src/key/notation.emel:134:16 ]
+#      │
+#  134 │     Char(c) if m == NO_MODS && c != ' ' && c != '<' => String.from_code_point(c)
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#    = help: did you mean `k`?
+#
+# error[E0211]: cannot find value `m` in this scope
+#      ╭─[ src/key/notation.emel:135:16 ]
+#      │
+#  135 │     Char(c) if m.ctrl && c.is_ascii_uppercase() =>
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#    = help: did you mean `k`?
+#
+# error[E0211]: cannot find value `m` in this scope
+#      ╭─[ src/key/notation.emel:136:22 ]
+#      │
+#  136 │       bracket(Mods(..m, shift: true), String.from_code_point(c.to_ascii_lowercase()))
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#    = help: did you mean `k`?
+#
+# error[E0211]: cannot find value `true` in this scope
+#      ╭─[ src/key/notation.emel:136:32 ]
+#      │
+#  136 │       bracket(Mods(..m, shift: true), String.from_code_point(c.to_ascii_lowercase()))
+#      │                                ──┬─  
+#      │                                  ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `c` in this scope
+#      ╭─[ src/key/notation.emel:136:62 ]
+#      │
+#  136 │       bracket(Mods(..m, shift: true), String.from_code_point(c.to_ascii_lowercase()))
+#      │                                                              ┬  
+#      │                                                              ╰── 
+# ─────╯
+#    = help: did you mean `k`?
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/key/notation.emel:26:5 ]
+#     │
+#  26 │     ['<', ..rest] => match angle(rest) {
+#     │     ─┬  
+#     │      ╰── 
+# ────╯
+#
+# error[E0313]: type `Option[Key]` has no field or function `expect`
+#     ╭─[ src/key/notation.emel:38:29 ]
+#     │
+#  38 │   Key.key(Char(c), NO_MODS).expect("a String holds only scalar values")
+#     │                             ───┬──  
+#     │                                ╰──── 
+# ────╯
+#
+# error[E0313]: type `Int` has no field or function `to_ascii_lowercase`
+#     ╭─[ src/key/notation.emel:84:11 ]
+#     │
+#  84 │   match c.to_ascii_lowercase() {
+#     │           ─────────┬────────  
+#     │                    ╰────────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `Option[Modifier]`, found `Int`
+#     ╭─[ src/key/notation.emel:85:6 ]
+#     │
+#  85 │     'c' => Some(Ctrl)
+#     │      ┬  
+#     │      ╰── 
+# ────╯
+#
+# error[E0313]: type `Int` has no field or function `is_ascii_alphanumeric`
+#     ╭─[ src/key/notation.emel:94:5 ]
+#     │
+#  94 │   c.is_ascii_alphanumeric()
+#     │     ──────────┬──────────  
+#     │               ╰──────────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `Option[KeyCode]`, found `fn(String) -> String`
+#     ╭─[ src/key/notation.emel:99:10 ]
+#     │
+#  99 │     "cr" | "enter" | "return" => Some(Enter)
+#     │          ──────────┬─────────  
+#     │                    ╰─────────── 
+# ────╯
+#
+# error[E0317]: refutable pattern in binding: pattern `_` not covered
+#     ╭─[ src/key/notation.emel:99:12 ]
+#     │
+#  99 │     "cr" | "enter" | "return" => Some(Enter)
+#     │            ───┬───  
+#     │               ╰───── 
+# ────╯
+#    = help: use `match` to handle the other cases
+#
+# error[E0313]: type `Option[Key]` has no field or function `expect`
+#      ╭─[ src/key/notation.emel:127:23 ]
+#      │
+#  127 │   Key.key(code, mods).expect("names give only scalar values and F1 to F12")
+#      │                       ───┬──  
+#      │                          ╰──── 
+# ─────╯
+#
+# error[E0313]: type `Int` has no field or function `is_ascii_uppercase`
+#      ╭─[ src/key/notation.emel:135:28 ]
+#      │
+#  135 │     Char(c) if m.ctrl && c.is_ascii_uppercase() =>
+#      │                            ─────────┬────────  
+#      │                                     ╰────────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `String`, found `(Mods, Option[String])`
+#      ╭─[ src/key/notation.emel:136:14 ]
+#      │
+#  136 │       bracket(Mods(..m, shift: true), String.from_code_point(c.to_ascii_lowercase()))
+#      │              ────────────────────────────────────┬───────────────────────────────────  
+#      │                                                  ╰───────────────────────────────────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/notation.emel:137:5 ]
+#      │
+#  137 │     code => bracket(m, name(code))
+#      │     ──┬─  
+#      │       ╰─── 
+# ─────╯
+#
+# error[E0309]: pattern `Char` has 1 fields, found 0
+#      ╭─[ src/key/notation.emel:151:5 ]
+#      │
+#  151 │     Char(' ') => "Space"
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# error[E0309]: pattern `Char` has 1 fields, found 0
+#      ╭─[ src/key/notation.emel:152:5 ]
+#      │
+#  152 │     Char('<') => "lt"
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/notation.emel:152:5 ]
+#      │
+#  152 │     Char('<') => "lt"
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/key/notation.emel:153:5 ]
+#      │
+#  153 │     Char(c) => String.from_code_point(c)
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# 255 errors, 5 warnings
+# --- end wish check ---
