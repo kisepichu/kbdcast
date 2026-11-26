@@ -1,0 +1,323 @@
+# The bytes that WezTerm's default (termwiz 0.22.0, the xterm encoding) sends to an application
+# for a key, in the input modes that the application has set.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
+
+import Std.Bytes.{Bytes}
+import Key.{
+  Key,
+  Mods,
+  NO_MODS,
+  Char,
+  Enter,
+  Esc,
+  Tab,
+  Backspace,
+  Delete,
+  Insert,
+  Up,
+  Down,
+  Left,
+  Right,
+  Home,
+  End,
+  PageUp,
+  PageDown,
+  Function,
+}
+
+## What the cursor keys, Home and End send without modifiers: CSI (`Normal`) or SS3
+## (`Application`). DECCKM, set by `CSI ? 1 h` and reset by `CSI ? 1 l`.
+pub enum CursorKeys {
+  Normal
+  Application
+} derive Eq, Show
+
+## What Enter sends: CR, or CR LF in newline mode. LNM, set by `CSI 20 h` and reset by
+## `CSI 20 l`.
+pub enum Newline {
+  Cr
+  CrLf
+} derive Eq, Show
+
+## A level of modifyOtherKeys.
+pub enum Level {
+  One
+  Two
+} derive Eq, Show
+
+## xterm's modifyOtherKeys, off or at a level, set by `CSI > 4 ; n m`.
+pub enum OtherKeys {
+  Off
+  On(Level)
+} derive Eq, Show
+
+## The modes that an application sets to change what the terminal sends for a key.
+pub type InputModes(cursor_keys: CursorKeys, newline: Newline, other_keys: OtherKeys)
+  derive Eq, Show
+
+## The modes before an application changes any.
+pub const DEFAULT_MODES: InputModes = InputModes(cursor_keys: Normal, newline: Cr, other_keys: Off)
+
+## Why a key cannot be sent in the modes: the terminal would drop a modifier of it, so what it sends
+## would be read as another key.
+pub enum Reason {
+  ## The key can be sent with modifyOtherKeys at this level (the lowest one that can), the other
+  ## modes kept.
+  NeedsOtherKeys(Level)
+  ## No level of modifyOtherKeys can send the key. Only the kitty keyboard protocol could.
+  NeedsKitty
+} derive Eq, Show
+
+## `key` cannot be sent in the modes it was to be sent in, for `reason`.
+pub error Unencodable(key: Key, reason: Reason) derive Eq, Show
+
+# The bytes that start the sequences.
+const ESC: String = "\u{1b}"
+const CSI: String = "\u{1b}["
+const SS3: String = "\u{1b}O"
+
+## The bytes that the terminal sends for `key` in `modes`: what termwiz 0.22.0's `KeyCode::encode`
+## gives with the xterm encoding. Fails with Unencodable if the terminal would drop a modifier of
+## `key`, so that decode would read those bytes as a key other than the representative of `key`
+## (spec §6). A key with super always fails: xterm's modifier number has no bit for super.
+pub fn encode(key: Key, modes: InputModes) -> Bytes fails Unencodable {
+  sent(key, modes) match {
+    Some(text) -> Bytes.encode_utf8(text)
+    None       -> fail Unencodable(key:, reason: reason(key, modes))
+  }
+}
+
+# The lowest level of modifyOtherKeys above that of `modes` at which `key` can be sent, the other
+# modes kept. Kitty if there is none.
+fn reason(key: Key, modes: InputModes) -> Reason {
+  higher = modes.other_keys match {
+    Off     -> [One, Two]
+    On(One) -> [Two]
+    On(Two) -> []
+  }
+  higher.find(|level| sent(key, InputModes(other_keys: On(level), ..modes)).is_some()) match {
+    Some(level) -> NeedsOtherKeys(level)
+    None        -> NeedsKitty
+  }
+}
+
+# What the terminal sends for `key` in `modes`, as the text that its bytes encode in UTF-8. `None`
+# if the terminal drops a modifier of `key`.
+fn sent(key: Key, modes: InputModes) -> Option[String] {
+  m = key.mods()
+  if m.super {
+    None
+  } else {
+    key.code() match {
+      Char(c)     -> character(c, m, modes.other_keys)
+      Enter       -> enter(m, modes)
+      Esc         -> esc(m, modes.other_keys)
+      Tab         -> Some(tab(m, modes.other_keys))
+      Backspace   -> backspace(m, modes.other_keys)
+      Up          -> Some(cursor("A", m, modes.cursor_keys))
+      Down        -> Some(cursor("B", m, modes.cursor_keys))
+      Right       -> Some(cursor("C", m, modes.cursor_keys))
+      Left        -> Some(cursor("D", m, modes.cursor_keys))
+      Home        -> Some(cursor("H", m, modes.cursor_keys))
+      End         -> Some(cursor("F", m, modes.cursor_keys))
+      Insert      -> Some(tilde(2, m))
+      Delete      -> Some(tilde(3, m))
+      PageUp      -> Some(tilde(5, m))
+      PageDown    -> Some(tilde(6, m))
+      Function(f) -> Some(function(Key.f_number(f), m))
+    }
+  }
+}
+
+# The character `c` held with `m`, which holds no super.
+fn character(c: Int, m: Mods, other_keys: OtherKeys) -> Option[String] {
+  (m, other_keys) match {
+    (NO_MODS, _)                                                 -> Some(text_of(c))
+    (Mods(ctrl: True, ..), On(Two))                              -> Some(other_key(c, m))
+    (Mods(ctrl: True, ..), _)                                    -> ctrl_character(c, m, other_keys)
+    # ESC and the character at every level, so the Shift on a digit is dropped.
+    (Mods(alt: True, shift: True, ..), _) if is_ascii_graphic(c) -> None
+    (Mods(alt: True, ..), _) if is_ascii_graphic(c)              -> Some("#{ESC}#{text_of(c)}")
+    (_, On(_))                                                   -> Some(other_key(c, m))
+    # The Shift on a digit, a space or a character outside ASCII is dropped.
+    (Mods(shift: True, ..), Off)                                 -> None
+    # Alt alone, with a space or a character outside ASCII.
+    (_, Off)                                                     -> Some("#{ESC}#{text_of(c)}")
+  }
+}
+
+# The character `c` held with `m`, which holds Ctrl and no super, with modifyOtherKeys off or at
+# level 1.
+fn ctrl_character(c: Int, m: Mods, other_keys: OtherKeys) -> Option[String] {
+  ctrl_mapping(c) match {
+    # Ctrl with a capital letter is Ctrl and Shift, and the control character drops the Shift.
+    Some(_) if is_ascii_uppercase(c)     -> other_key_if_on(c, m, other_keys)
+    # The control character drops the Shift on a digit or a space.
+    Some(_) if m.shift                   -> None
+    Some(control)                        -> Some(alt_prefix(m, text_of(control)))
+    # ESC and the character: the Ctrl is dropped.
+    None if m.alt && is_ascii_graphic(c) -> None
+    # Without modifyOtherKeys, the character alone: the Ctrl is dropped.
+    None                                 -> other_key_if_on(c, m, other_keys)
+  }
+}
+
+# The control character that Ctrl makes of `c` (termwiz's `ctrl_mapping`). `None` if Ctrl makes
+# none of it.
+fn ctrl_mapping(c: Int) -> Option[Int] {
+  c match {
+    # FRICTION(013): Emela has no literal for the code point of a character, so these are
+    # hexadecimal with the character in a comment.
+    # FRICTION(015): there is no or-pattern, so the characters that make the same control
+    # character (space and 2, 7 and /, 8 and ?) have an arm each.
+    0x20                        -> Some(0x00) # space
+    0x32                        -> Some(0x00) # 2
+    0x33                        -> Some(0x1B) # 3
+    0x34                        -> Some(0x1C) # 4
+    0x35                        -> Some(0x1D) # 5
+    0x36                        -> Some(0x1E) # 6
+    0x37                        -> Some(0x1F) # 7
+    0x2F                        -> Some(0x1F) # /
+    0x38                        -> Some(0x7F) # 8
+    0x3F                        -> Some(0x7F) # ?
+    # FRICTION(038): there are no range patterns, so @ to ~ is a guard. Each of `@`, `A` to `Z`,
+    # `[`, `\`, `]`, `^`, `_`, and of `` ` ``, `a` to `z`, `{`, `|`, `}`, `~`, makes the control
+    # character of its low 5 bits.
+    _ if c >= 0x40 && c <= 0x7E -> Some(c.bit_and(0x1F))
+    _                           -> None
+  }
+}
+
+# Enter sends CR, or CR LF in newline mode.
+fn enter(m: Mods, modes: InputModes) -> Option[String] {
+  if m.ctrl || m.shift {
+    other_key_if_on(0x0D, m, modes.other_keys)
+  } else {
+    cr = modes.newline match {
+      Cr   -> "\r"
+      CrLf -> "\r\n"
+    }
+    Some(alt_prefix(m, cr))
+  }
+}
+
+# Esc sends ESC.
+fn esc(m: Mods, other_keys: OtherKeys) -> Option[String] {
+  if m.ctrl || m.shift {
+    # Level 1 leaves Esc out, so below level 2 the terminal sends ESC alone.
+    other_keys match {
+      On(Two) -> Some(other_key(0x1B, m))
+      _       -> None
+    }
+  } else {
+    Some(alt_prefix(m, ESC))
+  }
+}
+
+fn tab(m: Mods, other_keys: OtherKeys) -> String {
+  (m, other_keys) match {
+    (NO_MODS, _)                             -> "\t"
+    (_, On(_))                               -> other_key(0x09, m)
+    (Mods(ctrl: True, shift: True, ..), Off) -> alt_prefix(m, "#{CSI}1;5Z")
+    (Mods(ctrl: True, ..), Off)              -> alt_prefix(m, "#{CSI}9;5u")
+    (Mods(shift: True, ..), Off)             -> alt_prefix(m, "#{CSI}Z")
+    (_, Off)                                 -> alt_prefix(m, "\t")
+  }
+}
+
+# Backspace sends DEL, and BS with Ctrl.
+fn backspace(m: Mods, other_keys: OtherKeys) -> Option[String] {
+  (m, other_keys) match {
+    (Mods(ctrl: True, ..), On(Two))  -> Some(other_key(0x08, m))
+    (Mods(shift: True, ..), On(Two)) -> Some(other_key(0x7F, m))
+    # Level 1 leaves Backspace out, so below level 2 the Shift is dropped.
+    (Mods(shift: True, ..), _)       -> None
+    (Mods(ctrl: True, ..), _)        -> Some(alt_prefix(m, "\u{8}"))
+    _                                -> Some(alt_prefix(m, "\u{7f}"))
+  }
+}
+
+# A cursor key, Home or End, whose sequences end in `final`.
+fn cursor(final: String, m: Mods, cursor_keys: CursorKeys) -> String {
+  (m, cursor_keys) match {
+    (NO_MODS, Normal)      -> "#{CSI}#{final}"
+    (NO_MODS, Application) -> "#{SS3}#{final}"
+    _                      -> "#{CSI}1;#{modifier_number(m)}#{final}"
+  }
+}
+
+# Insert, Delete, PageUp, PageDown, or F5 to F12: `CSI n~`.
+fn tilde(n: Int, m: Mods) -> String {
+  if m == NO_MODS { "#{CSI}#{n}~" } else { "#{CSI}#{n};#{modifier_number(m)}~" }
+}
+
+# F`n`.
+fn function(n: Int, m: Mods) -> String {
+  n match {
+    # FRICTION(009): a list cannot be read at a position known to be in it without an Option
+    # (`["P", "Q", "R", "S"][n - 1]`), so each F key has an arm.
+    1            -> f1_to_f4("P", m)
+    2            -> f1_to_f4("Q", m)
+    3            -> f1_to_f4("R", m)
+    4            -> f1_to_f4("S", m)
+    5            -> tilde(15, m)
+    # FRICTION(038): there are no range patterns, so F6 to F10 (17 to 21) is a guard.
+    _ if n <= 10 -> tilde(n + 11, m)
+    11           -> tilde(23, m)
+    _            -> tilde(24, m)
+  }
+}
+
+# F1 to F4, whose sequences end in `final`: SS3 without modifiers.
+fn f1_to_f4(final: String, m: Mods) -> String {
+  if m == NO_MODS { "#{SS3}#{final}" } else { "#{CSI}1;#{modifier_number(m)}#{final}" }
+}
+
+# The key with the code `c` held with `m` in modifyOtherKeys: `CSI 27;m;c~`.
+fn other_key(c: Int, m: Mods) -> String {
+  "#{CSI}27;#{modifier_number(m)};#{c}~"
+}
+
+# `other_key(c, m)` if modifyOtherKeys is on. `None` if it is off: the terminal drops a modifier.
+fn other_key_if_on(c: Int, m: Mods, other_keys: OtherKeys) -> Option[String] {
+  other_keys match {
+    Off   -> None
+    On(_) -> Some(other_key(c, m))
+  }
+}
+
+# `text` with ESC before it if `m` holds Alt.
+fn alt_prefix(m: Mods, text: String) -> String {
+  if m.alt { "#{ESC}#{text}" } else { text }
+}
+
+# xterm's modifier number: 1, plus 1 for Shift, 2 for Alt and 4 for Ctrl.
+fn modifier_number(m: Mods) -> Int {
+  1 + (if m.shift { 1 } else { 0 }) + (if m.alt { 2 } else { 0 }) + (if m.ctrl { 4 } else { 0 })
+}
+
+# FRICTION(039): std has no predicates on a code point, so these two are written here.
+# FRICTION(013)
+# Rust's `is_ascii_graphic`: ASCII alphanumeric or punctuation, which termwiz sends after ESC for
+# Alt.
+fn is_ascii_graphic(c: Int) -> Bool {
+  c >= 0x21 && c <= 0x7E # ! to ~
+}
+
+# FRICTION(039)
+# FRICTION(013)
+fn is_ascii_uppercase(c: Int) -> Bool {
+  c >= 0x41 && c <= 0x5A # A to Z
+}
+
+# FRICTION(003): the code point of a Char is a scalar value (`Key.key` makes sure), and so is a
+# control character, but `String.from_code_point` returns an Option.
+# FRICTION(040): Option has no `expect`, so the None that cannot happen is a match with a panic.
+fn text_of(c: Int) -> String {
+  String.from_code_point(c) match {
+    Some(s) -> s
+    None    -> panic("None, but #{c} is the code point of a Char or of a control character")
+  }
+}

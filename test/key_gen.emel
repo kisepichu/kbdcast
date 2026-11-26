@@ -1,5 +1,5 @@
-# Generators of keys for the property tests of the notation (`notation_test.emel`) and of the
-# encoding.
+# Generators of keys and input modes for the property tests of the notation (`notation_test.emel`)
+# and of the encoding (`encode_test.emel`).
 #
 # FRICTION(028): brix's Gen has no choice from a list of values (`element`) and no `bool`, so they
 # are written here.
@@ -26,12 +26,24 @@ import Key.{
   PageDown,
   Function,
 }
+import Key.Encode.{InputModes, Normal, Application, Cr, CrLf, Off, On, One, Two}
 
 ## A key in normal form: one of `codes` with each of the four modifiers held or not, made by
 ## `Key.key`.
 pub fn keys() -> Gen[Key] {
   Gen.pair(element(codes()), mods())
     |> Gen.map(|(code, mods)| expect(Key.key(code, mods), "every code is a scalar value or F1-F12"))
+}
+
+## Input modes: DECCKM, LNM and modifyOtherKeys each in any of its states.
+pub fn modes() -> Gen[InputModes] {
+  Gen.pair(
+    Gen.pair(element([Normal, Application]), element([Cr, CrLf])),
+    element([Off, On(One), On(Two)]),
+  )
+    |> Gen.map(
+      |((cursor_keys, newline), other_keys)| InputModes(cursor_keys:, newline:, other_keys:),
+    )
 }
 
 # An ASCII printable character, `é` (U+E9), `あ` (U+3042), `😀` (U+1F600), a control character

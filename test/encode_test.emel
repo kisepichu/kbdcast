@@ -1,0 +1,149 @@
+import Brix.Pbt.Gen
+import Brix.Pbt.Property.{Config}
+# FRICTION(042): importing the variant `Key` of Decoded keeps the type `Key` from being imported,
+# so the type is written through its module.
+import Key
+import Key.Decode.{Key}
+import Key.Encode.{InputModes, Unencodable, DEFAULT_MODES, Application, CrLf, On, One, Two}
+import Key.Notation.{NotationError}
+import Golden
+import KeyGen
+
+# The default modes with one mode changed.
+const LEVEL1: InputModes = InputModes(other_keys: On(One), ..DEFAULT_MODES)
+const LEVEL2: InputModes = InputModes(other_keys: On(Two), ..DEFAULT_MODES)
+const APPLICATION: InputModes = InputModes(cursor_keys: Application, ..DEFAULT_MODES)
+const CRLF: InputModes = InputModes(newline: CrLf, ..DEFAULT_MODES)
+
+# What `encode` does in `modes` with the one key that `parse` reads from `s`.
+fn encoded(s: String, modes: InputModes) -> String fails NotationError {
+  Notation.parse(s) match {
+    [k]  -> outcome(k, modes)
+    keys -> panic("#{inspect(s)} is not one key but #{keys}")
+  }
+}
+
+# FRICTION(023): W0303 warns that the derived Show of a private type in a test is never used, when
+# only a failed assert shows it, so what encode does is a String, not an enum of the two cases.
+# What `encode` does with `k` in `modes`: the bytes it sends in hexadecimal, or the reason it
+# cannot send `k` as Show writes it (`NeedsOtherKeys(One)`). The Unencodable holds `k`.
+fn outcome(k: Key.Key, modes: InputModes) -> String {
+  Encode.encode(k, modes).to_hex() escape {
+    Unencodable(key:, reason:) -> {
+      assert key == k
+      "#{reason}"
+    }
+  }
+}
+
+@test
+fn encode_sends_a_character_as_utf8() {
+  assert encoded("a", DEFAULT_MODES) == "61"
+  assert encoded("A", DEFAULT_MODES) == "41"
+  assert encoded("あ", DEFAULT_MODES) == "e38182"
+}
+
+@test
+fn encode_sends_ctrl_with_a_character_as_a_control_character_or_in_modify_other_keys() {
+  assert encoded("<C-a>", DEFAULT_MODES) == "01"
+  assert encoded("<C-a>", LEVEL2) == "1b5b32373b353b39377e"
+  assert encoded("<C-i>", DEFAULT_MODES) == "09"
+  assert encoded("<C-i>", LEVEL2) == "1b5b32373b353b3130357e"
+  assert encoded("<C-Space>", DEFAULT_MODES) == "00"
+}
+
+@test
+fn encode_needs_modify_other_keys_for_ctrl_with_a_character_that_has_no_control_character_of_its_own(
+) {
+  # Ctrl with a capital letter is Ctrl and Shift.
+  assert encoded("<C-S-a>", DEFAULT_MODES) == "NeedsOtherKeys(One)"
+  assert encoded("<C-S-a>", LEVEL1) == "1b5b32373b353b36357e"
+  assert encoded("<C-é>", DEFAULT_MODES) == "NeedsOtherKeys(One)"
+  # Below level 2, Ctrl and Alt with a digit are ESC and the digit.
+  assert encoded("<C-M-1>", LEVEL1) == "NeedsOtherKeys(Two)"
+}
+
+@test
+fn encode_sends_alt_as_esc_before_the_key_or_in_modify_other_keys() {
+  assert encoded("<M-é>", DEFAULT_MODES) == "1bc3a9"
+  assert encoded("<M-é>", LEVEL1) == "1b5b32373b333b3233337e"
+  assert encoded("<M-[>", DEFAULT_MODES) == "1b5b"
+  # ESC and the digit at every level, so the Shift is dropped.
+  assert encoded("<M-S-1>", LEVEL2) == "NeedsKitty"
+}
+
+@test
+fn encode_needs_modify_other_keys_for_shift_with_a_digit() {
+  assert encoded("<S-1>", DEFAULT_MODES) == "NeedsOtherKeys(One)"
+  assert encoded("<S-1>", LEVEL1) == "1b5b32373b323b34397e"
+}
+
+@test
+fn encode_sends_enter_and_esc_with_shift_only_in_modify_other_keys() {
+  assert encoded("<S-Esc>", LEVEL1) == "NeedsOtherKeys(Two)"
+  assert encoded("<S-Esc>", LEVEL2) == "1b5b32373b323b32377e"
+  assert encoded("<S-CR>", DEFAULT_MODES) == "NeedsOtherKeys(One)"
+}
+
+@test
+fn encode_sends_enter_as_cr_lf_in_newline_mode() {
+  assert encoded("<CR>", CRLF) == "0d0a"
+  assert encoded("<M-CR>", CRLF) == "1b0d0a"
+}
+
+@test
+fn encode_sends_a_cursor_key_in_ss3_in_application_mode_unless_modified() {
+  assert encoded("<Up>", DEFAULT_MODES) == "1b5b41"
+  assert encoded("<Up>", APPLICATION) == "1b4f41"
+  assert encoded("<C-Up>", APPLICATION) == "1b5b313b3541"
+}
+
+@test
+fn encode_sends_tab_with_modifiers_in_its_own_sequences_unless_in_modify_other_keys() {
+  assert encoded("<Tab>", DEFAULT_MODES) == "09"
+  assert encoded("<S-Tab>", DEFAULT_MODES) == "1b5b5a"
+  assert encoded("<S-Tab>", LEVEL1) == "1b5b32373b323b397e"
+  assert encoded("<C-Tab>", DEFAULT_MODES) == "1b5b393b3575"
+  assert encoded("<C-S-Tab>", DEFAULT_MODES) == "1b5b313b355a"
+}
+
+@test
+fn encode_sends_backspace_as_del_and_with_ctrl_as_bs() {
+  assert encoded("<BS>", DEFAULT_MODES) == "7f"
+  assert encoded("<C-BS>", DEFAULT_MODES) == "08"
+  assert encoded("<S-BS>", LEVEL1) == "NeedsOtherKeys(Two)"
+}
+
+@test
+fn encode_sends_the_editing_and_function_keys_with_the_modifier_number() {
+  assert encoded("<Del>", DEFAULT_MODES) == "1b5b337e"
+  assert encoded("<F1>", DEFAULT_MODES) == "1b4f50"
+  assert encoded("<S-F1>", DEFAULT_MODES) == "1b5b313b3250"
+  assert encoded("<F5>", DEFAULT_MODES) == "1b5b31357e"
+  assert encoded("<C-F12>", DEFAULT_MODES) == "1b5b32343b357e"
+}
+
+@test
+fn encode_needs_kitty_for_super_in_every_mode() {
+  sent = ["<D-a>", "<D-Up>", "<C-D-x>"].flat_map(|s| {
+    List.range(0, 12).map(|mode| (s, mode, encoded(s, Golden.row_modes(mode))))
+  })
+  assert sent.filter(|(_, _, outcome)| outcome != "NeedsKitty") == []
+}
+
+@test
+fn decode_reads_what_encode_sends_as_the_representative_of_the_key() {
+  Property.check_with(
+    Gen.pair(KeyGen.keys(), KeyGen.modes()),
+    Config(cases: 2000, ..Property.config()),
+    |(k, m)| {
+      sent = Some(Encode.encode(k, m)) escape {
+        Unencodable(..) -> None
+      }
+      sent match {
+        Some(b) -> assert Decode.decode(b) == [Key(Golden.representative(k, m.other_keys))]
+        None    -> ()
+      }
+    },
+  )
+}
