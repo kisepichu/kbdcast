@@ -138,6 +138,7 @@ fn angle(cs: List[Int]) -> Angle {
   }
 }
 
+# FRICTION(021): the modifiers are put in `done`, so that the call to `modifiers` is a tail call.
 # The modifiers at the start of `cs` (each one a letter and `-`), with those of `done`, and what
 # follows them. Their order does not matter, so they are kept in the reverse of the written order.
 fn modifiers(cs: List[Int], done: List[Modifier]) -> (List[Modifier], List[Int]) {
@@ -191,6 +192,8 @@ fn named(name: List[Int]) -> Option[KeyCode] {
   }
 }
 
+# FRICTION(016): there is no pattern that splits off the start of a String (`"f" ++ n`), so the
+# name is matched as code points, and its number is made from the digits.
 # F1 to F12: `f` and a number without a leading zero. `Key.f_key` rejects the numbers above 12.
 fn function_key(lowered: List[Int]) -> Option[KeyCode] {
   number = lowered match {

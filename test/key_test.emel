@@ -53,7 +53,8 @@ const CASES: List[((KeyCode, Mods), (KeyCode, Mods))] = [
 fn key_puts_the_code_and_the_mods_in_normal_form() {
   CASES.each(|((code, mods), want)| {
     made = Key.key(code, mods).map(|k| (k.code(), k.mods()))
-    # The input is on both sides, so that a failure shows which case it is.
+    # FRICTION(053): `assert` has no label, so the input is on both sides, so that a failure shows
+    # which case it is.
     assert ((code, mods), made) == ((code, mods), Some(want))
   })
 }

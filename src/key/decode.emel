@@ -93,6 +93,9 @@ const SHIFT: Mods = Mods(shift: True, ..NO_MODS)
 ## 6. Anything else is UTF-8: each code point is a character, and each run of bytes at which no
 ##    code point starts is unknown.
 pub fn decode(b: Bytes) -> List[Decoded] {
+  # FRICTION(052): Bytes has no list pattern, so the walk keeps the bytes two ways in step: `b` and
+  # the offset `at`, to slice and to read UTF-8, and `bs`, the List of the bytes from `at` on, to
+  # match.
   items(b, 0, b.to_list(), [])
 }
 
@@ -135,6 +138,8 @@ fn opens_sequence(rest: List[Int]) -> Bool {
 # the number of bytes it takes. `bs` holds the bytes from `at` on, and is not empty.
 fn unprefixed(b: Bytes, at: Int, bs: List[Int], alt: Bool) -> (Decoded, Int) {
   bs match {
+    # FRICTION(050): a list pattern cannot start with the bytes of a const (`[..PASTE_START, ..]`),
+    # so the arm matches its first 2 bytes, and a guard compares a slice of `b` with all of it.
     [ESC, LEFT_BRACKET, ..] if b.slice(at, at + PASTE_START.size()) == PASTE_START -> paste(b, at)
     # `ESC [` that ends `b` starts no sequence.
     [ESC, LEFT_BRACKET, ..rest] if !rest.is_empty() -> csi(b, at, rest, alt)
