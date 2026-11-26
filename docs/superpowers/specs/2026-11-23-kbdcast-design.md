@@ -191,7 +191,7 @@ flowchart LR
 | 方針 | kbdcast での使い方 |
 |---|---|
 | Parse, don't validate | tape のパーサは、正しくない形を表現できない `Tape` を返す（`run` は 1 回だけ、`size` は `run` の前、steps は `run` の後） |
-| 不正な状態を表現できなくする | Bool を並べずに enum を使う（`CursorKeys = Normal \| Application`）。値に範囲があるもの（`F(n)`）は、opaque な型と検査付きの構築関数で作る |
+| 不正な状態を表現できなくする | Bool を並べずに enum を使う（`CursorKeys = Normal \| Application`）。値に範囲があるもの（F キーの番号の `FKey`）は、opaque な型と検査付きの構築関数で作る |
 | エラーは型で表す | 想定内の失敗は `fails` で返し、tape の行番号を持たせる。バグは defect にする |
 | 純粋な core | VT、key codec、overlay は純粋な関数の fold として書き、effect を付けない |
 | effect は 2 つの層の port | host の port（`Pty`、`Clock`、`CastSink`）と、ドメインの port（`Driver`）。handler が adapter、layer が「本番用」「テスト用」の組み合わせ |
@@ -202,7 +202,7 @@ opaque な型と構築関数の Emela での書き方は、R の段階で spec �
 
 | 型 | 中身 | 置き場所 |
 |---|---|---|
-| `Key(code, mods)` | `KeyCode` は `Char \| Enter \| Esc \| Tab \| ... \| F(n)` | 2 |
+| `Key(code, mods)` | `KeyCode` は `Char \| Enter \| Esc \| Tab \| ... \| Function(FKey)` | 2 |
 | `InputModes` | `CursorKeys`（DECCKM）、LNM、modifyOtherKeys の段階。VT が持ち、encoder が読む（2 の spec §6） | 2 と 3 |
 | `encode(Key, InputModes) -> Bytes` | 今のモードで表せないキーは `fails Unencodable` | 2 |
 | `decode(Bytes) -> List[Decoded]` | `Decoded` は `Key \| Paste \| Unknown(Bytes)`。失敗しない | 2 |
