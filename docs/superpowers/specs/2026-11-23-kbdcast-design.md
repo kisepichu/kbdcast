@@ -150,7 +150,7 @@ kbdcast/
 ├── src/
 │   ├── key.emel, key/{notation,encode,decode}.emel        (2)
 │   ├── utf8.emel                                          UTF-8 のストリーム用デコーダ
-│   ├── vt/{parser,screen,width}.emel                      (3)
+│   ├── vt.emel, vt/{parser,screen,terminal,width}.emel     (3)
 │   ├── cast.emel                                          asciicast v3 の読み書き (Std.Json)
 │   ├── tape.emel, recorder.emel                           (1)
 │   └── overlay.emel                                       (4)
@@ -206,7 +206,7 @@ opaque な型と構築関数の Emela での書き方は、R の段階で spec �
 | `InputModes` | `CursorKeys`（DECCKM）、LNM、modifyOtherKeys の段階。VT が持ち、encoder が読む（2 の spec §6） | 2 と 3 |
 | `encode(Key, InputModes) -> Bytes` | 今のモードで表せないキーは `fails Unencodable` | 2 |
 | `decode(Bytes) -> List[Decoded]` | `Decoded` は `Key \| Paste \| Unknown(Bytes)`。失敗しない | 2 |
-| `Terminal.feed(t, Bytes) -> (Terminal, List[Reply])` | UTF-8 のデコード、parser、screen の fold | 3 |
+| `Vt.feed(t, String) -> (Terminal, List[Reply])` | parser と画面の fold。入力は文字列で、PTY の bytes は `Utf8` のストリーム用デコーダで先に文字列にする（3 の spec §2） | 3 |
 | `Event` | `Output \| Input \| Resize \| Marker \| Exit` | cast |
 | `Tape(settings, command, steps)` | `Step` は `Keys \| Sleep \| Wait \| SetTyping \| SetTimeout` で、それぞれ行番号を持つ | 1 |
 
@@ -292,7 +292,7 @@ effect Driver {
 |---|---|---|
 | regex | 性質テスト + 差分テスト | 対応する範囲のパターンと文字列をランダムに作り、一致するかどうかを JS の RegExp と比べる。RegExp は `test/` の中で `@external` を通して正解役（oracle）として呼ぶだけで、製品のコードには入らない |
 | key codec | 性質テスト + golden | `parse(print(k)) == [k]`。モード m で表せる k について、`decode(encode(k, m))` が k の代表に戻る。golden の表は、WezTerm が使う encoder（termwiz 0.22.0）を Rust の harness から呼んで生成する。手で打つと、Windows 版 WezTerm と WSL の間の ConPTY を通り、組み合わせも打ち切れないため（2 の spec §8） |
-| VT | 性質テスト + 差分テスト + golden | 入力をどこで分割しても結果が変わらない（`feed(feed(t, a), b) == feed(t, a ++ b)`）。UTF-8 やエスケープシーケンスの途中で切れる場合もまとめて検査できる。カーソルが画面の外に出ないことも見る。差分テストの参照は avt（agg が中で使う emulator）で、小さな Rust の harness でスナップショットを出す |
+| VT | 性質テスト + golden | 入力をどこで分割しても結果が変わらない（`feed(feed(t, a), b) == feed(t, a ++ b)`）。escape の列の途中で切れる場合もまとめて検査できる。UTF-8 の途中で切れる場合は `Utf8` のデコーダの性質テストと、JS の `TextDecoder` との差分テストで見る。カーソルが画面の外に出ないことも見る。golden の表は、avt 0.18.0（agg 1.9.0 が中で使う emulator）を Rust の harness から呼んで生成する（3 の spec §9） |
 | tape のパーサ | golden | パース結果と、エラーの行、列、文言 |
 | recorder | fake | `TestDriver` で、tape から操作の並び（キーを送る間隔を含む）を見る。`FakePty` と `TestClock` で、問い合わせへの返事、遅れて届く出力、途中での終了を決定的に再現する |
 | pty-bun | 結合テスト | 本物の PTY で `cat` や小さなスクリプトを動かす。時間は揺れるので、中身だけを確かめる |
@@ -395,7 +395,7 @@ flowchart LR
 - Emela 0.29 で capture checking が既定になる予定（#666）。版を固定し、上げるときにメモを見直す。
 - JS ターゲットでは `Array.set` が常にコピーするので、VT の画面の更新が遅い可能性がある。3 で測る。
 - overlay が画面を描き直す出力は cast を大きくする。差分だけを出すかどうかは 4 で決める。
-- Rust のビルド。2 の termwiz の harness で用意し（Rust の版は `mise.toml` で固定）、3 の avt の harness も同じ形で足す。
+- Rust のビルド。2 の termwiz の harness で用意し（Rust の版は `mise.toml` で固定）、3 の avt の harness も同じ形で足した。
 
 ## 15. 決定の記録
 
@@ -411,5 +411,6 @@ flowchart LR
 | recorder の並行処理 | fiber 1 本で出力を読み続ける | 読み込み用の fiber と queue（状態を共有することになり、テストが決定的でなくなる） |
 | 順序 | 0、R、2、3、1、4 | recorder を先にする（`wait` を一度仮の意味で作り、後で意味を変えることになる） |
 | tools の言語 | Bun 上の TypeScript | Emela（Emela のコードより前に要り、そのときはまだ regex もない） |
+| VT の意味論 | avt 0.18.0（agg 1.9.0）と同じ画面を作る。入力は文字列 | xterm の ctlseqs を正にする（agg が元の cast を描いたときと食い違いうる）、Bytes を受ける（cast の `o` は文字列） |
 | key codec の encode | WezTerm の既定（普通のキー、DECCKM、LNM、modifyOtherKeys）を真似る。今の mode で表せないキーは `Unencodable` | kitty も扱う（flags の扱いが増え、golden に WezTerm の設定の変更が要る）、表せないキーは修飾を落として送る（書いた意図が黙って失われる） |
 | key codec の正解 | termwiz を Rust の harness から呼んで生成した表 | WezTerm で手で打って録る（ConPTY を通り、組み合わせを打ち切れない） |
