@@ -1,0 +1,89 @@
+# wish-target: src/cast.emel
+import Std.Json
+
+# 前のイベントの時刻（録画の始まりからのミリ秒）
+pub opaque type Writer(last_ms: Int)
+
+pub fn header(cols: Int, rows: Int, command: String) -> String {
+  let cmd = Json.encode(Json.String(command))
+  "{\"version\": 3, \"term\": {\"cols\": ${cols}, \"rows\": ${rows}, \"type\": \"xterm-256color\"}, \"command\": ${cmd}}"
+}
+
+pub fn writer() -> Writer {
+  Writer(last_ms: 0)
+}
+
+pub fn event(w: Writer, at_ms: Int, code: String, data: String) -> (Writer, String) {
+  let line = "[${interval(at_ms - w.last_ms)}, ${Json.encode(Json.String(code))}, ${Json.encode(Json.String(data))}]"
+  (Writer(last_ms: at_ms), line)
+}
+
+# ミリ秒の差を、秒で小数 3 桁に書く（1234 は "1.234"）
+fn interval(ms: Int) -> String {
+  let frac = (ms % 1000).to_string().pad_start(3, "0")
+  "${ms / 1000}.${frac}"
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0118]: expected expression
+#    ╭─[ src/cast.emel:8:3 ]
+#    │
+#  8 │   let cmd = Json.encode(Json.String(command))
+#    │   ─┬─  
+#    │    ╰─── 
+# ───╯
+#
+# error[E0122]: expected newline or `}` after statement
+#    ╭─[ src/cast.emel:8:7 ]
+#    │
+#  8 │   let cmd = Json.encode(Json.String(command))
+#    │       ─┬─  
+#    │        ╰─── 
+# ───╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/cast.emel:17:3 ]
+#     │
+#  17 │   let line = "[${interval(at_ms - w.last_ms)}, ${Json.encode(Json.String(code))}, ${Json.encode(Json.String(data))}]"
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/cast.emel:17:7 ]
+#     │
+#  17 │   let line = "[${interval(at_ms - w.last_ms)}, ${Json.encode(Json.String(code))}, ${Json.encode(Json.String(data))}]"
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/cast.emel:23:3 ]
+#     │
+#  23 │   let frac = (ms % 1000).to_string().pad_start(3, "0")
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/cast.emel:23:7 ]
+#     │
+#  23 │   let frac = (ms % 1000).to_string().pad_start(3, "0")
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `line` in this scope
+#     ╭─[ src/cast.emel:18:28 ]
+#     │
+#  18 │   (Writer(last_ms: at_ms), line)
+#     │                            ──┬─  
+#     │                              ╰─── 
+# ────╯
+#
+# 7 errors, 1 warning
+# --- end wish check ---
