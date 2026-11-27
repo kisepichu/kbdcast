@@ -248,11 +248,13 @@ fn csi(t: Terminal, ps: List[List[Int]], inter: Option[Int], f: Int) -> (Termina
   }
 }
 
-# avt's `Param::as_u16`: the first part of a parameter (the parser never gives one with no part).
+# avt's `Param::as_u16`: the first part of a parameter.
+# FRICTION(040): the parser never gives a parameter with no part, so the `None` of `p.head()`
+# cannot happen, and Option has no `expect`; the match on the parts makes `[]` the panic.
 fn value(p: List[Int]) -> Int {
   p match {
     [n, ..] -> n
-    []      -> 0
+    []      -> panic("a CSI parameter with no part, which Vt.Parser never gives")
   }
 }
 
