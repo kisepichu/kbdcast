@@ -64,12 +64,14 @@ fn a_process_ended_by_a_signal_exits_with_128_and_the_signal() {
   assert code == 137
 }
 
-# The first read is cut off before the output arrives; the output is not lost.
+# The first read is cut off before the output arrives, and the output arrives while no read waits
+# (at 200 ms, during the sleep); the next read still gets it.
 @test
 fn an_interrupted_read_loses_no_output() {
   with SystemClock, BunPty(["sh", "-c", "sleep 0.2; printf late"], 80, 24, "/tmp", []) {
     pty = use Pty
     assert Fiber.timeout(50, || pty.read()) == None
+    (use Clock).sleep(300)
     assert pty.read() == Data(Bytes.encode_utf8("late"))
   }
 }
