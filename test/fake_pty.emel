@@ -34,6 +34,7 @@ pub fn script(events: List[Event]) -> Script {
 
 # Longer than any test: a read with nothing to come waits this long, which is until it is
 # interrupted.
+# FRICTION(082): there is no direct way to wait until interrupted, so the wait is the longest sleep.
 const FOREVER: Int = 2147483647
 
 ## `with FakePty(echo) { ... }` plays the script in `State[Script]` on the time of Clock. `read`
@@ -76,6 +77,8 @@ fn next_output() -> Output uses { Clock, State[Script] } {
       Data(Bytes.concat(ready.map(|(_, b)| b)))
     }
     ([], [], Some((at, code))) if at <= now -> Exited(code)
+    # FRICTION(015): there is no or-pattern, so waiting for the next output, and for the exit when
+    # no output is left, have an arm each with the same body.
     ([], [(at, _), ..], _) -> {
       clock.sleep(at - now)
       next_output()
@@ -84,6 +87,7 @@ fn next_output() -> Output uses { Clock, State[Script] } {
       clock.sleep(at - now)
       next_output()
     }
+    # FRICTION(082): waits until interrupted by sleeping for the largest Int.
     ([], [], None) -> {
       clock.sleep(FOREVER)
       next_output()

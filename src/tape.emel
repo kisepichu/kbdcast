@@ -293,6 +293,8 @@ fn command(line: Int, arg: Span) -> Command fails TapeError {
 
 # Outside quotes, or inside the quote `mark` (`'` or `"`) that opened at the column `open`, for the
 # error if it does not close.
+# FRICTION(015): there is no or-pattern, so the two quotes are one variant that holds its mark, and
+# one arm takes a quote that does not close, whichever it is.
 enum Quote {
   Bare
   Quoted(mark: Int, open: Int)

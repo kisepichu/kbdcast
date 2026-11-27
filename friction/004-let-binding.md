@@ -25,6 +25,7 @@
   cast の writer の wish（`wish/cast.emel`、サブプロジェクト 1 の計画の Task 2）でも、3 行に `let` を書いた（`:8`、`:17`、`:23`）
   BunPty の wish（`wish/pty_bun.emel`、サブプロジェクト 1 の計画の Task 3）でも、3 行に `let` を書いた（`:38`、`:39`、`:51`）
   recorder の wish（`wish/recorder.emel`、サブプロジェクト 1 の計画の Task 4）でも、1 行に `let` を書いた（`:39` の `let last = rest.is_empty()`）
+  LiveDriver の wish（`wish/live.emel`、サブプロジェクト 1 の計画の Task 5）でも、7 行に `let` を書いた（`:41`、`:48`、`:60`、`:75`、`:92`、`:94`、`:117`。`:92`、`:94`、`:117` は `let (next_vt, replies) = ...` のように組を分ける形）
   cli の main の wish（`wish/main.emel`、サブプロジェクト 1 の計画の Task 6）でも、3 行に `let` を書いた（`:31`、`:34`、`:38`。`:31` と `:34` は右辺の後ろに `catch { ... }` を付けた形）
 - 診断:
   wish check（emela 0.28.2、`wish/text.emel:52-155`）。`let` の行ごとに 2 つ出る:

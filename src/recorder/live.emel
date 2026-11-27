@@ -105,7 +105,9 @@ fn running() -> () fails ProcessExited uses { State[Recording] } {
 
 # Reads the PTY until `window` milliseconds have passed since `start`. The output read at a time is
 # at the tape time plus the time since `start`, kept within the window and not before `previous`,
-# the time of the output before it in the window (the clock is a wall clock, friction 032).
+# the time of the output before it in the window.
+# FRICTION(032): Clock reads only the wall clock, which can step; `previous` and the two clamps keep
+# the times of a window in order and inside it.
 fn read_window(start: Instant, window: Int, previous: Int) -> ()
   fails ProcessExited
   uses { Async, Clock, Pty, State[Recording], Stdout } {

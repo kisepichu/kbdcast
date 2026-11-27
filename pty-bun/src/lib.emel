@@ -31,6 +31,8 @@ fn open_error(h: Host) -> String
 
 # The output that has arrived, waiting until some arrives. Empty once the process has exited and its
 # output has ended. An interrupted read leaves the output for the next read.
+# FRICTION(064): Option is not a boundary type, so the end of the output comes back as empty
+# Bytes, and the exit code through a second function (`exit_code`).
 @external(js, "./pty.mjs", "read")
 suspend fn read_output(h: Host) -> Bytes
 

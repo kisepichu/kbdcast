@@ -1,6 +1,9 @@
 # The entry of kbdcast (spec §9). `kbdcast rec <tape>` reads the tape, parses it, and records it
 # under BunPty, SystemClock and SystemStdout, writing the cast to stdout. An error goes to stderr
 # with exit code 1, and wrong arguments write the usage with exit code 2.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
 
 import Kbdcast.Key.Encode
 import Kbdcast.Key.Encode.{Unencodable, NeedsOtherKeys, NeedsKitty, One, Two}

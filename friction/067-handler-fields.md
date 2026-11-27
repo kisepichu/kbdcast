@@ -22,6 +22,6 @@
 - コスト: コードのコストは無い。直すには spec を引く必要があった。普段のコードに基盤レベルは漏れていない
 - spec:
   `[effect.handler]`（「A handler with state declares fields after its name. Fields are referenced through `self`, as in `self.conn`.」）、`[module.resolution]`（`self` は操作と release の中で見える。init では見えない）、`[grammar.decl]` の `handler_decl`、`spec/diagnostics.md` の E0110 と E0211
-- 既存: emela の issue と PR は探していない
+- 既存: emela の issue と PR に無い（2026-11-28、`gh search issues --repo emela-lang/emela --include-prs` で「handler field」「handler fields self」「self handler」「handler state」「E0110 handler」「handler body field」「handler の欄」「欄 self」「handler 状態」「fields after its name」を検索）。当たったのは別の話題: init で handler の値を `Self(...)` と書けるようにする #646、init の中で handler の値を `Self(...)` だけで作る proposal #907（open。`BunPty(host:)` のような handler の名前の構成子は、0.30 までは W4001、0.30 からは E4014 にする案）、with の項目に括弧を付ける案 #904（open）、release の後の handler member の #712 など。欄の宣言の場所や `self` を示す診断の話は無い
 - 行き先:
   自分の誤解だった → 診断の改善（emela の `spec/diagnostics.md`）。下書き（未提出。出すのは user）: In a handler body, `name: Type` gets ``E0110: expected `init`, `release`, operation (`fn`) or inner handler (`handler`)``; it could add ``help: a handler declares its fields after its name: `handler H(name: Type): E` ``. Inside the operations and the release of a handler with a field `host`, an unresolved `host` could get ``help: fields are read through self: `self.host` ``
