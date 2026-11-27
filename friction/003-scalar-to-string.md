@@ -14,6 +14,7 @@
   UTF-8 デコーダの wish check（v0.28.2）: `:76` に ``error[E0212]: module `String` has no `from_chars` ``、`:63` の `List[Char]` に ``error[E0211]: cannot find type `Char` in this scope`` が 2、`:56` の `Char.from_int` に ``error[E0211]: cannot find module or trait `Char` in this scope``。どれも help は付かない。`:15` は char literal（013）の E0105 の行に、`:24` は構成子を並べた `type`（029）の中に、`:32` は `=>` の腕（E0110）の中にあり、届かなかった
   VT の parser の wish check（v0.28.2）では、5 か所とも届かなかった。`:55` は `let`（004）で崩れた `fold` の closure の中、ほかの 4 か所は範囲パターン（038）と or-pattern（015）で崩れた腕の中にあった
   VT の解釈の wish check（v0.28.2）: `Char` に ``error[E0211]: cannot find type `Char` in this scope`` が 7（`:79` と `:158` に 2 つずつ、`:226` に 1 つ、`:242` に 2 つ）。help は付かない。`:68` の `s.chars()`（Emela の `chars` は grapheme cluster の String の List を返す）と `:70-71` の `inter.last()` は `=>` の腕（E0110）の中にあり、届かなかった
+  VT の公開 API の wish check（v0.28.2）: `:66-68` の `line.filter(...).map(fn(c) { String.from_code_point(c.char) })` に ``error[E0301]: type mismatch: expected `List[String]`, found `List[Option[String]]` ``（``= note: the mismatch is between `String` and `Option[String]` ``）。続く `.join("")` が `List[String]` を求めるので出た。help は付かない
 - 回避策:
   10 か所（どれも `FRICTION(003)` の印）
   - `Text.slice`（`text/src/lib.emel`）: `from_code_points(...)` の `None` を `panic` にする．code point は `s` から取ったので起きない
@@ -27,6 +28,8 @@
   - `character`（`src/vt/parser.emel`、サブプロジェクト 3 の計画の Task 3）: `advance` が受けた String の code point を、`Print` の文字列（`string_of`、002）と中間の文字（`collect`）にするため `String.from_code_point` で 1 文字の String にし、起きない `None` をその場の match で defect にした（040）。UTF-8 デコーダの `character` と同じ形を、private なのでもう 1 つ書いた
   - `character`（`test/parser_test.emel`、Task 3）: テストが入力を code point の位置で切って String に戻す所（`string_of`、002）と、生成器が U+00A0 までの code point を 1 文字の部品にする所で、起きない `None` を match で defect にする
   - `character`（`test/vt_snapshot.emel`、サブプロジェクト 3 の計画の Task 5）: スナップショットの String を作るため、セルの code point（`Vt.Screen` の `Cell` は Int で持つ）を `String.from_code_point` で 1 文字の String にし、起きない `None` をその場の match で defect にした（040）。`src/vt/terminal.emel` は文字を初めから Int の code point で持ち（`Print` の文字列は `code_points()`、中間の文字は `code_points().last()`、終わりの文字は parser の Int のまま）、String にしないので、そちらは回り道に数えない
+  - `character`（`src/vt.emel`、サブプロジェクト 3 の計画の Task 6）: `text` が各行のセルの code point（`Cell` は Int で持つ）を `String.from_code_point` で 1 文字の String にし（`string_of`、002）、起きない `None` をその場の match で defect にした（040）。wish（`wish/vt.emel:68`）は `String.from_code_point` が String を返す形で書いていた。`test/vt_snapshot.emel` と同じ形を、private なのでもう 1 つ書いた
+  - `character`（`test/vt_test.emel`、Task 6）: テストが入力を code point の位置で切って String に戻す所（`string_of`、002）で、起きない `None` を match で defect にする（`test/parser_test.emel` と同じ形）
   `from_code_points` は，wish では `List.all` で確かめてから `String.from_scalars` で組み立てていた．実装は確かめと組み立てを `String.from_code_point` の Option 1 つで済ませたので，そこに残った回り道は Option の List をまとめる関数が無いこと（006）で，ここには数えない
   std も `String.to_ascii_lowercase` と `String.to_ascii_uppercase` で，同じ起きない `None` を `.or("")` で握りつぶしている
 - コスト: 補助関数 3 つ（`code_point`，`string_of`，表記の `text_of`．`string_of` は 002 を避けるためでもある）と，起きない分岐 4 つ（25 行ほど）と `expect`（040）の呼び出し 1 つ．普段のコードに基盤レベルは漏れていない
@@ -34,6 +37,7 @@
   UTF-8 デコーダ（Task 1）: 補助関数 1 つ（`character`、起きない分岐を含めて 6 行）。読めた文字ごとに 1 文字の String を作ってからつなぐ（1,000,000 byte を 4096 byte ずつ読んで 118–165 ms。055 の計測）。テストの生成器にも補助関数 1 つ（`encoded`、3 行）
   VT の parser（Task 3）: 補助関数 1 つ（`character`、起きない分岐を含めて 6 行）。書く文字は code point の List に逆順で持ち、`Print` にする所で 1 文字ずつ String にしてつなぐ。テストにも同じ補助関数 1 つ（6 行）
   VT の解釈（Task 5）: test の補助に補助関数 1 つ（`character`、起きない分岐を含めて 6 行）。スナップショットの各セルで 1 文字の String を作ってつなぐ
+  VT の公開 API（Task 6）: 補助関数 1 つ（`character`、起きない分岐を含めて 6 行）。`text` を呼ぶたびに、見えている画面の各セルで 1 文字の String を作ってつなぐ（80 × 24 で 1920 個）。テストにも同じ補助関数 1 つ（6 行）
 - spec: `[api.string]`（`from_code_point`），`[target.string]`（「There is no character type」），`[lib.api-rules]`（「A precondition of the caller is broken: it is a defect」）
 - 既存: なし（emela の issue と `proposals/` に無い．002 と同じ検索，2026-11-25）
 - 行き先: 前提の範囲内で spec に足りない → 002 の proposal の Open questions に足した．単独の proposal にはしない（O(`to - from`) の `slice` が std に入れば，text の 1 か所と regex の `string_of` は消える．残るのはテストの生成器と regex の group の名前の 2 か所で，どちらも String から取ったのではない code point から String を作る）

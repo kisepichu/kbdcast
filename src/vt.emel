@@ -1,0 +1,114 @@
+# The VT: reads the output of a terminal application and makes the screen that avt 0.18.0 makes.
+# The recorder feeds it the output of the PTY and writes the replies back, `wait` reads its text,
+# and the overlay draws its lines and its cursor.
+# The behavior follows avt 0.18.0 (Apache-2.0, https://github.com/asciinema/avt)
+# (`text` is avt's `Buffer::text`, without joining a row that wraps to the next.)
+#
+# FRICTION(012): Emela does not re-export what a module imports, so a user imports `Reply` from
+# Vt.Terminal and `Cell` from Vt.Screen.
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
+
+import Std.Bytes.{Bytes}
+import Vt.Parser.{Parser}
+import Vt.Screen.{Cell, WideTail}
+import Vt.Terminal.{Reply, DeviceAttributes, Status, CursorPosition}
+import Key.Encode.{InputModes}
+
+## A terminal of a fixed size, and what is left of a sequence that the output fed so far cut.
+pub opaque type Terminal(parser: Parser, term: Terminal.Terminal)
+
+## A terminal of `cols` columns and `rows` rows as an application finds it. Fewer than one column or
+## row is a defect.
+pub fn new(cols: Int, rows: Int) -> Terminal {
+  Terminal(parser: Parser.parser(), term: Terminal.terminal(cols, rows))
+}
+
+## The terminal after the output `s`, and the replies to the queries in it, in order. A sequence
+## that `s` cuts takes effect with the output fed next.
+pub fn feed(t: Terminal, s: String) -> (Terminal, List[Reply]) {
+  (parser, actions) = Parser.advance(t.parser, s)
+  (term, replies) = actions.fold((t.term, []), |(term, replies), a| {
+    (next, more) = Terminal.apply(term, a)
+    (next, List.append(replies, more))
+  })
+  (Terminal(parser:, term:), replies)
+}
+
+## The bytes that answer a query: `CSI ? 62 ; 22 c`, `CSI 0 n`, and `CSI row ; col R` with the row
+## and the column of `CursorPosition` written in decimal as they are.
+pub fn reply_bytes(r: Reply) -> Bytes {
+  r match {
+    DeviceAttributes         -> Bytes.encode_utf8("\u{1b}[?62;22c")
+    Status                   -> Bytes.encode_utf8("\u{1b}[0n")
+    CursorPosition(row, col) -> Bytes.encode_utf8("\u{1b}[#{row};#{col}R")
+  }
+}
+
+## The number of columns and the number of rows.
+pub fn size(t: Terminal) -> (Int, Int) {
+  s = Terminal.screen(t.term)
+  (Screen.cols(s), Screen.rows(s))
+}
+
+## The cells of each row of the screen in view from the top, each row from the left.
+pub fn lines(t: Terminal) -> List[List[Cell]] {
+  Screen.lines(Terminal.screen(t.term))
+}
+
+## The column and the row of the cursor, or `None` while it is hidden. The column is `cols` right
+## after writing in the last column, as in avt.
+pub fn cursor(t: Terminal) -> Option[(Int, Int)] {
+  (col, row, visible) = Terminal.cursor(t.term)
+  if visible { Some((col, row)) } else { None }
+}
+
+## The characters of each row of the screen in view, without the right halves of wide characters and
+## without the White_Space at the end of the row, the rows joined by `\n`. A row that wraps is not
+## joined to the next.
+pub fn text(t: Terminal) -> String {
+  lines(t).map(row_text).join("\n")
+}
+
+## The modes that change what the keys send: DECCKM, LNM and modifyOtherKeys.
+pub fn input_modes(t: Terminal) -> InputModes {
+  Terminal.input_modes(t.term)
+}
+
+# The characters of a row, without the right halves of wide characters and without the White_Space
+# at the end (avt's `Line::text` and the `trim_end` in `Buffer::text`).
+fn row_text(cells: List[Cell]) -> String {
+  string_of(cells.filter(|c| c.occupancy != WideTail).map(|c| c.char)) |> trim_end()
+}
+
+# `s` without the White_Space at its end (Rust's `trim_end`, which avt uses).
+# FRICTION(059): String has no `trim_end`, and `String.trim` takes the White_Space at the start
+# too, so that is put back: it is the part of `s` before what `trim` leaves, which begins and ends
+# with a character that is not White_Space and so is found in `s` only once.
+fn trim_end(s: String) -> String {
+  kept = s.trim()
+  if kept == "" {
+    ""
+  } else {
+    String.split(s, kept) match {
+      [start, _] -> "#{start}#{kept}"
+      parts      -> panic("#{kept} is found in #{s} more than once: #{parts}")
+    }
+  }
+}
+
+# FRICTION(002): String has no `from_code_points`, so the text of a row is built from the code points
+# of its cells one by one.
+fn string_of(cps: List[Int]) -> String {
+  cps.map(character).join("")
+}
+
+# FRICTION(003): the code point of a cell is a scalar value, but `String.from_code_point` returns an
+# Option.
+# FRICTION(040): Option has no `expect`, so the None that cannot happen is a match with a panic.
+fn character(c: Int) -> String {
+  String.from_code_point(c) match {
+    Some(s) -> s
+    None    -> panic("a cell holds #{c}, which is not a scalar value")
+  }
+}
