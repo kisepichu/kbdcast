@@ -8,6 +8,7 @@
   key codec の encode（`src/key/encode.emel` の `text_of`、Task 6）でも、`Char` の code point と制御文字の code point を `String.from_code_point` で String にする所の起きない `None`（003）を defect にする。golden の補助（`test/golden.emel`、Task 6）でも、`representative` が代表のキーに Alt を付け直す `Key.key` の起きない `None` を defect にする
   ストリーム用の UTF-8 デコーダ（`src/utf8.emel` の `character`、サブプロジェクト 3 の計画の Task 1）でも、WHATWG の decoder が作った code point を `String.from_code_point` で String にする所の起きない `None`（003。境界の検査が surrogate、U+10FFFF より上、過長を除く）を defect にする。そのテスト（`test/utf8_test.emel`）の生成器でも、0〜255 の Int だけで作った bytes の List を `Bytes.from_list` で Bytes にする所と、生成した scalar value を `String.from_code_point` で String にする所（003）の、起きない `None` を defect にする
   VT の parser（`src/vt/parser.emel` の `character`、サブプロジェクト 3 の計画の Task 3）でも、`advance` が受けた String の code point を `String.from_code_point` で String にする所の起きない `None`（003）を defect にする。そのテスト（`test/parser_test.emel` の `character`）でも、入力から取った code point と、生成器が作った U+00A0 までの code point を String にする所の起きない `None` を defect にする
+  VT の画面（`src/vt/screen.emel` の `at`、サブプロジェクト 3 の計画の Task 4）でも、呼ぶ側が範囲の中と知っている位置（行は `rows` 未満、列は `cols` 未満）の行やセルを `Array.get` で読む所（009）の、起きない `None` を defect にする
 - こう書きたかった:
   `wish/notation.emel:38`、`:127`。Rust の `Option::expect`
   ```emela
@@ -23,6 +24,7 @@
   ...
   key(code, mods).expect("a key that termwiz encoded")
   ```
+  VT の画面の wish（`wish/screen.emel`）は、読む所を添字の `s.grid[row]`、`line[col]` で書いた（009）ので、`.expect` は書いていない
 - 診断:
   wish check（v0.28.2）で、2 か所とも ``error[E0313]: type `Option[Key]` has no field or function `expect` ``。help は付かない
   repo の外の使い捨ての Pome での最小の形（`xs.head().expect("not empty")`、2026-11-27）でも ``error[E0313]: type `Option[Int]` has no field or function `expect` `` の 1 つ
@@ -37,12 +39,14 @@
   golden の補助（Task 6）: `representative` で 2 つ目の `None` を defect にする所ができたので、`test/golden.emel` に 4 つ目の private な `expect` を置き（`FRICTION(040)` の印）、Task 5 の `row_key` のその場の match も `|> expect(...)` に直した。印は `expect` の定義に移した
   UTF-8 デコーダ（`src/utf8.emel` の `character`、`FRICTION(040)` の印）: `None` を defect にする所は 1 つなので、encode と同じくその場の match にした。wish（`wish/utf8.emel:32`、`:56` の `Char.from_int`）は失敗しない形を想定していたので、`.expect` は書いていない（003）。テスト（`test/utf8_test.emel` の `expect`、`FRICTION(040)` の印）には 5 つ目の private な `expect` を置き、`inputs`（`Bytes.from_list`）と `encoded`（`String.from_code_point`）の 2 か所から呼ぶ
   VT の parser（`src/vt/parser.emel` の `character`、`FRICTION(040)` の印）: `None` を defect にする所は 1 つなので、UTF-8 デコーダと同じくその場の match にした。wish（`wish/parser.emel:55` など）は `String.from_code_point` が String を返すと思っていたので、`.expect` は書いていない（003）。テスト（`test/parser_test.emel` の `character`、`FRICTION(040)` の印）も、`None` を defect にする所は `character` の中の 1 つなので、その場の match にした
+  VT の画面（`src/vt/screen.emel` の `at`、`FRICTION(009)` と `FRICTION(040)` の印）: Array を位置で読む所が 9 つあるので、その場の match を 9 つ書かず、private な `at[A](a: Array[A], index: Int) -> A`（`get` の match と panic）を 1 つ置いた。どの Option にも使える `expect` でなく、009 の下書きの `Array.at` の形にした（panic の文は `Array.set` の defect に倣って位置と大きさを言う）
 - コスト:
   補助関数 3 つ（6 行ずつ。表記、テストの生成器、decode）。method の形（`.expect(...)`）では書けず、pipe で書く（`[type.rules]`: method の形で呼べるのは、型を定義した module の関数だけ）。普段のコードに基盤レベルは漏れていない
   repo の中で同じ match を所ごとに書いている所が、これまでに 11 ある: `regex/src/fold.emel`、`regex/src/class.emel`、`regex/src/vm.emel`（どれも 009）、`regex/src/syntax.emel`、`regex/src/lib.emel`、`text/src/lib.emel`、`text/test/text_test.emel`（どれも 003）、`regex/test/differential_test.emel`、`regex/test/linear_test.emel`、`regex/test/find_test.emel`、`test/golden.emel`。std の `Std.Bytes.hex` も `from_hex(s)` の `None` を同じ形で `panic` にする（v0.28.2 の `std/bytes.emel:157-160`）
   encode と golden の補助（Task 6）: 補助関数がもう 1 つ（golden の補助の `expect`、6 行）と、その場の match が 1 つ（encode の `text_of`）。repo の中でその場の match を書いている所は、golden の補助の 1 つが `expect` に変わり、encode の 1 つが増えたので、11 のまま
   UTF-8 デコーダ（Task 1）: 補助関数がもう 1 つ（テストの `expect`、6 行）と、その場の match が 1 つ（`src/utf8.emel` の `character`）。repo の中でその場の match を書いている所は 12 になった
   VT の parser（Task 3）: その場の match が 2 つ（`src/vt/parser.emel` と `test/parser_test.emel` の `character`）。repo の中でその場の match を書いている所は 14 になった
+  VT の画面（Task 4）: 補助関数がもう 1 つ（`at`、6 行）。その場の match は増えない（14 のまま）
 - spec: `[api.option]`（`map`、`and_then`、`or`、`is_some`、`is_none`、`or_fail`）、`[lib.api-rules]`（「A precondition of the caller is broken: it is a defect.」）、`[type.rules]`、`spec/history.md:459`（`Option.unwrap_or` を `Option.or` にした。`unwrap` と `expect` には触れていない）
 - 既存: emela の issue と PR に無い（2026-11-27、`gh search issues --repo emela-lang/emela --include-prs` で「Option expect」「unwrap」を検索。「unwrap」で当たったのは `unwrap_or` を `or` にした #191 などで、別の話題）。checkout の main（596b6038）の core にも無い。009（範囲外を defect にする `Array.at`）と 003（失敗しない `String.from_scalars`）は、それぞれの所で起きない `None` を無くす案で、このメモはどの Option にも使える形
 - 行き先: 前提の範囲内で spec に足りない → proposal の下書きの材料（まだ書かない）。`Option.expect(opt, message) -> A`（`None` は `message` の defect）。`[lib.api-rules]` の「呼ぶ側の前提が壊れたら defect」を、呼ぶ側が 1 行で書ける形。009 と 003 と合わせ、repo と std の `None -> panic` の数を使い道に添える。未提出。出すのは user

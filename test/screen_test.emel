@@ -1,0 +1,361 @@
+import Vt.Screen.{
+  Screen,
+  Cell,
+  Pen,
+  Indexed,
+  Single,
+  WideHead,
+  WideTail,
+  NextChars,
+  ToEndOfScreen,
+  ToStartOfScreen,
+  WholeScreen,
+  ToEndOfLine,
+  ToStartOfLine,
+  WholeLine,
+  DEFAULT_PEN,
+}
+
+# The pen that the tests write over, erase and scroll with, so that the cells it reaches differ from
+# those written with the default pen.
+const RED: Pen = Pen(background: Some(Indexed(1)), ..DEFAULT_PEN)
+
+const SMALL_A: Int = 0x61 # a
+const HIRAGANA_A: Int = 0x3042 # あ
+const HIRAGANA_I: Int = 0x3044 # い
+const HIRAGANA_U: Int = 0x3046 # う
+
+# A blank cell with `pen`.
+fn blank(pen: Pen) -> Cell {
+  Cell(0x20, Single, pen)
+}
+
+# `s` after writing the characters of `text` with the default pen from column `col` of row `row` on,
+# each after the columns that the one before took.
+fn put(s: Screen, col: Int, row: Int, text: String) -> Screen {
+  (written, _) = text.code_points().fold((s, col), |(at, col), c| {
+    Screen.print(at, col, row, c, DEFAULT_PEN) match {
+      (next, Some(width)) -> (next, col + width)
+      (_, None)           -> panic("#{text} does not fit from column #{col}")
+    }
+  })
+  written
+}
+
+# A screen `cols` wide with a row for each of `rows`, written with the default pen (avt's test helper
+# `buffer`, which takes the width from the first row).
+fn screen_of(cols: Int, rows: List[String]) -> Screen {
+  rows.enumerate().fold(Screen.blank(cols, rows.length(), DEFAULT_PEN), |s, (row, text)| {
+    put(s, 0, row, text)
+  })
+}
+
+# The code points of the characters of each line of `s`.
+fn chars(s: Screen) -> List[List[Int]] {
+  Screen.lines(s).map(|line| line.map(|cell| cell.char))
+}
+
+# The same with the spaces at the end of each line removed (avt's `Buffer::text`, with no wrapped
+# line).
+fn text(s: Screen) -> List[List[Int]] {
+  chars(s).map(|line| {
+    reversed = line.reverse()
+    reversed.drop(reversed.find_index(|c| c != 0x20).or(reversed.length())).reverse()
+  })
+}
+
+# The code points of each of `texts`.
+fn code_points(texts: List[String]) -> List[List[Int]] {
+  texts.map(|t| t.code_points())
+}
+
+# For each line of `s`, `r` for a cell with the pen RED and `.` for any other.
+fn pens(s: Screen) -> List[String] {
+  Screen.lines(s).map(|line| line.map(|cell| if cell.pen == RED { "r" } else { "." }).join(""))
+}
+
+# avt's test `text` (buffer.rs), without the part that wraps lines.
+@test
+fn print_writes_each_character_where_it_is_asked() {
+  s = Screen.blank(10, 5, DEFAULT_PEN)
+  assert text(s) == code_points(["", "", "", "", ""])
+  written = put(s, 0, 0, "x")
+    |> put(1, 1, "x")
+    |> put(2, 2, "x")
+    |> put(3, 3, "x")
+    |> put(4, 4, "x")
+  assert text(written) == code_points(["x", " x", "  x", "   x", "    x"])
+}
+
+# avt's test `scroll_up` (buffer.rs): the view after the first three scrolls, without the wrapped
+# marks, the joined text and the scrollback.
+@test
+fn scroll_up_moves_the_lines_of_the_range_up_by_one() {
+  s = screen_of(4, ["aaaa", "aaaa", "aa  ", "bb", "cccc", "cccc", "cc"])
+  # the whole view
+  assert chars(Screen.scroll_up(s, 0, 7, 1, DEFAULT_PEN))
+    == code_points(["aaaa", "aa  ", "bb  ", "cccc", "cccc", "cc  ", "    "])
+  # the top of the view
+  assert chars(Screen.scroll_up(s, 0, 5, 1, DEFAULT_PEN))
+    == code_points(["aaaa", "aa  ", "bb  ", "cccc", "    ", "cccc", "cc  "])
+  # the bottom of the view
+  assert chars(Screen.scroll_up(s, 1, 7, 1, DEFAULT_PEN))
+    == code_points(["aaaa", "aa  ", "bb  ", "cccc", "cccc", "cc  ", "    "])
+}
+
+@test
+fn blank_makes_a_screen_of_blank_cells_with_the_pen() {
+  s = Screen.blank(3, 2, RED)
+  assert Screen.cols(s) == 3
+  assert Screen.rows(s) == 2
+  assert Screen.lines(s)
+    == [[blank(RED), blank(RED), blank(RED)], [blank(RED), blank(RED), blank(RED)]]
+}
+
+@test
+fn print_gives_the_width_and_writes_a_wide_character_in_two_cells() {
+  s = Screen.blank(4, 1, DEFAULT_PEN)
+  (narrow, width) = Screen.print(s, 0, 0, SMALL_A, RED)
+  assert width == Some(1)
+  assert Screen.lines(narrow)
+    == [[Cell(SMALL_A, Single, RED), blank(DEFAULT_PEN), blank(DEFAULT_PEN), blank(DEFAULT_PEN)]]
+  (wide, width) = Screen.print(s, 0, 0, HIRAGANA_A, RED)
+  assert width == Some(2)
+  assert Screen.lines(wide)
+    == [
+      [
+        Cell(HIRAGANA_A, WideHead, RED),
+        Cell(0x20, WideTail, RED),
+        blank(DEFAULT_PEN),
+        blank(DEFAULT_PEN),
+      ],
+    ]
+  # In the last two columns.
+  (last, width) = Screen.print(s, 2, 0, HIRAGANA_A, RED)
+  assert width == Some(2)
+  assert Screen.lines(last)
+    == [
+      [
+        blank(DEFAULT_PEN),
+        blank(DEFAULT_PEN),
+        Cell(HIRAGANA_A, WideHead, RED),
+        Cell(0x20, WideTail, RED),
+      ],
+    ]
+}
+
+@test
+fn print_does_not_write_a_wide_character_in_the_last_column() {
+  s = Screen.blank(3, 1, DEFAULT_PEN)
+  (after, width) = Screen.print(s, 2, 0, HIRAGANA_A, RED)
+  assert width == None
+  assert Screen.lines(after) == Screen.lines(s)
+  # Nor on the right half of a wide character in the last column.
+  wide = put(s, 1, 0, "あ")
+  (after, width) = Screen.print(wide, 2, 0, HIRAGANA_I, RED)
+  assert width == None
+  assert Screen.lines(after) == Screen.lines(wide)
+}
+
+# What is left of a wide character that a write cuts in half becomes a blank cell with the pen of
+# the write (avt's `Line::print`, arm by arm).
+@test
+fn print_over_a_wide_character_blanks_the_half_that_is_left() {
+  s = put(Screen.blank(4, 1, DEFAULT_PEN), 0, 0, "あ")
+  # A narrow character on the left half.
+  (left, _) = Screen.print(s, 0, 0, SMALL_A, RED)
+  assert Screen.lines(left)
+    == [[Cell(SMALL_A, Single, RED), blank(RED), blank(DEFAULT_PEN), blank(DEFAULT_PEN)]]
+  # A narrow character on the right half.
+  (right, _) = Screen.print(s, 1, 0, SMALL_A, RED)
+  assert Screen.lines(right)
+    == [[blank(RED), Cell(SMALL_A, Single, RED), blank(DEFAULT_PEN), blank(DEFAULT_PEN)]]
+  # A wide character on the left half takes the same two cells.
+  (same, _) = Screen.print(s, 0, 0, HIRAGANA_I, RED)
+  assert Screen.lines(same)
+    == [
+      [
+        Cell(HIRAGANA_I, WideHead, RED),
+        Cell(0x20, WideTail, RED),
+        blank(DEFAULT_PEN),
+        blank(DEFAULT_PEN),
+      ],
+    ]
+  # A wide character on the right half, with one column after it.
+  (shifted, _) = Screen.print(
+    put(Screen.blank(4, 1, DEFAULT_PEN), 1, 0, "あ"),
+    2,
+    0,
+    HIRAGANA_I,
+    RED,
+  )
+  assert Screen.lines(shifted)
+    == [
+      [blank(DEFAULT_PEN), blank(RED), Cell(HIRAGANA_I, WideHead, RED), Cell(0x20, WideTail, RED)],
+    ]
+}
+
+@test
+fn print_of_a_wide_character_over_two_wide_characters_blanks_both_halves_that_are_left() {
+  # う on the right half of あ, in front of い.
+  (after, width) = Screen.print(
+    put(Screen.blank(5, 1, DEFAULT_PEN), 0, 0, "あい"),
+    1,
+    0,
+    HIRAGANA_U,
+    RED,
+  )
+  assert width == Some(2)
+  assert Screen.lines(after)
+    == [
+      [
+        blank(RED),
+        Cell(HIRAGANA_U, WideHead, RED),
+        Cell(0x20, WideTail, RED),
+        blank(RED),
+        blank(DEFAULT_PEN),
+      ],
+    ]
+  # う on a narrow character, in front of あ.
+  (after, _) = Screen.print(
+    put(Screen.blank(5, 1, DEFAULT_PEN), 0, 0, "aあ"),
+    0,
+    0,
+    HIRAGANA_U,
+    RED,
+  )
+  assert Screen.lines(after)
+    == [
+      [
+        Cell(HIRAGANA_U, WideHead, RED),
+        Cell(0x20, WideTail, RED),
+        blank(RED),
+        blank(DEFAULT_PEN),
+        blank(DEFAULT_PEN),
+      ],
+    ]
+}
+
+@test
+fn erase_blanks_the_range_of_each_mode_with_the_pen() {
+  s = screen_of(4, ["abcd", "efgh", "ijkl"])
+  next = Screen.erase(s, 1, 1, NextChars(2), RED)
+  assert chars(next) == code_points(["abcd", "e  h", "ijkl"])
+  assert pens(next) == ["....", ".rr.", "...."]
+  below = Screen.erase(s, 1, 1, ToEndOfScreen, RED)
+  assert chars(below) == code_points(["abcd", "e   ", "    "])
+  assert pens(below) == ["....", ".rrr", "rrrr"]
+  above = Screen.erase(s, 1, 1, ToStartOfScreen, RED)
+  assert chars(above) == code_points(["    ", "  gh", "ijkl"])
+  assert pens(above) == ["rrrr", "rr..", "...."]
+  all = Screen.erase(s, 1, 1, WholeScreen, RED)
+  assert chars(all) == code_points(["    ", "    ", "    "])
+  assert pens(all) == ["rrrr", "rrrr", "rrrr"]
+  to_right = Screen.erase(s, 1, 1, ToEndOfLine, RED)
+  assert chars(to_right) == code_points(["abcd", "e   ", "ijkl"])
+  assert pens(to_right) == ["....", ".rrr", "...."]
+  to_left = Screen.erase(s, 1, 1, ToStartOfLine, RED)
+  assert chars(to_left) == code_points(["abcd", "  gh", "ijkl"])
+  assert pens(to_left) == ["....", "rr..", "...."]
+  line = Screen.erase(s, 1, 1, WholeLine, RED)
+  assert chars(line) == code_points(["abcd", "    ", "ijkl"])
+  assert pens(line) == ["....", "rrrr", "...."]
+}
+
+# As in avt, the range stops at the end of the line, and the column may be one past the last one
+# (where the cursor is after writing in the last column).
+@test
+fn erase_stops_at_the_end_of_the_line() {
+  s = screen_of(4, ["abcd", "efgh"])
+  assert Screen.lines(Screen.erase(s, 1, 1, NextChars(10), RED))
+    == Screen.lines(Screen.erase(s, 1, 1, ToEndOfLine, RED))
+  assert Screen.lines(Screen.erase(s, 4, 1, NextChars(1), RED)) == Screen.lines(s)
+  assert Screen.lines(Screen.erase(s, 4, 1, ToEndOfLine, RED)) == Screen.lines(s)
+  assert pens(Screen.erase(s, 4, 1, ToStartOfLine, RED)) == ["....", "rrrr"]
+  assert pens(Screen.erase(s, 4, 0, ToEndOfScreen, RED)) == ["....", "rrrr"]
+  assert pens(Screen.erase(s, 4, 1, ToStartOfScreen, RED)) == ["rrrr", "rrrr"]
+}
+
+@test
+fn erase_leaves_no_half_of_a_wide_character() {
+  s = put(Screen.blank(4, 1, DEFAULT_PEN), 0, 0, "aあb")
+  # From the right half to the end of the line.
+  assert Screen.lines(Screen.erase(s, 2, 0, ToEndOfLine, RED))
+    == [[Cell(SMALL_A, Single, DEFAULT_PEN), blank(RED), blank(RED), blank(RED)]]
+  # Two characters that end on the left half.
+  assert Screen.lines(Screen.erase(s, 0, 0, NextChars(2), RED))
+    == [[blank(RED), blank(RED), blank(RED), Cell(0x62, Single, DEFAULT_PEN)]]
+  # One character on the right half.
+  assert Screen.lines(Screen.erase(s, 2, 0, NextChars(1), RED))
+    == [
+      [Cell(SMALL_A, Single, DEFAULT_PEN), blank(RED), blank(RED), Cell(0x62, Single, DEFAULT_PEN)],
+    ]
+  # From the start of the line to the left half.
+  assert Screen.lines(Screen.erase(s, 1, 0, ToStartOfLine, RED))
+    == [[blank(RED), blank(RED), blank(RED), Cell(0x62, Single, DEFAULT_PEN)]]
+}
+
+@test
+fn scroll_up_and_down_change_only_the_rows_of_the_range() {
+  s = screen_of(2, ["aa", "bb", "cc", "dd"])
+  up = Screen.scroll_up(s, 1, 3, 1, RED)
+  assert chars(up) == code_points(["aa", "cc", "  ", "dd"])
+  assert pens(up) == ["..", "..", "rr", ".."]
+  down = Screen.scroll_down(s, 1, 3, 1, RED)
+  assert chars(down) == code_points(["aa", "  ", "bb", "dd"])
+  assert pens(down) == ["..", "rr", "..", ".."]
+  # As in avt, no more lines than the range has.
+  assert pens(Screen.scroll_up(s, 1, 3, 5, RED)) == ["..", "rr", "rr", ".."]
+  assert pens(Screen.scroll_down(s, 1, 3, 5, RED)) == ["..", "rr", "rr", ".."]
+}
+
+# The cells pushed past the last column come back in at the column, as avt rotates them, for the
+# caller to write over.
+@test
+fn shift_right_rotates_the_cells_from_the_column_on() {
+  s = screen_of(4, ["abcd"])
+  assert chars(Screen.shift_right(s, 1, 0, 2, RED)) == code_points(["acdb"])
+  # As in avt, no more columns than there are from the column on.
+  assert chars(Screen.shift_right(s, 1, 0, 10, RED)) == code_points(["abcd"])
+}
+
+@test
+fn shift_right_leaves_no_half_of_a_wide_character() {
+  # From the right half: the wide character is cut.
+  cut = Screen.shift_right(put(Screen.blank(4, 1, DEFAULT_PEN), 0, 0, "aあb"), 2, 0, 1, RED)
+  assert Screen.lines(cut)
+    == [
+      [Cell(SMALL_A, Single, DEFAULT_PEN), blank(RED), Cell(0x62, Single, DEFAULT_PEN), blank(RED)],
+    ]
+  # The right half comes back in at the column, and the left half is in the last column.
+  wrapped = Screen.shift_right(put(Screen.blank(4, 1, DEFAULT_PEN), 0, 0, "abあ"), 0, 0, 1, RED)
+  assert Screen.lines(wrapped)
+    == [
+      [blank(RED), Cell(SMALL_A, Single, DEFAULT_PEN), Cell(0x62, Single, DEFAULT_PEN), blank(RED)],
+    ]
+}
+
+@test
+fn delete_moves_the_cells_after_the_deleted_ones_left_and_blanks_the_end() {
+  s = screen_of(4, ["abcd"])
+  deleted = Screen.delete(s, 1, 0, 2, RED)
+  assert chars(deleted) == code_points(["ad  "])
+  assert pens(deleted) == ["..rr"]
+  # As in avt, no more columns than there are from the column on.
+  assert pens(Screen.delete(s, 1, 0, 10, RED)) == [".rrr"]
+}
+
+@test
+fn delete_leaves_no_half_of_a_wide_character() {
+  s = put(Screen.blank(4, 1, DEFAULT_PEN), 0, 0, "aあb")
+  # From the right half.
+  assert Screen.lines(Screen.delete(s, 2, 0, 1, RED))
+    == [
+      [Cell(SMALL_A, Single, DEFAULT_PEN), blank(RED), Cell(0x62, Single, DEFAULT_PEN), blank(RED)],
+    ]
+  # The left half only.
+  assert Screen.lines(Screen.delete(s, 1, 0, 1, RED))
+    == [
+      [Cell(SMALL_A, Single, DEFAULT_PEN), blank(RED), Cell(0x62, Single, DEFAULT_PEN), blank(RED)],
+    ]
+}

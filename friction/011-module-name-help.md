@@ -15,9 +15,11 @@
   - key codec の encode の wish（`wish/encode.emel`、サブプロジェクト 2 の計画の Task 6）でも、import なしの `Bytes`（返り値の型と `Option[Bytes]`）に ``error[E0211]: cannot find type `Bytes` in this scope`` が 14 出た。help は付かない
   - key codec の decode の wish（`wish/decode.emel`、サブプロジェクト 2 の計画の Task 4）でも、`Std.Bytes` の import が無く、`decode` の引数の型の `Bytes`（`:15`）に ``error[E0211]: cannot find type `Bytes` in this scope`` が 1、`Bytes.from_list`（`:70`、`:72`、`:74`、`:76`）に ``error[E0211]: cannot find module or trait `Bytes` in this scope`` が 4 出た。help は付かない（`Decoded` の `Unknown(Bytes)`（`:12`）は、行の頭の `|`（051）で崩れた行にあり、届かなかった）
   - ストリーム用の UTF-8 デコーダの wish（`wish/utf8.emel`、サブプロジェクト 3 の計画の Task 1）でも、`Std.Bytes` の import が無く、`feed` の引数の型の `Bytes`（`:74`）に ``error[E0211]: cannot find type `Bytes` in this scope`` が 1 出た。help は付かない
+  - VT の画面の wish（`wish/screen.emel`、サブプロジェクト 3 の計画の Task 4）でも、import なしの `Array[...]`（`Screen` の欄の型、`blank_line`、`with_line`、`clear` の型）に ``error[E0211]: cannot find type `Array` in this scope`` が 7 出た（`:60` に 2、`:64`、`:76` に 2、`:109` に 2）。help は付かない。`Array.fill`（`:64`、`:67`）は `=` で書いた関数の本体（020）の中にあり、届かなかった
 - 回避策:
   `import FoldTable.{SOURCES, TARGETS}` と `import Std.Array.{Array}`（`regex/src/fold.emel`、`regex/src/class.emel`）、`import Std.Map.{Map}`（`regex/src/syntax.emel`。Array は使わない形にした）。vm と公開 API（Task 6）は `import Std.Array.{Array}`、`import Std.Map.{Map}`、`import Std.Set.{Set}`（`regex/src/vm.emel`、`regex/src/lib.emel`）。正しい書き方に直しただけなので、コードに印は付けない。テストも Pome の中の名前で `import Fold` と書く（text のテストの `import Lib` と同じ）。差分テスト（Task 8）は `import Brix.Pbt.Gen.{Gen, Tree}`、`import PatternGen`、`import Std.Array.{Array}`（`regex/test/pattern_gen.emel`、`regex/test/differential_test.emel`）
   encode（Task 6）は `import Std.Bytes.{Bytes}`（`src/key/encode.emel`）。decode（Task 4）も同じ（`src/key/decode.emel`）。UTF-8 デコーダ（サブプロジェクト 3 の Task 1）も同じ（`src/utf8.emel`）
+  VT の画面（サブプロジェクト 3 の Task 4）も `import Std.Array.{Array}`（`src/vt/screen.emel`）
 - コスト:
   コードのコストは無い。直すには spec を引く必要があった。同じモジュールが、Pome の中では `FoldTable`、依存する側からは `Regex.FoldTable` と、書く場所で名前が変わる。Array は std の値の層にあり（`[lib.layers]`、`proposals/array.md:233` が core に置かない理由を書く）、組み込みの扱いは core の 1 つの segment の名前のモジュールだけ（`[module.resolution]`）
 - spec:
