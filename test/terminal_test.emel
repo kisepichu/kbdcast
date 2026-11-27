@@ -3,7 +3,8 @@ import Vt.Screen.{Cell, Single, DEFAULT_PEN}
 import Key.Encode.{InputModes, Normal, Application, Cr, CrLf, Off, On, One, Two}
 import VtSnapshot
 
-# What kbdcast adds to avt (spec §7), on a screen of 10 columns and 3 rows.
+# What kbdcast adds to avt (spec §7), on a screen of 10 columns and 3 rows unless a test gives
+# another size.
 
 # The replies to `input`, in order.
 fn replies(input: String) -> List[Reply] {
@@ -36,6 +37,9 @@ fn dsr_answers_the_status_and_the_position_of_the_cursor() {
   assert replies("abcdefghij\u{1b}[6n") == [CursorPosition(1, 10)]
   # In origin mode the row counts from the top of the scroll region.
   assert replies("\u{1b}[2;3r\u{1b}[?6h\u{1b}[6n") == [CursorPosition(1, 1)]
+  # DECRC can put the cursor above the top margin in origin mode, and the row does not go below 1.
+  (_, made) = VtSnapshot.run(10, 5, "\u{1b}[2;5r\u{1b}[?6h\u{1b}7\u{1b}[4;5r\u{1b}8\u{1b}[6n")
+  assert made == [CursorPosition(1, 1)]
 }
 
 @test
@@ -62,6 +66,10 @@ fn modify_other_keys_takes_the_level_of_csi_greater_4() {
   assert modes("\u{1b}[>4;2m\u{1b}[>4m").other_keys == Off
   # A level that xterm does not have changes nothing.
   assert modes("\u{1b}[>4;2m\u{1b}[>4;3m").other_keys == On(Two)
+  # `CSI > m` with no parameter turns it off, as xterm's XTMODKEYS does; `CSI > 0 m` is another
+  # resource and changes nothing.
+  assert modes("\u{1b}[>4;2m\u{1b}[>m").other_keys == Off
+  assert modes("\u{1b}[>4;2m\u{1b}[>0m").other_keys == On(Two)
   # RIS turns it off, and DECSTR leaves it.
   assert modes("\u{1b}[>4;2m\u{1b}c").other_keys == Off
   assert modes("\u{1b}[>4;2m\u{1b}[!p").other_keys == On(Two)

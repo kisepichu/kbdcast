@@ -241,6 +241,8 @@ fn csi(t: Terminal, ps: List[List[Int]], inter: Option[Int], f: Int) -> (Termina
     (Some(0x21), 0x70) -> (soft_reset(t), []) # ! p DECSTR
     (Some(0x3F), 0x68) -> (ps.fold(t, |t, p| dec_mode(t, value(p), True)), []) # ? h DECSET
     (Some(0x3F), 0x6C) -> (ps.fold(t, |t, p| dec_mode(t, value(p), False)), []) # ? l DECRST
+    # > m: with no parameter, xterm's XTMODKEYS resets every resource, modifyOtherKeys among them.
+    (Some(0x3E), 0x6D) if ps == [] -> (other_keys(t, 0), [])
     (Some(0x3E), 0x6D) if arg(ps, 0) == 4 -> (other_keys(t, arg(ps, 1)), []) # > 4 ; n m
     _            -> (t, [])
   }
@@ -268,13 +270,14 @@ fn count(ps: List[List[Int]], i: Int, default: Int) -> Int {
   if n == 0 { default } else { n }
 }
 
-# The replies to DSR: the status for 5 and the position of the cursor for 6.
+# The replies to DSR: the status for 5 and the position of the cursor for 6. In origin mode DECRC
+# can leave the cursor above the top margin, where the row of the reply stays 1.
 fn status(t: Terminal, n: Int) -> List[Reply] {
   n match {
     5 -> [Status]
     6 -> [
       CursorPosition(
-        t.row - (if t.origin { t.top } else { 0 }) + 1,
+        Int.max(t.row - (if t.origin { t.top } else { 0 }) + 1, 1),
         Int.min(t.col, t.col_count - 1) + 1,
       ),
     ]
@@ -282,8 +285,8 @@ fn status(t: Terminal, n: Int) -> List[Reply] {
   }
 }
 
-# `CSI > 4 ; n m`: modifyOtherKeys off for 0 (and when `n` is left out), at a level for 1 and 2. A
-# level that xterm does not have changes nothing.
+# `CSI > 4 ; n m`: modifyOtherKeys off for 0 (and when `n` is left out, and for `CSI > m`), at a
+# level for 1 and 2. A level that xterm does not have changes nothing.
 fn other_keys(t: Terminal, n: Int) -> Terminal {
   level = n match {
     0 -> Some(Off)
