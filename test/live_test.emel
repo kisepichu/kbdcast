@@ -1,0 +1,148 @@
+import FakePty.{FakePty, Event, Emit, Exit}
+import Key.{Key}
+import Key.Encode.{Unencodable, NeedsKitty}
+import Key.Notation
+import Key.Notation.{NotationError}
+import Recorder.{Reason, RecordError, CannotSend, Exited, TimedOut}
+import Recorder.Live
+import Std.Bytes.{Bytes}
+import Std.Clock.{TestClock}
+import Std.Duration.{Duration}
+import Std.Instant
+import Std.Process.{TestStdout, StdoutText}
+import Std.State.{State}
+import Tape.{TapeError}
+
+# What recording the tape `source` leaves while a FakePty plays `events`, echoing what is written if
+# `echo`: the lines of the cast, the bytes written to the process, and the line and the reason of
+# the RecordError if Live.record fails.
+fn record(
+  source: String,
+  events: List[Event],
+  echo: Bool,
+) -> (List[String], Bytes, Option[(Int, Reason)])
+  fails TapeError {
+  tape = Tape.parse(source)
+  start = Instant.from_unix_milliseconds(Int64.from_int(0))
+  (((failure, _), script), out) = State.run(StdoutText(text: ""), || {
+    State.run(FakePty.script(events), || {
+      State.run(start, || {
+        with TestClock, TestStdout, FakePty(echo) {
+          {
+            Live.record(tape)
+            None
+          } escape {
+            RecordError(line:, reason:) -> Some((line, reason))
+          }
+        }
+      })
+    })
+  })
+  (out.text.split("\n").filter(|l| l != ""), Bytes.concat(script.written), failure)
+}
+
+fn cast(source: String, events: List[Event], echo: Bool) -> List[String] fails TapeError {
+  (lines, _, _) = record(source, events, echo)
+  lines
+}
+
+fn failure(source: String, events: List[Event]) -> Option[(Int, Reason)] fails TapeError {
+  (_, _, failure) = record(source, events, False)
+  failure
+}
+
+fn header(cols: Int, rows: Int) -> String {
+  "{\"version\": 3, \"term\": {\"cols\": #{cols}, \"rows\": #{rows}, \"type\": \"xterm-256color\"}, \"command\": \"app\"}"
+}
+
+fn emit(at_ms: Int, s: String) -> Event {
+  Emit(at_ms, Bytes.encode_utf8(s))
+}
+
+# The one key that `notation` writes.
+fn key(notation: String) -> Key fails NotationError {
+  Notation.parse(notation) match {
+    [k] -> k
+    _   -> panic("not one key: #{notation}")
+  }
+}
+
+@test
+fn time_passes_in_the_typing_after_each_key_and_not_in_a_wait() {
+  source = "set size 20x3\nset typing 100ms\nrun app\nwait /ready\n> ab\nsleep 1s"
+  assert cast(source, [emit(500, "ready\r\n")], True)
+    == [
+      header(20, 3),
+      "[0.000, \"o\", \"ready\\r\\n\"]",
+      "[0.000, \"i\", \"a\"]",
+      "[0.000, \"o\", \"a\"]",
+      "[0.100, \"i\", \"b\"]",
+      "[0.000, \"o\", \"b\"]",
+    ]
+}
+
+@test
+fn output_in_a_sleep_is_at_its_time_in_the_window() {
+  events = [emit(300, "x"), emit(1500, "y"), emit(5000, "z")]
+  assert cast("run app\nsleep 1s\nsleep 1s", events, False)
+    == [header(80, 24), "[0.300, \"o\", \"x\"]", "[1.200, \"o\", \"y\"]"]
+}
+
+@test
+fn output_in_a_wait_is_at_the_tape_time_of_the_wait() {
+  events = [emit(200, "a"), emit(3000, "b"), emit(3050, "c")]
+  assert cast("run app\nwait /b\nsleep 100ms", events, False)
+    == [header(80, 24), "[0.000, \"o\", \"a\"]", "[0.000, \"o\", \"b\"]", "[0.050, \"o\", \"c\"]"]
+}
+
+@test
+fn replies_go_back_to_the_process_and_not_into_the_cast() {
+  (lines, written, _) = record("run app\nsleep 100ms", [emit(10, "\u{1b}[6n\u{1b}[c")], False)
+  assert lines == [header(80, 24), "[0.010, \"o\", \"\\u001b[6n\\u001b[c\"]"]
+  assert written == Bytes.encode_utf8("\u{1b}[1;1R\u{1b}[?62;22c")
+}
+
+@test
+fn keys_are_sent_in_the_modes_the_application_has_set() {
+  assert cast("run app\nwait /ok\n> <C-S-a>", [emit(0, "\u{1b}[>4;1mok")], False)
+    == [
+      header(80, 24),
+      "[0.000, \"o\", \"\\u001b[>4;1mok\"]",
+      "[0.000, \"i\", \"\\u001b[27;5;65~\"]",
+    ]
+}
+
+@test
+fn a_wait_that_times_out_fails_with_the_screen() {
+  source = "set size 10x2\nset timeout 1s\nrun app\nwait /never"
+  (lines, _, failure) = record(source, [emit(100, "hello")], False)
+  assert failure == Some((4, TimedOut("never", Duration.seconds(1), "hello\n")))
+  assert lines == [header(10, 2), "[0.000, \"o\", \"hello\"]"]
+}
+
+@test
+fn an_exit_in_the_last_step_ends_the_recording_with_the_exit_code() {
+  (lines, _, failure) = record("set typing 10ms\nrun app\n> q", [Exit(5, 0)], False)
+  assert failure == None
+  assert lines == [header(80, 24), "[0.000, \"i\", \"q\"]", "[0.005, \"x\", \"0\"]"]
+}
+
+@test
+fn an_exit_before_the_last_step_fails_after_writing_the_exit_code() {
+  (lines, _, failure) = record("run app\nsleep 1s\n> q", [Exit(500, 3)], False)
+  assert failure == Some((2, Exited(3)))
+  assert lines == [header(80, 24), "[0.500, \"x\", \"3\"]"]
+}
+
+@test
+fn a_key_that_cannot_be_sent_fails_without_an_event() {
+  (lines, _, failure) = record("run app\n> <D-a>", [], False)
+  assert failure == Some((2, CannotSend(Unencodable(key: key("<D-a>"), reason: NeedsKitty))))
+  assert lines == [header(80, 24)]
+}
+
+@test
+fn a_character_cut_between_two_reads_comes_out_whole_in_the_second() {
+  events = [Emit(10, Bytes.hex("e381")), Emit(20, Bytes.hex("82"))]
+  assert cast("run app\nsleep 100ms", events, False) == [header(80, 24), "[0.020, \"o\", \"あ\"]"]
+}

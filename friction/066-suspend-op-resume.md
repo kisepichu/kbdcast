@@ -11,12 +11,15 @@
     if bytes.is_empty() { Exited(exit_code(host)) } else { Data(bytes) }
   }
   ```
+  LiveDriver の wish（`wish/live.emel:39-56`、サブプロジェクト 1 の計画の Task 5）でも、3 つの suspend fn の操作を `resume` を受けない direct style で書いた（本体が終われば呼んだ側が続く）
 - 診断:
   wish check（v0.28.2）は 063 の panic で何も出さなかった。panic の原因の `fails` だけを消した写しの `emela check`（2026-11-28）: `read` を指す ``error[E0406]: wrong number of parameters: operation `read` takes 1, found 0``。宣言の `read()` には引数が無いので「1 つ取る」と言われても分からず、それが `resume` だとは言わない。help も付かない
   `resume` を足して本体を direct style のままにした `suspend fn read(resume) { ...; if ... { Exited(...) } else { Data(b) } }` は、2 つの腕に ``error[E0301]: type mismatch: expected `()`, found `Output` ``。これも `resume` を呼ぶよう言わない
   `resume` を呼ばない本体（`suspend fn read(resume) { b = read_output(self.host); () }`）は、`emela check` が診断なしで通る（2026-11-28、使い捨ての写し）。呼び出した側は二度と再開されず、中断として巻き戻る（`[dyn.suspend]`）
+  LiveDriver の wish check（v0.28.2）は、handler の頭の `uses`（075）で handler の本体を top-level として読んだので、3 つの操作に ``E0130: a top-level `suspend fn` must be `@external` `` が出ただけで、この論点の E0406 には届かなかった
 - 回避策:
   `resume` を受けて呼ぶ形にした（`pty-bun/src/lib.emel` の `read`: `b = read_output(self.host)` の後に `resume(if b.is_empty() { Exited(...) } else { Data(b) })`）。spec の決まった形に直しただけなので、コードに印は付けない
+  LiveDriver（`src/recorder/live.emel`）も、3 つの操作で `resume` を受け、本体の終わりで `resume(())` と呼んだ。失敗する所（`running()`、`Encode.encode`、`read_window` などの `ProcessExited`、`WaitTimeout`）は `resume` を呼ばずに fail で抜ける。印は付けない
 - コスト:
   1 行の `resume(...)` で、コードはほとんど増えない。外部の待ちを 1 回するだけの操作でも継続を手で渡す形になり、`resume` を呼び忘れても compiler は止めない（その read を呼んだ fiber が黙って中断になる）。`@external suspend fn` を待つだけなら、本体の値をそのまま `resume` に渡す以外の使い方は無い。普段のコードに基盤レベルは漏れていない
 - spec:

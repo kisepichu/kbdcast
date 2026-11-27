@@ -9,11 +9,14 @@
   suspend fn read() -> Output {
   fn write(b: Bytes) -> () {
   ```
+  LiveDriver の wish（`wish/live.emel:39`、`:46`、`:53`、サブプロジェクト 1 の計画の Task 5）でも、3 つの操作に引数の型、返り値の型、`fails` を書いた（`suspend fn press(key: Key) -> () fails Unencodable | ProcessExited {` など）
 - 診断:
   wish check（v0.28.2）は 063 の panic で何も出さなかった。panic の原因の `fails` だけを消した写しの `emela check`（2026-11-28）: 引数の型の `b: Bytes` に ``error[E0134]: handler operation parameters take their types from the effect``（何を直せばよいかを言う）。返り値の型の `-> Output` と `-> ()` には何も出ない
   返り値の型を書いても何も出ないのは、黙って捨てているから。repo の外の使い捨ての写しで、正しい実装の後ろに嘘の signature を足した `suspend fn read(resume) -> String fails Nope uses { Nothing } {` と、本体が `()` の `fn write(b) -> Int {` は、どちらも `emela check` が診断なしで通る（exit 0。`Nope` と `Nothing` はどこにも無い名前）
   v0.28.2 の parser は handler の操作を `fn_decl` で読むので、返り値の型と `fails` と `uses` も木に入る。validation（`crates/emela-syntax/src/validation.rs`）は、`HANDLER_DECL` の中の fn には引数の型（E0134）だけを調べ、`RET_TYPE`、`FAILS_CLAUSE`、`USES_CLAUSE` を E0136 で止めるのは `IMPL_DECL` の中の fn だけ。checkout の main（596b6038）も同じ
+  LiveDriver の wish check（v0.28.2）は、handler の頭の `uses`（075）で handler の本体を top-level として読んだので、3 つの操作に ``error[E0130]: a top-level `suspend fn` must be `@external` `` が出ただけで、この論点の E0134 には届かなかった
 - 回避策: 引数の型と返り値の型を消した（`suspend fn read(resume)`、`fn write(b)`。`pty-bun/src/lib.emel`）。正しい書き方に直しただけなので、コードに印は付けない（`resume` は 066）
+  LiveDriver（`src/recorder/live.emel`）も、引数の型、返り値の型、`fails` を消した（`suspend fn press(key, resume)` など）。印は付けない
 - コスト:
   コードのコストは無い。書いた返り値の型が嘘でも通るので、読む人は書いてある型を信じられない（effect の宣言と違う型を書いても、型検査は effect の側の型で進む）。普段のコードに基盤レベルは漏れていない
 - spec:
