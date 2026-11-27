@@ -17,6 +17,7 @@
   key codec の encode（`wish/encode.emel:87`、`:99-107`、`:196`、サブプロジェクト 2 の計画の Task 6）でも、Ctrl の付いた英大文字の判定（`'A' <= c && c <= 'Z'`）、termwiz の `ctrl_mapping` の表（`'@' | '`' | ' ' | '2' -> Some(0x00)`、`'a'..='z' -> Some(c - 'a' + 1)` など 9 つの腕）、ASCII の印字できる記号と英数字の範囲（`'!' <= c && c <= '~'`）を文字の literal で書いた
   ストリーム用の UTF-8 デコーダ（`wish/utf8.emel:15`、サブプロジェクト 3 の計画の Task 1）でも、置き換え文字を `let replacement: Char = '\u{FFFD}'` と文字の literal で書いた。ここは code point の Int ではなく、`Char` の型の値のつもり（Rust の `char::REPLACEMENT_CHARACTER`。`Char` の型が無いことは 003）
   VT の解釈（`wish/terminal.emel:82-139`、`:160-171`、サブプロジェクト 3 の計画の Task 5）でも、avt 0.18.0 の `csi_dispatch` と `esc_dispatch` を写し、CSI の終わりの文字（`'@'`、`'A'`〜`'Z'` の 19、`` '`' ``、`'a'`〜`'u'` の 14）、private の印と中間の文字（`'!'`、`'?'`、`'>'`）、ESC の中間の文字と終わりの文字（`'#'`、`'('`、`')'`、`'D'`、`'E'`、`'H'`、`'M'`、`'7'`、`'8'`、`'c'`、`'0'`）を、組のパターンの文字の literal で書いた（`(None, 'A') => ...`、`(Some('?'), 'h') => ...`、`(Some('('), '0') => ...`）。引数の型も `Option[Char]` と `Char` にした（003）
+  tape のパーサ（`wish/tape.emel:163-171`、サブプロジェクト 1 の計画の Task 1）でも、`run` の行をシェル風に分ける所で、空白、tab、`'`、`"`、`\` を list のパターンの文字の literal に書いた（`[' ' | '\t', ..rest]`、`['\'', ..rest]`、`['\\', c, ..rest]`、`['\\', '"' | '\\' as c, ..rest]`）。要素の型は `List[Char]` のつもり（`Char` の型は 003）
 - 診断:
   wish check（v0.28.2）の 780 の診断のうち、`'` の ``error[E0105]: unrecognized character `\'` `` が 212、literal の中身の `\\`、`^`、`$`、`?` の E0105 が 31。続けて、崩れた式とパターンの後追いの E0110（``expected `)` ``、``expected `->` ``）、E0112、E0113、E0118、E0122、E0309（``pattern `Some` has 1 fields, found 0``）、W0301 が出る。repo の外の使い捨ての Pome での最小の形（`c == '('`）は、E0105 が 2 つ、E0118、E0122 の 4 つ（2026-11-25）。help は付かない。表示の `` `\'` `` は `'` を escape した形で、受け付けなかった文字そのものではない
   class の wish check（v0.28.2）では、86 の診断のうち 32 が E0105（`'` が 28、`'\n'` と `'\r'` の中身の `\` が 4）。続けて E0118、E0110、E0122 と、引数が読めなかった後追いの ``error[E0305]: wrong number of arguments: `range` takes 2, found 0`` と同じ形の `Span` のものが出た
@@ -27,6 +28,7 @@
   encode の wish check（v0.28.2）では、295 の error（ほかに W0301 などの warning が 28）のうち 69 が E0105（`'` が 62、literal の中身の `~` と `\\` が 2 つずつ、`` ` ``、`^`、`?` が 1 つずつ）。続けて、崩れたパターンの後追いの E0113、E0110（``expected `->` ``、``expected `]` ``）、E0118、E0122、``error[E0123]: `_` can only be used in patterns``（`'_'` の中身）、``error[E0211]: cannot find value `A` in this scope``（`'A'` の中身）、``E0301: type mismatch: expected `Option[Int]`, found `List[?0]` ``（`'['` の中身を List と読んだ）と、本体が読めなかった `is_ascii_graphic` の ``E0301: type mismatch: expected `Bool`, found `()` ``
   UTF-8 デコーダの wish check（v0.28.2）では、`:15` の 1 行に `'` の E0105 が 2 と、literal の中身の `\` の E0105 が 1。同じ行の `let`（004）と `Char`（003）には届かなかった
   VT の解釈の wish check（v0.28.2）では、632 の診断（brix の W0203 を除く）のうち 116 が E0105（`'` が 113、`'?'` の中身の `?` が 2、`` '`' `` の中身の `` ` `` が 1。`:82-139` と `:160-171` の 51 行）。続けて、崩れた組のパターンの後追いの ``E0110: expected `)` ``、``E0110: expected `->` ``、E0113、E0118、E0122、``E0112: a tuple pattern needs at least two elements``（`(Some('!'), 'p')` などの 5 つ）、``E0309: pattern `Some` has 1 fields, found 0``（5）、``E0305: wrong number of arguments: `Some` takes 1, found 0``（1）、腕ごとの ``E0301: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?0)` ``、`'A'` などの中身を名前と読んだ ``E0211: cannot find value `A` in this scope``（35）が出た。``W0301: unreachable match arm`` も 42（CSI の 2 つ目から後の腕のすべてと、ESC の `(None, 'E')` から `(Some('#'), '8')` まで）。help は付かない
+  tape のパーサの wish check（v0.28.2）では、253 の診断のうち 24 が char literal の E0105（`'` が 17、literal の中身の `\` が 7。`:163-171` の 7 行）と、`'"'` の `"` から行末までを string と読んだ ``error[E0101]: unterminated string literal`` が 3（`:165`、`:170`、`:171`）。続けて、崩れたパターンの後追いの E0113、E0110（``expected `]` ``、``expected `)` ``、``expected `->` ``）、E0118、E0122 と、``W0301: unreachable match arm`` が 3（`:163-165`）。help は付かない
 - 回避策:
   parser が見る文字ごとに `const` で名前を付けた（`regex/src/syntax.emel` の `EXCLAMATION` から `CLOSE_BRACE` までの 51 個、`FRICTION(013)` の印）。パターンには const を書ける（`[BACKSLASH, SMALL_D, ..]`。右辺が literal だけなので、網羅性の判定でも値として扱われる、`[data.const]`）。`\f` の 0x0C のように値そのものが意味の所は、16 進の literal のまま書いた
   std と x も同じ所で回り道をしている:
@@ -41,6 +43,7 @@
   encode（`src/key/encode.emel`、`FRICTION(013)` の印）: `ctrl_mapping` の腕は 16 進の literal にし、行末のコメントで文字を示した（`0x32 -> Some(0x00) # 2`）。英字と記号の範囲（`@` から `~`）は 1 つの guard にまとめた（038）。範囲の判定の `is_ascii_graphic` と `is_ascii_uppercase`（039）も、16 進の literal と行末のコメントにした（`c >= 0x21 && c <= 0x7E # ! to ~`）。列の始まりの ESC、CSI、SS3 は、文字の literal の問題ではないので印を付けず、String の const（`"\u{1b}["`）にした
   UTF-8 デコーダ（`src/utf8.emel`）: 出すのは String なので、1 文字の String の const にした（`const REPLACEMENT: String = "\u{FFFD}"`）。`[lex.literal]` のとおりの書き方で、回り道ではないので印は付けない
   VT の解釈（`src/vt/terminal.emel` の `csi` と `esc`、`FRICTION(013)` の印 2 か所）: encode と同じく、腕の文字を 16 進の literal にし、行末のコメントで文字と avt の関数の名前を示した（`(None, 0x41) -> (cursor_up(t, n), []) # A CUU`、`(Some(0x3F), 0x68) -> ... # ? h DECSET`）。CSI の終わりの文字の 35 と、private の印と中間の文字の 6 つは const にしなかった（腕ごとに 1 回しか出ず、行末のコメントで足りる）。avt が ESC の後の `@`〜`_` を C1 にする所は、wish の 4 つの腕でなく avt と同じ 1 つの guard（`(None, _) if f >= 0x40 && f <= 0x5F -> execute(t, f + 0x40)`）にした。DEC の罫線の表は、avt の `SPECIAL_GFX_CHARS` の 31 文字を string の literal に書いて `code_points()` で Array にした（`const DRAWING`）
+  tape のパーサ（`src/tape.emel`、サブプロジェクト 1 の計画の Task 1、`FRICTION(013)` の印）: 表記と同じく、パターンと比べる式に書く文字を const にした（`TAB`、`CARRIAGE_RETURN`、`SPACE`、`DOUBLE_QUOTE`、`SINGLE_QUOTE`、`SLASH`、`DIGIT_ZERO`、`DIGIT_NINE`、`GREATER_THAN`、`BACKSLASH` の 10 個。`[GREATER_THAN, ..]`、`(Bare, [SINGLE_QUOTE, ..rest])`、`Quoted(DOUBLE_QUOTE, column)`）
 - コスト:
   const の宣言が 51 行（ファイルの 570 行のうち）。読むときに名前と文字を対応させる必要がある。const の名前は大文字、数字、`_` だけ（`[lex.name]`）なので、`d` と `D` は `SMALL_D` と `CAPITAL_D` に書き分けた。性能のコストは無い。普段のコードに基盤レベルは漏れていない
   class では、9 つの文字を 16 進で書き、行末のコメントで文字を示した（7 行）
@@ -50,6 +53,7 @@
   decode では、const の宣言が 18 行（ファイルの約 350 行のうち）。`P` から `S` を F1〜F4 にする所は、`f - 'P' + 1` の引き算でなく、4 つの腕に分けた（015）
   encode では、10 の腕と 2 つの範囲の判定の文字を 16 進で書き、行末のコメントで文字を示した（行末のコメントが 12）
   VT の解釈では、CSI の 39 の腕と ESC の 9 つの腕の文字を 16 進で書き、文字はコメントで示した（CSI の腕の行末か直前の行のコメントが 39、ESC の行末のコメントが 8）。読むときは、`0x48` が `H` であることをコメントで見る
+  tape のパーサでは、const の宣言が 10 行（ファイルの約 410 行のうち）
 - spec:
   `[lex.literal]`（「There is no character type (Char). A single character is represented as a String of length 1 (16.2).」）、`[target.string]`、`[data.const]`、`[lex.name]`、`spec/diagnostics.md` の E0105
 - 既存:
