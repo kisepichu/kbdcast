@@ -5,10 +5,7 @@ emela = "0.28.2"
 
 [dependencies]
 "github.com/kisepichu/kbdcast" = "v0.1.0"
-"github.com/kisepichu/kbdcast/pty" = "v0.1.0"
 "github.com/kisepichu/kbdcast/pty-bun" = "v0.1.0"
-"github.com/kisepichu/kbdcast/regex" = "v0.1.0"
-"github.com/kisepichu/kbdcast/text" = "v0.1.0"
 
 [replace]
 "github.com/kisepichu/kbdcast" = { path = ".." }
