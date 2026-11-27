@@ -36,7 +36,7 @@ fn is_wide_tells_common_characters_apart() {
 }
 
 @test
-fn golden_has_2012_cases_whose_snapshots_have_the_cursor_the_keys_mode_and_each_row() {
-  assert CASES.length() == 2012
+fn golden_has_2042_cases_whose_snapshots_have_the_cursor_the_keys_mode_and_each_row() {
+  assert CASES.length() == 2042
   assert CASES.filter(|(_, _, rows, _, snapshot)| snapshot.split("\n").length() != rows + 2) == []
 }

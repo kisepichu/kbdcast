@@ -194,8 +194,9 @@ fn token(rng: &mut Rng, out: &mut String) {
     }
 }
 
-// Hand-written cases name the behaviors that the random cases may reach only by chance.
-const NAMED: [(&str, usize, usize, &str); 12] = [
+// Hand-written cases name the behaviors that the random cases may reach only by chance, and from
+// "c1-ind-and-nel" on, those that the random tokens never make or that need a larger screen.
+const NAMED: [(&str, usize, usize, &str); 42] = [
     ("print-and-wrap", 5, 3, "abcdefghijkl"),
     ("wide-at-last-column", 5, 2, "abcdあ"),
     ("wide-over-wide-tail", 6, 2, "あい\u{1b}[1Gx\u{1b}[4Gy"),
@@ -208,6 +209,71 @@ const NAMED: [(&str, usize, usize, &str); 12] = [
     ("hide-cursor", 3, 1, "\u{1b}[?25l"),
     ("tabs", 20, 1, "a\tb\u{1b}[3g\u{1b}[5G\u{1b}H\r\tc"),
     ("erase-with-pen", 5, 2, "abcde\u{1b}[44m\u{1b}[1;3H\u{1b}[K\u{1b}[2J"),
+    ("c1-ind-and-nel", 5, 4, "ab\u{84}c\u{85}d\u{84}\u{84}e"),
+    ("c1-hts-and-ri", 20, 3, "\u{1b}[2;5H\u{88}\r\tx\u{8d}\u{8d}y"),
+    ("c1-dcs-until-st", 6, 2, "a\u{90}1$qm\u{9c}b\u{90}x\u{1b}\\c"),
+    ("c1-osc-until-bel-or-st", 6, 2, "a\u{9d}0;title\u{7}b\u{9d}2;x\u{9c}c\u{9d}1;y\u{1b}\\d"),
+    ("c1-sos-pm-apc-strings", 6, 1, "a\u{98}x\u{9c}b\u{9e}y\u{7}c\u{9f}z\u{1b}\\d"),
+    ("c1-ignored-and-cancelling", 6, 2, "a\u{80}b\u{99}c\u{1b}[2\u{85}Cd"),
+    ("csi-final-above-a0", 6, 2, "ab\u{1b}[2\u{e9}c\u{1b}[\u{3042}d\u{1b}[?1\u{1f600}e"),
+    ("esc-final-above-a0", 6, 1, "a\u{1b}\u{e9}b\u{1b}#\u{3042}c\u{1b} \u{1f600}d"),
+    ("charset-other-finals", 8, 1, "\u{1b}(0q\u{1b}(Aq\u{1b}(0q\u{1b}(\u{e9}q\u{1b})0\u{e}q\u{1b})Uq\u{f}q"),
+    ("sgr-rgb-colon-forms", 6, 1, "\u{1b}[38:2:1:2:3ma\u{1b}[48:2::4:5:6mb\u{1b}[38:2:9:7:8:9mc\u{1b}[48:2:1:2md"),
+    ("sgr-cut-off-extended", 6, 1, "\u{1b}[31;38;5ma\u{1b}[44;48;2;1;2mb\u{1b}[38;5mc\u{1b}[38md"),
+    ("sgr-mixed-separators", 6, 1, "\u{1b}[38;2;1:5;2;3ma\u{1b}[48;5:7mb\u{1b}[38;2;10;20;30;1mc"),
+    ("sgr-sub-parameters-on-plain", 6, 1, "\u{1b}[1;31m\u{1b}[0:1ma\u{1b}[4:3mb\u{1b}[1:2mc\u{1b}[7:1md"),
+    (
+        "sgr-out-of-range",
+        6,
+        1,
+        "\u{1b}[38;5;300ma\u{1b}[38;2;300;400;500mb\u{1b}[48:5:256mc\u{1b}[65535;99md\u{1b}[38;2;65536;1;1me",
+    ),
+    ("rep-under-dec-graphics", 8, 1, "q\u{1b}(0\u{1b}[2bx\u{1b}(B\u{1b}[2b"),
+    ("rep-at-last-column", 4, 2, "abcd\u{1b}[2b"),
+    ("rep-after-wide", 7, 1, "a\u{3042}\u{1b}[2b"),
+    ("rep-at-column-0-and-no-autowrap", 4, 2, "\u{1b}[3bx\r\n\u{1b}[?7lab\u{1b}[5b"),
+    (
+        "decrc-above-region-in-origin-mode",
+        10,
+        5,
+        "\u{1b}[2;5r\u{1b}[?6h\u{1b}7\u{1b}[4;5r\u{1b}8x\n\u{1b}[Ay\u{1b}[9Bz",
+    ),
+    ("ri-and-vpa-in-origin-mode", 6, 5, "\u{1b}[2;4r\u{1b}[?6h\u{1b}Mx\u{1b}[2dy\u{1b}[9dz\u{1b}[9Aw"),
+    ("tabs-cht-cbt-with-counts", 40, 1, "\u{1b}[3Ia\u{1b}[2Zb\u{1b}[9Ic\u{1b}[9Zd"),
+    (
+        "tabs-set-and-clear-stops",
+        30,
+        2,
+        "\u{1b}[5G\u{1b}H\u{1b}[12G\u{1b}[0W\r\tx\tx\tx\u{1b}[17G\u{1b}[g\r\n\tx\tx\tx\tx",
+    ),
+    (
+        "tabs-ctc-and-tbc-clear-all",
+        30,
+        2,
+        "\u{1b}[9G\u{1b}[2W\r\ta\u{1b}[5W\r\tb\r\n\u{1b}[7G\u{1b}H\u{1b}[1g\u{1b}[3g\r\tc",
+    ),
+    ("hts-at-column-0-and-past-end", 12, 1, "\u{1b}H\u{1b}[5G\u{1b}[Zx\u{1b}[12Gy\u{1b}H\r\u{1b}[2Iz"),
+    (
+        "il-dl-outside-and-below-region",
+        5,
+        8,
+        "1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8\u{1b}[3;5r\u{1b}[7;1H\u{1b}[2L\u{1b}[1;1H\u{1b}[M\u{1b}[4;1H\u{1b}[L",
+    ),
+    (
+        "alt-screen-pen-twice-and-1048",
+        6,
+        3,
+        "ab\u{1b}[?1048h\u{1b}[3;3H\u{1b}[?1048lc\u{1b}[44m\u{1b}[?1049hx\u{1b}[?1049h\u{1b}[?1049ly",
+    ),
+    (
+        "decstr-resets-modes-not-screen",
+        6,
+        3,
+        "\u{1b}[?6h\u{1b}[2;3r\u{1b}[4h\u{1b}[31m\u{1b}(0\u{1b}[?25l\u{1b}[?7lab\u{1b}[!pqcdefgh",
+    ),
+    ("csi-intermediates-last-one-counts", 6, 2, "a\u{1b}[ 2Cb\u{1b}[?2Cc\u{1b}[31m\u{1b}[?!pd"),
+    ("esc-intermediates-last-one-counts", 4, 2, "\u{1b} #8\u{1b}(#0q"),
+    ("can-sub-del-inside-csi", 8, 1, "a\u{1b}[3\u{18}Cb\u{1b}[2\u{7f}Cc\u{1b}[\u{1a}Dd"),
 ];
 
 fn cases(seed: u64, count: usize) {
