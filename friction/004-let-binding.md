@@ -18,6 +18,7 @@
   key codec の encode の wish（`wish/encode.emel`、サブプロジェクト 2 の計画の Task 6）でも、4 行に `let` を書いた（`:32`、`:45`、`:113`、`:174`）
   ストリーム用の UTF-8 デコーダの wish（`wish/utf8.emel`、サブプロジェクト 3 の計画の Task 1）でも、関数の中の 4 行に `let` を書いた（`:53-54`、`:64`、`:75`。`:64` と `:75` は `let (d, out) = acc` のように組を分ける形）。module の直下の定数にも `let replacement: Char = '\u{FFFD}'`（`:15`。Rust の `const`、OCaml と F# の top-level の `let` のつもり）と書いた
   幅の wish（`wish/width.emel`、サブプロジェクト 3 の計画の Task 2）でも、`is_wide` の中の 1 行に `let n = WIDE_FIRST.partition_point(...)` と書いた（`:11`）
+  VT の parser の wish（`wish/parser.emel`、サブプロジェクト 3 の計画の Task 3）でも、3 行に `let` を書いた（`:52`、`:53`、`:68`。`:52` と `:53` は `let (last, text, acts) = ...` のように組を分ける形）
 - 診断:
   wish check（emela 0.28.2、`wish/text.emel:52-155`）。`let` の行ごとに 2 つ出る:
   - `let` に ``error[E0118]: expected expression``
@@ -46,10 +47,13 @@
   UTF-8 デコーダの wish（Task 1）では、関数の中の 4 行に E0118 と E0122 が 1 つずつ（8）。束縛されなかった名前の E0211 が 5 続いた（`seen`、`code_point`、`d`、`next`、`out`）。module の直下の `:15` には、同じ行の char literal（013）の E0105 しか出なかった。repo の外の使い捨ての Pome での最小の形（`let replacement: String = "x"` と、それを返す関数、2026-11-27）では、`let` を指す ``error[E0126]: expected declaration`` と、使う所の ``error[E0211]: cannot find value `replacement` in this scope`` の 2 つ。help は付かず、`const` を示さない
 
   幅の wish（Task 2）では、`:11` の 1 行に E0118 と E0122 が 1 つずつ（2）。束縛されなかった名前の E0211 が 1 続いた（`n`）。同じ行の右辺の式の `fn(first) { ... }`（E0148）には届かず、次の行の添字（009）は E0122 の 1 つになった。6 の診断のうち 3 がこの 1 つの誤りから出ている
+
+  VT の parser の wish（Task 3）では、届いた 2 行（`:52`、`:68`）に E0118 と E0122 が 1 つずつ（4）。束縛されなかった名前の E0211 が 4 続いた（`last`、`text`、`acts`、`k`）。`:52` の右辺の `fold` の closure（`:52-59`）は読まれず、その中の `:53` の `let`、前置の match（E0142）、`=>` の腕、String の `+`、`String.from_code_point` を String として使う所（003）には、どれも届かなかった
 - 回避策: `let` を消して `start = Int.max(from, 0)` と書いた（`text/src/lib.emel` の `slice`）。regex の `regex/src/syntax.emel`、`regex/src/class.emel`、`regex/src/vm.emel`、`regex/src/lib.emel`、テストの `regex/test/pattern_gen.emel`、key の `src/key.emel`（`(rep_code, rep_mods) = representative(c)`）、表記の `src/key/notation.emel`、decode の `src/key/decode.emel`、golden の補助の `test/golden.emel` も同じく `let` を消した。正しい構文に直しただけなので、コードに印は付けない
   encode（Task 6、`src/key/encode.emel`）も同じく `let` を消した（`higher = ...`、`m = key.mods()`、`cr = ...`。`:174` の `final` は、F1〜F4 を腕に分けたので（009）束縛が要らなくなった）
   UTF-8 デコーダ（Task 1、`src/utf8.emel`）も同じく `let` を消した（`code_point = ...`、`bytes_seen = ...`、`(next, strings) = read(...)`。`push` の `(d, out) = acc` は、fold を位置で歩く再帰にした（055）ので要らなくなった）。module の直下の定数は `const REPLACEMENT: String = "\u{FFFD}"`（`[data.const]`。名前は大文字）にした
   幅（Task 2、`src/vt/width.emel`）では、`n` の束縛そのものが要らなくなった（std の `lower_bound` を範囲の終わりの表で引き、その位置の始まりを読む 1 つの式にした。031）
+  VT の parser（Task 3、`src/vt/parser.emel`）も同じく `let` を消した（`(last, written, done) = ...`、`(next, step) = feed(at, c)`、`k = ...`）
 - コスト:
   コードのコストは無い。直すには spec を引く必要があった。診断から分かるのは `let` が式として読めないことだけで、wish-first（AGENTS.md 規則 1）では spec を読む前に wish を書くので、そのときの手がかりは診断しかない。後に続く 4 つの E0211 は束縛の失敗の後追いで、wish の本当の診断（`String.from_scalars` の E0212、003）を埋もれさせる
 - spec:

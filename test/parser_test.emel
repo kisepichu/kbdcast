@@ -1,0 +1,240 @@
+import Brix.Pbt.Gen.{Gen}
+import Brix.Pbt.Property.{Config}
+import Vt.Parser.{Action, Print, Execute, Csi, Esc}
+import VtGolden.{CASES}
+
+# The actions that `s` gives a parser that has read nothing.
+fn actions(s: String) -> List[Action] {
+  (_, made) = Parser.advance(Parser.parser(), s)
+  made
+}
+
+@test
+fn advance_writes_the_characters_of_ground_in_one_print() {
+  assert actions("ab") == [Print("ab")]
+  assert actions("aあ😀") == [Print("aあ😀")]
+  # avt writes DEL in Ground.
+  assert actions("a\u{7f}b") == [Print("a\u{7f}b")]
+  assert actions("a\nb") == [Print("a"), Execute(0x0A), Print("b")]
+}
+
+@test
+fn advance_executes_c0_and_c1_controls() {
+  assert actions("\r\t\u{8}") == [Execute(0x0D), Execute(0x09), Execute(0x08)]
+  assert actions("\u{0}\u{7}") == [Execute(0x00), Execute(0x07)]
+  assert actions("a\u{85}b") == [Print("a"), Execute(0x85), Print("b")]
+}
+
+@test
+fn advance_reads_esc_sequences() {
+  assert actions("\u{1b}7") == [Esc("", 0x37)]
+  assert actions("\u{1b}(0") == [Esc("(", 0x30)]
+  assert actions("\u{1b}#8") == [Esc("#", 0x38)]
+  # From U+00A0 up, a character goes the way of `A`, and the action keeps it.
+  assert actions("\u{1b}é") == [Esc("", 0xE9)]
+  # A C0 control inside the sequence is executed, and the sequence goes on.
+  assert actions("\u{1b}\n7") == [Execute(0x0A), Esc("", 0x37)]
+}
+
+@test
+fn advance_reads_the_parameters_of_csi_sequences() {
+  assert actions("\u{1b}[A") == [Csi([], "", 0x41)]
+  assert actions("\u{1b}[1;2H") == [Csi([[1], [2]], "", 0x48)]
+  assert actions("\u{1b}[;5H") == [Csi([[0], [5]], "", 0x48)]
+  assert actions("\u{1b}[38:2::1:2:3m") == [Csi([[38, 2, 0, 1, 2, 3]], "", 0x6D)]
+  assert actions("\u{9b}2J") == [Csi([[2]], "", 0x4A)]
+  assert actions("\u{1b}[日A") == [Csi([], "", 0x65E5), Print("A")]
+}
+
+@test
+fn advance_keeps_the_limits_of_avt_on_parameters() {
+  # 32 parameters: the 32nd `;` stays on the last one, which reads on (`1` and `2` make 12).
+  # FRICTION(022): String and List have no `repeat`, so the copies are made from a range.
+  semicolons = String.concat(List.range(0, 32).map(|_| "1;"))
+  ones = List.range(0, 31).map(|_| [1])
+  assert actions("\u{1b}[#{semicolons}2m") == [Csi(List.append(ones, [[12]]), "", 0x6D)]
+  # 6 parts: the 6th `:` stays on the last one.
+  assert actions("\u{1b}[1:2:3:4:5:6:7m") == [Csi([[1, 2, 3, 4, 5, 67]], "", 0x6D)]
+  # A part is a u16, which wraps.
+  assert actions("\u{1b}[65536;70000m") == [Csi([[0], [4464]], "", 0x6D)]
+}
+
+@test
+fn advance_reads_private_markers_and_intermediate_characters() {
+  assert actions("\u{1b}[?25l") == [Csi([[25]], "?", 0x6C)]
+  assert actions("\u{1b}[!p") == [Csi([], "!", 0x70)]
+  assert actions("\u{1b}[>4;2m") == [Csi([[4], [2]], ">", 0x6D)]
+  assert actions("\u{1b}[?1$p") == [Csi([[1]], "?$", 0x70)]
+}
+
+@test
+fn controls_inside_a_csi_sequence_execute_restart_or_cancel_it() {
+  assert actions("\u{1b}[1\n2H") == [Execute(0x0A), Csi([[12]], "", 0x48)]
+  # DEL is ignored.
+  assert actions("\u{1b}[1\u{7f}2H") == [Csi([[12]], "", 0x48)]
+  assert actions("\u{1b}[1\u{1b}[2H") == [Csi([[2]], "", 0x48)]
+  assert actions("\u{1b}[1\u{18}A") == [Execute(0x18), Print("A")]
+  assert actions("\u{1b}[1\u{1a}A") == [Execute(0x1A), Print("A")]
+}
+
+@test
+fn advance_ignores_a_csi_sequence_with_a_misplaced_parameter_character() {
+  assert actions("\u{1b}[:1Hx") == [Print("x")]
+  assert actions("\u{1b}[1?hx") == [Print("x")]
+  assert actions("\u{1b}[ 1qx") == [Print("x")]
+}
+
+@test
+fn advance_drops_the_contents_of_osc_dcs_sos_pm_and_apc() {
+  assert actions("\u{1b}]0;title\u{7}x") == [Print("x")]
+  assert actions("\u{1b}]0;t\u{1b}\\x") == [Esc("", 0x5C), Print("x")]
+  assert actions("\u{1b}P1$qm\u{1b}\\x") == [Esc("", 0x5C), Print("x")]
+  assert actions("\u{9d}0;t\u{9c}x") == [Print("x")]
+  assert actions("\u{90}1$qm\u{9c}x") == [Print("x")]
+  # BEL ends an OSC string, but not the others.
+  assert actions("\u{1b}Xa\u{7}b\u{9c}x") == [Print("x")]
+  assert actions("\u{1b}^a\u{7}b\u{9c}x") == [Print("x")]
+  assert actions("\u{1b}_a\u{7}b\u{9c}x") == [Print("x")]
+  assert actions("\u{98}a\u{7}b\u{9c}x") == [Print("x")]
+  assert actions("\u{1b}]t\u{18}x") == [Execute(0x18), Print("x")]
+}
+
+@test
+fn advance_carries_a_cut_sequence_to_the_next_call_but_not_the_characters_written() {
+  (p, first) = Parser.advance(Parser.parser(), "ab\u{1b}[1")
+  assert first == [Print("ab")]
+  (_, second) = Parser.advance(p, ";2Hc")
+  assert second == [Csi([[1], [2]], "", 0x48), Print("c")]
+}
+
+# Each golden input, cut into 2 to 4 pieces at random places and advanced through piece by piece,
+# gives the same actions as the whole input at once, once adjacent Prints are joined.
+@test
+fn where_a_golden_input_is_cut_does_not_change_the_actions() {
+  CASES.each(|(_, _, _, input, _)| {
+    Property.check_with(cuts(), Config(cases: 4, ..Property.config()), |at| {
+      # FRICTION(053): assert takes no label, and the input is not a drawn value that the property
+      # would show, so the input is on both sides.
+      assert (input, cut_and_advanced(input, at)) == (input, joined(actions(input)))
+    })
+  })
+}
+
+# The same for output made of random pieces.
+@test
+fn where_random_output_is_cut_does_not_change_the_actions() {
+  output = Gen.list(piece()) |> Gen.map(|pieces| String.concat(pieces))
+  Property.check_with(
+    Gen.pair(output, cuts()),
+    Config(cases: 3000, ..Property.config()),
+    |(input, at)| assert cut_and_advanced(input, at) == joined(actions(input)),
+  )
+}
+
+# Where to cut an input: 1 to 3 positions, each taken modulo one more than the number of code points
+# of the input.
+# FRICTION(028): brix has no `and_then`, so the positions cannot be drawn from a range that depends
+# on the drawn input, and they are drawn from 0 to 1000 and reduced with `%`.
+fn cuts() -> Gen[List[Int]] {
+  position = Gen.int_between(0, 1000)
+  Gen.pair(Gen.int_between(1, 3), Gen.pair(position, Gen.pair(position, position)))
+    |> Gen.map(|(count, (a, (b, c)))| [a, b, c].take(count))
+}
+
+# The actions that `input` gives, cut at `at` into pieces that are advanced through in turn, with
+# adjacent Prints joined.
+fn cut_and_advanced(input: String, at: List[Int]) -> List[Action] {
+  cps = input.code_points()
+  positions = at.map(|n| n % (cps.length() + 1)).sort()
+  pieces = List.zip([0, ..positions], List.append(positions, [cps.length()]))
+    |> List.map(|(from, to)| string_of(cps.take(to).drop(from)))
+  (_, made) = pieces.fold((Parser.parser(), []), |(p, made), piece| {
+    (next, more) = Parser.advance(p, piece)
+    (next, List.append(made, more))
+  })
+  joined(made)
+}
+
+# `made` with each run of adjacent Prints joined into one.
+fn joined(made: List[Action]) -> List[Action] {
+  made.fold([], |done, action| {
+    (done, action) match {
+      ([Print(before), ..rest], Print(after)) -> [Print("#{before}#{after}"), ..rest]
+      _                                       -> [action, ..done]
+    }
+  })
+    |> List.reverse()
+}
+
+# A piece of terminal output: the start or the end of a sequence, a parameter, a private marker, an
+# intermediate or final character, text, a line break, or (about a third of the time) any one code
+# point up to U+00A0 (C0, ASCII, DEL, C1 and the first character that goes the way of `A`).
+# FRICTION(028): brix has no choice between generators, so the code point is drawn each time, and
+# `kind` picks the piece.
+fn piece() -> Gen[String] {
+  Gen.pair(Gen.int_between(0, 63), Gen.int_between(0, 0xA0))
+    |> Gen.map(|(kind, c)| {
+      kind match {
+        0  -> "\u{1b}"
+        1  -> "\u{1b}["
+        2  -> "\u{9b}"
+        3  -> "\u{1b}]"
+        4  -> "\u{9d}"
+        5  -> "\u{1b}P"
+        6  -> "\u{90}"
+        7  -> "\u{1b}X"
+        8  -> "\u{1b}^"
+        9  -> "\u{1b}_"
+        10 -> "\u{98}"
+        11 -> "\u{9e}"
+        12 -> "\u{9f}"
+        13 -> "\u{9c}"
+        14 -> "\u{1b}\\"
+        15 -> "\u{7}"
+        16 -> "\u{18}"
+        17 -> "\u{1a}"
+        18 -> "\u{7f}"
+        19 -> "1"
+        20 -> "38"
+        21 -> "65536"
+        22 -> ";"
+        23 -> ":"
+        24 -> "?"
+        25 -> ">"
+        26 -> "!"
+        27 -> " "
+        28 -> "#"
+        29 -> "("
+        30 -> "$"
+        31 -> "A"
+        32 -> "H"
+        33 -> "m"
+        34 -> "h"
+        35 -> "l"
+        36 -> "p"
+        37 -> "q"
+        38 -> "abc"
+        39 -> "あ"
+        40 -> "😀"
+        41 -> "\n"
+        42 -> "\r\n"
+        _  -> character(c)
+      }
+    })
+}
+
+# FRICTION(002): String has no `slice` nor `from_code_points`, so a piece of an input is built back
+# from its code points one by one.
+fn string_of(cps: List[Int]) -> String {
+  cps.map(character).join("")
+}
+
+# FRICTION(003): the code points come from a String or are below U+00A1, so they are scalar values,
+# but `String.from_code_point` returns an Option.
+# FRICTION(040): Option has no `expect`, so the None that cannot happen is a match with a panic.
+fn character(c: Int) -> String {
+  String.from_code_point(c) match {
+    Some(s) -> s
+    None    -> panic("None, but #{c} is a scalar value")
+  }
+}
