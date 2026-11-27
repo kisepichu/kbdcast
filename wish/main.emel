@@ -1,0 +1,440 @@
+# wish-target: cli/src/main.emel
+#
+# kbdcast の entry。`kbdcast rec <tape>` で tape を読んで parse し、
+# BunPty、SystemClock、SystemStdout の下で録画して、cast を stdout に書く。
+# error は stderr に書いて終了コード 1、引数の誤りは使い方を書いて 2（recorder spec §9）。
+
+import Std.Process.{Args, Stderr, ExitCode}
+import Std.FileSystem.{FileSystem, FileError}
+import Std.Path
+import Std.Clock.{SystemClock}
+import Std.Process.{SystemStdout}
+import Std.Duration.{Duration}
+import Kbdcast.Tape.{Tape, TapeError}
+import Kbdcast.Recorder.{RecordError, Reason}
+import Kbdcast.Recorder.Live
+import Kbdcast.Key.Encode.{Unencodable, NeedsOtherKeys, NeedsKitty}
+import Kbdcast.Key.Notation
+import PtyBun.{BunPty, SpawnFailed}
+
+fn main() -> ExitCode {
+  match Args.list() {
+    ["rec", path] -> rec(path)
+    _ -> {
+      Stderr.write_line("usage: kbdcast rec <tape>")
+      ExitCode(2)
+    }
+  }
+}
+
+fn rec(path: String) -> ExitCode {
+  let source = FileSystem.read_text(path) catch {
+    FileError(reason) -> return failure("${path}: ${reason}")
+  }
+  let tape = Tape.parse(source) catch {
+    TapeError(line, column, message) -> return failure("${path}:${line}:${column}: ${message}")
+  }
+  # 作業ディレクトリは tape のあるディレクトリ（recorder spec §2）
+  let dir = Path.parent(Path.absolute(path))
+  with BunPty(tape.command.argv, tape.cols, tape.rows, dir, ["TERM=xterm-256color"]), SystemClock, SystemStdout {
+    Live.record(tape)
+  } catch {
+    SpawnFailed(message) ->
+      failure("${path}:${tape.command.line}: cannot start ${tape.command.argv[0]}: ${message}")
+    RecordError(line, reason) -> failure("${path}:${line}: ${describe(reason)}")
+  }
+  ExitCode(0)
+}
+
+fn failure(message: String) -> ExitCode {
+  Stderr.write_line(message)
+  ExitCode(1)
+}
+
+fn describe(reason: Reason) -> String {
+  match reason {
+    Reason.CannotSend(Unencodable(key, NeedsOtherKeys(level))) ->
+      "cannot send ${Notation.print(key)}: it needs modifyOtherKeys level ${level}, which the program has not enabled"
+    Reason.CannotSend(Unencodable(key, NeedsKitty)) ->
+      "cannot send ${Notation.print(key)}: it needs the kitty keyboard protocol, which kbdcast does not support"
+    Reason.Exited(code) -> "the program exited with code ${code} before the end of the tape"
+    Reason.TimedOut(pattern, timeout, screen) ->
+      "/${pattern} did not appear within ${duration(timeout)}\nscreen:\n${screen}"
+  }
+}
+
+# tape の <dur> の書き方: 秒で割り切れれば <n>s、そうでなければ <n>ms
+fn duration(d: Duration) -> String {
+  if d.as_ms() % 1000 == 0 { "${d.as_ms() / 1000}s" } else { "${d.as_ms()}ms" }
+}
+
+# --- wish check (emela 0.28.2) ---
+# (Pome.toml は wish check が仮に置いた: cli/Pome.toml)
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/main.emel:21:3 ]
+#     │
+#  21 │   match Args.list() {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/main.emel:31:3 ]
+#     │
+#  31 │   let source = FileSystem.read_text(path) catch {
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/main.emel:31:7 ]
+#     │
+#  31 │   let source = FileSystem.read_text(path) catch {
+#     │       ───┬──  
+#     │          ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/main.emel:34:3 ]
+#     │
+#  34 │   let tape = Tape.parse(source) catch {
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/main.emel:34:7 ]
+#     │
+#  34 │   let tape = Tape.parse(source) catch {
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/main.emel:38:3 ]
+#     │
+#  38 │   let dir = Path.parent(Path.absolute(path))
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/main.emel:38:7 ]
+#     │
+#  38 │   let dir = Path.parent(Path.absolute(path))
+#     │       ─┬─  
+#     │        ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/main.emel:41:5 ]
+#     │
+#  41 │   } catch {
+#     │     ──┬──  
+#     │       ╰──── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/main.emel:55:3 ]
+#     │
+#  55 │   match reason {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/main.emel:56:66 ]
+#     │
+#  56 │     Reason.CannotSend(Unencodable(key, NeedsOtherKeys(level))) ->
+#     │                                                                  ┬  
+#     │                                                                  ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/main.emel:57:119 ]
+#     │
+#  57 │       "cannot send ${Notation.print(key)}: it needs modifyOtherKeys level ${level}, which the program has not enabled"
+#     │                                                                                                                       ┬  
+#     │                                                                                                                       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/main.emel:58:55 ]
+#     │
+#  58 │     Reason.CannotSend(Unencodable(key, NeedsKitty)) ->
+#     │                                                       ┬  
+#     │                                                       ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/main.emel:59:113 ]
+#     │
+#  59 │       "cannot send ${Notation.print(key)}: it needs the kitty keyboard protocol, which kbdcast does not support"
+#     │                                                                                                                 ┬  
+#     │                                                                                                                 ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/main.emel:61:49 ]
+#     │
+#  61 │     Reason.TimedOut(pattern, timeout, screen) ->
+#     │                                                 ┬  
+#     │                                                 ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/main.emel:62:83 ]
+#     │
+#  62 │       "/${pattern} did not appear within ${duration(timeout)}\nscreen:\n${screen}"
+#     │                                                                                   ┬  
+#     │                                                                                   ╰── 
+# ────╯
+#
+# error[E0205]: undefined module `Kbdcast.Tape`
+#     ╭─[ src/main.emel:13:8 ]
+#     │
+#  13 │ import Kbdcast.Tape.{Tape, TapeError}
+#     │        ──────┬─────  
+#     │              ╰─────── 
+# ────╯
+#
+# error[E0205]: undefined module `Kbdcast.Recorder`
+#     ╭─[ src/main.emel:14:8 ]
+#     │
+#  14 │ import Kbdcast.Recorder.{RecordError, Reason}
+#     │        ────────┬───────  
+#     │                ╰───────── 
+# ────╯
+#
+# error[E0205]: undefined module `Kbdcast.Recorder.Live`
+#     ╭─[ src/main.emel:15:8 ]
+#     │
+#  15 │ import Kbdcast.Recorder.Live
+#     │        ──────────┬──────────  
+#     │                  ╰──────────── 
+# ────╯
+#
+# error[E0205]: undefined module `Kbdcast.Key.Encode`
+#     ╭─[ src/main.emel:16:8 ]
+#     │
+#  16 │ import Kbdcast.Key.Encode.{Unencodable, NeedsOtherKeys, NeedsKitty}
+#     │        ─────────┬────────  
+#     │                 ╰────────── 
+# ────╯
+#
+# error[E0205]: undefined module `Kbdcast.Key.Notation`
+#     ╭─[ src/main.emel:17:8 ]
+#     │
+#  17 │ import Kbdcast.Key.Notation
+#     │        ──────────┬─────────  
+#     │                  ╰─────────── 
+# ────╯
+#
+# error[E0205]: undefined module `PtyBun`
+#     ╭─[ src/main.emel:18:8 ]
+#     │
+#  18 │ import PtyBun.{BunPty, SpawnFailed}
+#     │        ───┬──  
+#     │           ╰──── 
+# ────╯
+#
+# error[E0212]: module `Std.FileSystem` has no `FileError`
+#    ╭─[ src/main.emel:8:36 ]
+#    │
+#  8 │ import Std.FileSystem.{FileSystem, FileError}
+#    │                                    ────┬────  
+#    │                                        ╰────── 
+# ───╯
+#
+# error[E0217]: expected module or trait, found effect `Args`
+#     ╭─[ src/main.emel:21:9 ]
+#     │
+#  21 │   match Args.list() {
+#     │         ──┬─  
+#     │           ╰─── 
+# ────╯
+#    = help: call the operations of an effect through its capability: `(use Args).op(...)`
+#
+# error[E0217]: expected module or trait, found effect `Stderr`
+#     ╭─[ src/main.emel:24:7 ]
+#     │
+#  24 │       Stderr.write_line("usage: kbdcast rec <tape>")
+#     │       ───┬──  
+#     │          ╰──── 
+# ────╯
+#    = help: call the operations of an effect through its capability: `(use Stderr).op(...)`
+#
+# error[E0215]: cannot construct opaque `ExitCode` outside module `Std.Process`
+#     ╭─[ src/main.emel:25:7 ]
+#     │
+#  25 │       ExitCode(2)
+#     │       ────┬───  
+#     │           ╰───── 
+# ────╯
+#    = help: `ExitCode` is opaque: use the functions of module `Std.Process` to make one
+#
+# error[E0211]: cannot find handler, layer or label `BunPty` in this scope
+#     ╭─[ src/main.emel:39:8 ]
+#     │
+#  39 │   with BunPty(tape.command.argv, tape.cols, tape.rows, dir, ["TERM=xterm-256color"]), SystemClock, SystemStdout {
+#     │        ───┬──  
+#     │           ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `tape` in this scope
+#     ╭─[ src/main.emel:39:15 ]
+#     │
+#  39 │   with BunPty(tape.command.argv, tape.cols, tape.rows, dir, ["TERM=xterm-256color"]), SystemClock, SystemStdout {
+#     │               ──┬─  
+#     │                 ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `tape` in this scope
+#     ╭─[ src/main.emel:39:34 ]
+#     │
+#  39 │   with BunPty(tape.command.argv, tape.cols, tape.rows, dir, ["TERM=xterm-256color"]), SystemClock, SystemStdout {
+#     │                                  ──┬─  
+#     │                                    ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `tape` in this scope
+#     ╭─[ src/main.emel:39:45 ]
+#     │
+#  39 │   with BunPty(tape.command.argv, tape.cols, tape.rows, dir, ["TERM=xterm-256color"]), SystemClock, SystemStdout {
+#     │                                             ──┬─  
+#     │                                               ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `dir` in this scope
+#     ╭─[ src/main.emel:39:56 ]
+#     │
+#  39 │   with BunPty(tape.command.argv, tape.cols, tape.rows, dir, ["TERM=xterm-256color"]), SystemClock, SystemStdout {
+#     │                                                        ─┬─  
+#     │                                                         ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Live` in this scope
+#     ╭─[ src/main.emel:40:5 ]
+#     │
+#  40 │     Live.record(tape)
+#     │     ──┬─  
+#     │       ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `tape` in this scope
+#     ╭─[ src/main.emel:40:17 ]
+#     │
+#  40 │     Live.record(tape)
+#     │                 ──┬─  
+#     │                   ╰─── 
+# ────╯
+#
+# error[E0215]: cannot construct opaque `ExitCode` outside module `Std.Process`
+#     ╭─[ src/main.emel:46:3 ]
+#     │
+#  46 │   ExitCode(0)
+#     │   ────┬───  
+#     │       ╰───── 
+# ────╯
+#    = help: `ExitCode` is opaque: use the functions of module `Std.Process` to make one
+#
+# error[E0217]: expected module or trait, found effect `Stderr`
+#     ╭─[ src/main.emel:50:3 ]
+#     │
+#  50 │   Stderr.write_line(message)
+#     │   ───┬──  
+#     │      ╰──── 
+# ────╯
+#    = help: call the operations of an effect through its capability: `(use Stderr).op(...)`
+#
+# error[E0215]: cannot construct opaque `ExitCode` outside module `Std.Process`
+#     ╭─[ src/main.emel:51:3 ]
+#     │
+#  51 │   ExitCode(1)
+#     │   ────┬───  
+#     │       ╰───── 
+# ────╯
+#    = help: `ExitCode` is opaque: use the functions of module `Std.Process` to make one
+#
+# error[E0211]: cannot find type `Reason` in this scope
+#     ╭─[ src/main.emel:54:21 ]
+#     │
+#  54 │ fn describe(reason: Reason) -> String {
+#     │                     ───┬──  
+#     │                        ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Reason` in this scope
+#     ╭─[ src/main.emel:56:5 ]
+#     │
+#  56 │     Reason.CannotSend(Unencodable(key, NeedsOtherKeys(level))) ->
+#     │     ───┬──  
+#     │        ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Unencodable` in this scope
+#     ╭─[ src/main.emel:56:23 ]
+#     │
+#  56 │     Reason.CannotSend(Unencodable(key, NeedsOtherKeys(level))) ->
+#     │                       ─────┬─────  
+#     │                            ╰─────── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `NeedsOtherKeys` in this scope
+#     ╭─[ src/main.emel:56:40 ]
+#     │
+#  56 │     Reason.CannotSend(Unencodable(key, NeedsOtherKeys(level))) ->
+#     │                                        ───────┬──────  
+#     │                                               ╰──────── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Reason` in this scope
+#     ╭─[ src/main.emel:58:5 ]
+#     │
+#  58 │     Reason.CannotSend(Unencodable(key, NeedsKitty)) ->
+#     │     ───┬──  
+#     │        ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Unencodable` in this scope
+#     ╭─[ src/main.emel:58:23 ]
+#     │
+#  58 │     Reason.CannotSend(Unencodable(key, NeedsKitty)) ->
+#     │                       ─────┬─────  
+#     │                            ╰─────── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `NeedsKitty` in this scope
+#     ╭─[ src/main.emel:58:40 ]
+#     │
+#  58 │     Reason.CannotSend(Unencodable(key, NeedsKitty)) ->
+#     │                                        ─────┬────  
+#     │                                             ╰────── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Reason` in this scope
+#     ╭─[ src/main.emel:60:5 ]
+#     │
+#  60 │     Reason.Exited(code) -> "the program exited with code ${code} before the end of the tape"
+#     │     ───┬──  
+#     │        ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Reason` in this scope
+#     ╭─[ src/main.emel:61:5 ]
+#     │
+#  61 │     Reason.TimedOut(pattern, timeout, screen) ->
+#     │     ───┬──  
+#     │        ╰──── 
+# ────╯
+#
+# error[E0315]: cannot access field `as_ms` of opaque type `Duration` outside its module
+#     ╭─[ src/main.emel:68:8 ]
+#     │
+#  68 │   if d.as_ms() % 1000 == 0 { "${d.as_ms() / 1000}s" } else { "${d.as_ms()}ms" }
+#     │        ──┬──  
+#     │          ╰──── 
+# ────╯
+#
+# 45 errors
+# --- end wish check ---
