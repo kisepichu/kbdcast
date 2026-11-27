@@ -31,6 +31,9 @@ fn text_joins_the_rows_without_the_blanks_at_their_ends() {
   assert Vt.text(fed(4, 2, "abcdef")) == "abcd\nef"
   # As avt's `trim_end`, the end of a row loses any White_Space, not only spaces.
   assert Vt.text(fed(4, 1, " a\u{a0}")) == " a"
+  # It reads the screen in view, the alternate one while it is active, where avt's `Vt::text` reads
+  # the primary one. `main` leaves the cursor at column 4, so `alt` wraps to the second row.
+  assert Vt.text(fed(4, 2, "main\u{1b}[?1049halt")) == "\nalt"
 }
 
 @test

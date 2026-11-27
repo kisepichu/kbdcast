@@ -2,7 +2,9 @@
 # The recorder feeds it the output of the PTY and writes the replies back, `wait` reads its text,
 # and the overlay draws its lines and its cursor.
 # The behavior follows avt 0.18.0 (Apache-2.0, https://github.com/asciinema/avt)
-# (`text` is avt's `Buffer::text`, without joining a row that wraps to the next.)
+# (`text` reads the screen in view, the alternate one while it is active, unlike avt's `Vt::text`,
+# which reads the primary one. For each row it is avt's `Buffer::text`, without joining a row that
+# wraps to the next.)
 #
 # FRICTION(012): Emela does not re-export what a module imports, so a user imports `Reply` from
 # Vt.Terminal and `Cell` from Vt.Screen.
@@ -63,9 +65,9 @@ pub fn cursor(t: Terminal) -> Option[(Int, Int)] {
   if visible { Some((col, row)) } else { None }
 }
 
-## The characters of each row of the screen in view, without the right halves of wide characters and
-## without the White_Space at the end of the row, the rows joined by `\n`. A row that wraps is not
-## joined to the next.
+## The characters of each row of the screen in view (the alternate screen while it is active),
+## without the right halves of wide characters and without the White_Space at the end of the row,
+## the rows joined by `\n`. A row that wraps is not joined to the next.
 pub fn text(t: Terminal) -> String {
   lines(t).map(row_text).join("\n")
 }
