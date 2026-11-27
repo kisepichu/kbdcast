@@ -1,0 +1,829 @@
+# wish-target: src/recorder/live.emel
+#
+# LiveDriver: Driver を PTY、VT、cast の writer で動かす本番用の handler。
+# 状態は VT、UTF-8 のデコーダ、tape の時間（ms）、cast の Writer、終わったかどうか。
+# 時間が流れる操作は「期限まで PTY を読んで feed し続ける」処理にし、
+# 読み込みは Task.timeout で打ち切る（全体設計 §9、recorder spec §7）。
+
+module Recorder.Live
+
+import Std.Clock.{Clock, Instant}
+import Std.Duration.{Duration}
+import Std.Process.{Stdout}
+import Std.Task
+import Pty.{Pty, Output}
+import Recorder.{Driver, ProcessExited, WaitTimeout}
+import Key.{Key}
+import Key.Encode.{encode, Unencodable}
+import Regex.{Regex}
+import Vt
+import Utf8
+import Cast
+
+pub handler LiveDriver: Driver uses { Pty, Clock, Stdout } {
+  var vt: Vt.Terminal
+  var decoder: Utf8.Decoder
+  var tape_ms: Int
+  var writer: Cast.Writer
+  var exited: Option[Int]
+
+  init(cols: Int, rows: Int, command: String) {
+    Stdout.write_line(Cast.header(cols, rows, command))
+    vt = Vt.new(cols, rows)
+    decoder = Utf8.decoder()
+    tape_ms = 0
+    writer = Cast.writer()
+    exited = None
+  }
+
+  suspend fn press(key: Key) -> () fails Unencodable | ProcessExited {
+    ensure_running()
+    let bytes = encode(key, Vt.input_modes(vt))
+    Pty.write(bytes)
+    record(tape_ms, "i", String.from_utf8_lossy(bytes))
+  }
+
+  suspend fn idle(d: Duration) -> () fails ProcessExited {
+    ensure_running()
+    let start = Clock.now()
+    read_window(start, d.as_ms())
+    tape_ms += d.as_ms()
+  }
+
+  suspend fn wait_for(pattern: Regex, source: String, timeout: Duration) -> () fails WaitTimeout | ProcessExited {
+    ensure_running()
+    wait_screen(pattern, Clock.now() + timeout)
+  }
+
+  # 窓の残りの間 PTY を読む。o イベントの時刻は窓の長さの中に丸める。
+  fn read_window(start: Instant, window: Int) -> () fails ProcessExited {
+    let left = window - (Clock.now() - start).as_ms()
+    if left > 0 {
+      match Task.timeout(Duration.ms(left), fn() { Pty.read() }) {
+        None -> ()
+        Some(output) -> {
+          receive(output, tape_ms + min((Clock.now() - start).as_ms(), window))
+          read_window(start, window)
+        }
+      }
+    }
+  }
+
+  # feed のたびに画面を見る。tape の時間は進めない。
+  fn wait_screen(pattern: Regex, deadline: Instant) -> () fails WaitTimeout | ProcessExited {
+    if !Regex.is_match(pattern, Vt.text(vt)) {
+      let left = deadline - Clock.now()
+      if left <= Duration.zero {
+        fail WaitTimeout(Vt.text(vt))
+      }
+      match Task.timeout(left, fn() { Pty.read() }) {
+        None -> fail WaitTimeout(Vt.text(vt))
+        Some(output) -> {
+          receive(output, tape_ms)
+          wait_screen(pattern, deadline)
+        }
+      }
+    }
+  }
+
+  fn receive(output: Output, at_ms: Int) -> () fails ProcessExited {
+    match output {
+      Output.Data(bytes) -> {
+        let (next_decoder, text) = Utf8.decode(decoder, bytes)
+        decoder = next_decoder
+        let (next_vt, replies) = Vt.feed(vt, text)
+        vt = next_vt
+        replies.each(fn(reply) { Pty.write(Vt.reply_bytes(reply)) })
+        if text != "" {
+          record(at_ms, "o", text)
+        }
+      }
+      Output.Exited(code) -> {
+        record(at_ms, "x", code.to_string())
+        exited = Some(code)
+        fail ProcessExited(code)
+      }
+    }
+  }
+
+  fn ensure_running() -> () fails ProcessExited {
+    match exited {
+      Some(code) -> fail ProcessExited(code)
+      None -> ()
+    }
+  }
+
+  fn record(at_ms: Int, code: String, data: String) -> () {
+    let (next_writer, line) = Cast.event(writer, at_ms, code, data)
+    writer = next_writer
+    Stdout.write_line(line)
+  }
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0126]: expected declaration
+#    ╭─[ src/recorder/live.emel:8:1 ]
+#    │
+#  8 │ module Recorder.Live
+#    │ ───┬──  
+#    │    ╰──── 
+# ───╯
+#
+# error[E0127]: imports must come before declarations
+#     ╭─[ src/recorder/live.emel:10:1 ]
+#     │
+#  10 │ import Std.Clock.{Clock, Instant}
+#     │ ───┬──  
+#     │    ╰──── 
+# ────╯
+#
+# error[E0127]: imports must come before declarations
+#     ╭─[ src/recorder/live.emel:11:1 ]
+#     │
+#  11 │ import Std.Duration.{Duration}
+#     │ ───┬──  
+#     │    ╰──── 
+# ────╯
+#
+# error[E0127]: imports must come before declarations
+#     ╭─[ src/recorder/live.emel:12:1 ]
+#     │
+#  12 │ import Std.Process.{Stdout}
+#     │ ───┬──  
+#     │    ╰──── 
+# ────╯
+#
+# error[E0127]: imports must come before declarations
+#     ╭─[ src/recorder/live.emel:13:1 ]
+#     │
+#  13 │ import Std.Task
+#     │ ───┬──  
+#     │    ╰──── 
+# ────╯
+#
+# error[E0127]: imports must come before declarations
+#     ╭─[ src/recorder/live.emel:14:1 ]
+#     │
+#  14 │ import Pty.{Pty, Output}
+#     │ ───┬──  
+#     │    ╰──── 
+# ────╯
+#
+# error[E0127]: imports must come before declarations
+#     ╭─[ src/recorder/live.emel:15:1 ]
+#     │
+#  15 │ import Recorder.{Driver, ProcessExited, WaitTimeout}
+#     │ ───┬──  
+#     │    ╰──── 
+# ────╯
+#
+# error[E0127]: imports must come before declarations
+#     ╭─[ src/recorder/live.emel:16:1 ]
+#     │
+#  16 │ import Key.{Key}
+#     │ ───┬──  
+#     │    ╰──── 
+# ────╯
+#
+# error[E0127]: imports must come before declarations
+#     ╭─[ src/recorder/live.emel:17:1 ]
+#     │
+#  17 │ import Key.Encode.{encode, Unencodable}
+#     │ ───┬──  
+#     │    ╰──── 
+# ────╯
+#
+# error[E0127]: imports must come before declarations
+#     ╭─[ src/recorder/live.emel:18:1 ]
+#     │
+#  18 │ import Regex.{Regex}
+#     │ ───┬──  
+#     │    ╰──── 
+# ────╯
+#
+# error[E0127]: imports must come before declarations
+#     ╭─[ src/recorder/live.emel:19:1 ]
+#     │
+#  19 │ import Vt
+#     │ ───┬──  
+#     │    ╰──── 
+# ────╯
+#
+# error[E0127]: imports must come before declarations
+#     ╭─[ src/recorder/live.emel:20:1 ]
+#     │
+#  20 │ import Utf8
+#     │ ───┬──  
+#     │    ╰──── 
+# ────╯
+#
+# error[E0127]: imports must come before declarations
+#     ╭─[ src/recorder/live.emel:21:1 ]
+#     │
+#  21 │ import Cast
+#     │ ───┬──  
+#     │    ╰──── 
+# ────╯
+#
+# error[E0110]: expected `{`
+#     ╭─[ src/recorder/live.emel:23:32 ]
+#     │
+#  23 │ pub handler LiveDriver: Driver uses { Pty, Clock, Stdout } {
+#     │                                ──┬─  
+#     │                                  ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/recorder/live.emel:23:32 ]
+#     │
+#  23 │ pub handler LiveDriver: Driver uses { Pty, Clock, Stdout } {
+#     │                                ──┬─  
+#     │                                  ╰─── 
+# ────╯
+#
+# error[E0130]: a top-level `suspend fn` must be `@external`
+#     ╭─[ src/recorder/live.emel:39:14 ]
+#     │
+#  39 │   suspend fn press(key: Key) -> () fails Unencodable | ProcessExited {
+#     │              ──┬──  
+#     │                ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/recorder/live.emel:41:5 ]
+#     │
+#  41 │     let bytes = encode(key, Vt.input_modes(vt))
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/recorder/live.emel:41:9 ]
+#     │
+#  41 │     let bytes = encode(key, Vt.input_modes(vt))
+#     │         ──┬──  
+#     │           ╰──── 
+# ────╯
+#
+# error[E0130]: a top-level `suspend fn` must be `@external`
+#     ╭─[ src/recorder/live.emel:46:14 ]
+#     │
+#  46 │   suspend fn idle(d: Duration) -> () fails ProcessExited {
+#     │              ──┬─  
+#     │                ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/recorder/live.emel:48:5 ]
+#     │
+#  48 │     let start = Clock.now()
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/recorder/live.emel:48:9 ]
+#     │
+#  48 │     let start = Clock.now()
+#     │         ──┬──  
+#     │           ╰──── 
+# ────╯
+#
+# error[E0125]: invalid left-hand side of binding: expected a pattern
+#     ╭─[ src/recorder/live.emel:50:5 ]
+#     │
+#  50 │     tape_ms += d.as_ms()
+#     │     ────┬────  
+#     │         ╰────── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/recorder/live.emel:50:14 ]
+#     │
+#  50 │     tape_ms += d.as_ms()
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0130]: a top-level `suspend fn` must be `@external`
+#     ╭─[ src/recorder/live.emel:53:14 ]
+#     │
+#  53 │   suspend fn wait_for(pattern: Regex, source: String, timeout: Duration) -> () fails WaitTimeout | ProcessExited {
+#     │              ────┬───  
+#     │                  ╰───── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/recorder/live.emel:60:5 ]
+#     │
+#  60 │     let left = window - (Clock.now() - start).as_ms()
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/recorder/live.emel:60:9 ]
+#     │
+#  60 │     let left = window - (Clock.now() - start).as_ms()
+#     │         ──┬─  
+#     │           ╰─── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/recorder/live.emel:62:7 ]
+#     │
+#  62 │       match Task.timeout(Duration.ms(left), fn() { Pty.read() }) {
+#     │       ──┬──  
+#     │         ╰──── 
+# ────╯
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#     ╭─[ src/recorder/live.emel:62:45 ]
+#     │
+#  62 │       match Task.timeout(Duration.ms(left), fn() { Pty.read() }) {
+#     │                                             ──┬─  
+#     │                                               ╰─── 
+# ────╯
+#    = help: write `|| Pty.read()`
+#
+# error[E0118]: expected expression
+#     ╭─[ src/recorder/live.emel:75:7 ]
+#     │
+#  75 │       let left = deadline - Clock.now()
+#     │       ─┬─  
+#     │        ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/recorder/live.emel:75:11 ]
+#     │
+#  75 │       let left = deadline - Clock.now()
+#     │           ──┬─  
+#     │             ╰─── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/recorder/live.emel:79:7 ]
+#     │
+#  79 │       match Task.timeout(left, fn() { Pty.read() }) {
+#     │       ──┬──  
+#     │         ╰──── 
+# ────╯
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#     ╭─[ src/recorder/live.emel:79:32 ]
+#     │
+#  79 │       match Task.timeout(left, fn() { Pty.read() }) {
+#     │                                ──┬─  
+#     │                                  ╰─── 
+# ────╯
+#    = help: write `|| Pty.read()`
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/recorder/live.emel:90:5 ]
+#     │
+#  90 │     match output {
+#     │     ──┬──  
+#     │       ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/recorder/live.emel:92:9 ]
+#     │
+#  92 │         let (next_decoder, text) = Utf8.decode(decoder, bytes)
+#     │         ─┬─  
+#     │          ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/recorder/live.emel:92:13 ]
+#     │
+#  92 │         let (next_decoder, text) = Utf8.decode(decoder, bytes)
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/recorder/live.emel:94:9 ]
+#     │
+#  94 │         let (next_vt, replies) = Vt.feed(vt, text)
+#     │         ─┬─  
+#     │          ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/recorder/live.emel:94:13 ]
+#     │
+#  94 │         let (next_vt, replies) = Vt.feed(vt, text)
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#     ╭─[ src/recorder/live.emel:96:22 ]
+#     │
+#  96 │         replies.each(fn(reply) { Pty.write(Vt.reply_bytes(reply)) })
+#     │                      ────┬────  
+#     │                          ╰────── 
+# ────╯
+#    = help: write `|reply| Pty.write(Vt.reply_bytes(reply))`
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/recorder/live.emel:110:5 ]
+#      │
+#  110 │     match exited {
+#      │     ──┬──  
+#      │       ╰──── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/recorder/live.emel:117:5 ]
+#      │
+#  117 │     let (next_writer, line) = Cast.event(writer, at_ms, code, data)
+#      │     ─┬─  
+#      │      ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/recorder/live.emel:117:9 ]
+#      │
+#  117 │     let (next_writer, line) = Cast.event(writer, at_ms, code, data)
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0126]: expected declaration
+#      ╭─[ src/recorder/live.emel:121:1 ]
+#      │
+#  121 │ }
+#      │ ┬  
+#      │ ╰── 
+# ─────╯
+#
+# error[E0205]: undefined module `Std.Task`
+#     ╭─[ src/recorder/live.emel:13:8 ]
+#     │
+#  13 │ import Std.Task
+#     │        ────┬───  
+#     │            ╰───── 
+# ────╯
+#
+# error[E0205]: undefined module `Pty`
+#     ╭─[ src/recorder/live.emel:14:8 ]
+#     │
+#  14 │ import Pty.{Pty, Output}
+#     │        ─┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0212]: module `Std.Clock` has no `Instant`
+#     ╭─[ src/recorder/live.emel:10:26 ]
+#     │
+#  10 │ import Std.Clock.{Clock, Instant}
+#     │                          ───┬───  
+#     │                             ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Pty` in this scope
+#     ╭─[ src/recorder/live.emel:42:5 ]
+#     │
+#  42 │     Pty.write(bytes)
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `bytes` in this scope
+#     ╭─[ src/recorder/live.emel:42:15 ]
+#     │
+#  42 │     Pty.write(bytes)
+#     │               ──┬──  
+#     │                 ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `tape_ms` in this scope
+#     ╭─[ src/recorder/live.emel:43:12 ]
+#     │
+#  43 │     record(tape_ms, "i", String.from_utf8_lossy(bytes))
+#     │            ───┬───  
+#     │               ╰───── 
+# ────╯
+#
+# error[E0212]: module `String` has no `from_utf8_lossy`
+#     ╭─[ src/recorder/live.emel:43:33 ]
+#     │
+#  43 │     record(tape_ms, "i", String.from_utf8_lossy(bytes))
+#     │                                 ───────┬───────  
+#     │                                        ╰───────── 
+# ────╯
+#
+# error[E0211]: cannot find value `bytes` in this scope
+#     ╭─[ src/recorder/live.emel:43:49 ]
+#     │
+#  43 │     record(tape_ms, "i", String.from_utf8_lossy(bytes))
+#     │                                                 ──┬──  
+#     │                                                   ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `start` in this scope
+#     ╭─[ src/recorder/live.emel:49:17 ]
+#     │
+#  49 │     read_window(start, d.as_ms())
+#     │                 ──┬──  
+#     │                   ╰──── 
+# ────╯
+#
+# error[E0212]: module `Std.Clock` has no `now`
+#     ╭─[ src/recorder/live.emel:55:32 ]
+#     │
+#  55 │     wait_screen(pattern, Clock.now() + timeout)
+#     │                                ─┬─  
+#     │                                 ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find type `Instant` in this scope
+#     ╭─[ src/recorder/live.emel:59:25 ]
+#     │
+#  59 │   fn read_window(start: Instant, window: Int) -> () fails ProcessExited {
+#     │                         ───┬───  
+#     │                            ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find value `left` in this scope
+#     ╭─[ src/recorder/live.emel:61:8 ]
+#     │
+#  61 │     if left > 0 {
+#     │        ──┬─  
+#     │          ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Task` in this scope
+#     ╭─[ src/recorder/live.emel:62:13 ]
+#     │
+#  62 │       match Task.timeout(Duration.ms(left), fn() { Pty.read() }) {
+#     │             ──┬─  
+#     │               ╰─── 
+# ────╯
+#
+# error[E0212]: module `Std.Duration` has no `ms`
+#     ╭─[ src/recorder/live.emel:62:35 ]
+#     │
+#  62 │       match Task.timeout(Duration.ms(left), fn() { Pty.read() }) {
+#     │                                   ─┬  
+#     │                                    ╰── 
+# ────╯
+#
+# error[E0211]: cannot find value `left` in this scope
+#     ╭─[ src/recorder/live.emel:62:38 ]
+#     │
+#  62 │       match Task.timeout(Duration.ms(left), fn() { Pty.read() }) {
+#     │                                      ──┬─  
+#     │                                        ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Pty` in this scope
+#     ╭─[ src/recorder/live.emel:62:52 ]
+#     │
+#  62 │       match Task.timeout(Duration.ms(left), fn() { Pty.read() }) {
+#     │                                                    ─┬─  
+#     │                                                     ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `tape_ms` in this scope
+#     ╭─[ src/recorder/live.emel:65:27 ]
+#     │
+#  65 │           receive(output, tape_ms + min((Clock.now() - start).as_ms(), window))
+#     │                           ───┬───  
+#     │                              ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find value `min` in this scope
+#     ╭─[ src/recorder/live.emel:65:37 ]
+#     │
+#  65 │           receive(output, tape_ms + min((Clock.now() - start).as_ms(), window))
+#     │                                     ─┬─  
+#     │                                      ╰─── 
+# ────╯
+#
+# error[E0212]: module `Std.Clock` has no `now`
+#     ╭─[ src/recorder/live.emel:65:48 ]
+#     │
+#  65 │           receive(output, tape_ms + min((Clock.now() - start).as_ms(), window))
+#     │                                                ─┬─  
+#     │                                                 ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find type `Instant` in this scope
+#     ╭─[ src/recorder/live.emel:73:44 ]
+#     │
+#  73 │   fn wait_screen(pattern: Regex, deadline: Instant) -> () fails WaitTimeout | ProcessExited {
+#     │                                            ───┬───  
+#     │                                               ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find value `vt` in this scope
+#     ╭─[ src/recorder/live.emel:74:41 ]
+#     │
+#  74 │     if !Regex.is_match(pattern, Vt.text(vt)) {
+#     │                                         ─┬  
+#     │                                          ╰── 
+# ────╯
+#
+# error[E0211]: cannot find value `left` in this scope
+#     ╭─[ src/recorder/live.emel:76:10 ]
+#     │
+#  76 │       if left <= Duration.zero {
+#     │          ──┬─  
+#     │            ╰─── 
+# ────╯
+#
+# error[E0212]: module `Std.Duration` has no `zero`
+#     ╭─[ src/recorder/live.emel:76:27 ]
+#     │
+#  76 │       if left <= Duration.zero {
+#     │                           ──┬─  
+#     │                             ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `vt` in this scope
+#     ╭─[ src/recorder/live.emel:77:34 ]
+#     │
+#  77 │         fail WaitTimeout(Vt.text(vt))
+#     │                                  ─┬  
+#     │                                   ╰── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Task` in this scope
+#     ╭─[ src/recorder/live.emel:79:13 ]
+#     │
+#  79 │       match Task.timeout(left, fn() { Pty.read() }) {
+#     │             ──┬─  
+#     │               ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `left` in this scope
+#     ╭─[ src/recorder/live.emel:79:26 ]
+#     │
+#  79 │       match Task.timeout(left, fn() { Pty.read() }) {
+#     │                          ──┬─  
+#     │                            ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Pty` in this scope
+#     ╭─[ src/recorder/live.emel:79:39 ]
+#     │
+#  79 │       match Task.timeout(left, fn() { Pty.read() }) {
+#     │                                       ─┬─  
+#     │                                        ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `vt` in this scope
+#     ╭─[ src/recorder/live.emel:80:42 ]
+#     │
+#  80 │         None -> fail WaitTimeout(Vt.text(vt))
+#     │                                          ─┬  
+#     │                                           ╰── 
+# ────╯
+#
+# error[E0211]: cannot find value `tape_ms` in this scope
+#     ╭─[ src/recorder/live.emel:82:27 ]
+#     │
+#  82 │           receive(output, tape_ms)
+#     │                           ───┬───  
+#     │                              ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find type `Output` in this scope
+#     ╭─[ src/recorder/live.emel:89:22 ]
+#     │
+#  89 │   fn receive(output: Output, at_ms: Int) -> () fails ProcessExited {
+#     │                      ───┬──  
+#     │                         ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Output` in this scope
+#     ╭─[ src/recorder/live.emel:91:7 ]
+#     │
+#  91 │       Output.Data(bytes) -> {
+#     │       ───┬──  
+#     │          ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `next_decoder` in this scope
+#     ╭─[ src/recorder/live.emel:93:19 ]
+#     │
+#  93 │         decoder = next_decoder
+#     │                   ──────┬─────  
+#     │                         ╰─────── 
+# ────╯
+#
+# error[E0211]: cannot find value `next_vt` in this scope
+#     ╭─[ src/recorder/live.emel:95:14 ]
+#     │
+#  95 │         vt = next_vt
+#     │              ───┬───  
+#     │                 ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find value `replies` in this scope
+#     ╭─[ src/recorder/live.emel:96:9 ]
+#     │
+#  96 │         replies.each(fn(reply) { Pty.write(Vt.reply_bytes(reply)) })
+#     │         ───┬───  
+#     │            ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Pty` in this scope
+#     ╭─[ src/recorder/live.emel:96:34 ]
+#     │
+#  96 │         replies.each(fn(reply) { Pty.write(Vt.reply_bytes(reply)) })
+#     │                                  ─┬─  
+#     │                                   ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `text` in this scope
+#     ╭─[ src/recorder/live.emel:97:12 ]
+#     │
+#  97 │         if text != "" {
+#     │            ──┬─  
+#     │              ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `text` in this scope
+#     ╭─[ src/recorder/live.emel:98:30 ]
+#     │
+#  98 │           record(at_ms, "o", text)
+#     │                              ──┬─  
+#     │                                ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Output` in this scope
+#      ╭─[ src/recorder/live.emel:101:7 ]
+#      │
+#  101 │       Output.Exited(code) -> {
+#      │       ───┬──  
+#      │          ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find value `exited` in this scope
+#      ╭─[ src/recorder/live.emel:110:11 ]
+#      │
+#  110 │     match exited {
+#      │           ───┬──  
+#      │              ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find value `next_writer` in this scope
+#      ╭─[ src/recorder/live.emel:118:14 ]
+#      │
+#  118 │     writer = next_writer
+#      │              ─────┬─────  
+#      │                   ╰─────── 
+# ─────╯
+#
+# error[E0217]: expected module or trait, found effect `Stdout`
+#      ╭─[ src/recorder/live.emel:119:5 ]
+#      │
+#  119 │     Stdout.write_line(line)
+#      │     ───┬──  
+#      │        ╰──── 
+# ─────╯
+#    = help: call the operations of an effect through its capability: `(use Stdout).op(...)`
+#
+# error[E0211]: cannot find value `line` in this scope
+#      ╭─[ src/recorder/live.emel:119:23 ]
+#      │
+#  119 │     Stdout.write_line(line)
+#      │                       ──┬─  
+#      │                         ╰─── 
+# ─────╯
+#
+# error[E0404]: handler `LiveDriver` does not implement operations `press`, `idle`, `wait_for`
+#     ╭─[ src/recorder/live.emel:23:13 ]
+#     │
+#  23 │ pub handler LiveDriver: Driver uses { Pty, Clock, Stdout } {
+#     │             ─────┬────  
+#     │                  ╰────── 
+# ────╯
+#
+# error[E0315]: cannot access field `as_ms` of opaque type `Duration` outside its module
+#     ╭─[ src/recorder/live.emel:49:26 ]
+#     │
+#  49 │     read_window(start, d.as_ms())
+#     │                          ──┬──  
+#     │                            ╰──── 
+# ────╯
+#
+# error[E0315]: cannot access field `as_ms` of opaque type `Duration` outside its module
+#     ╭─[ src/recorder/live.emel:50:18 ]
+#     │
+#  50 │     tape_ms += d.as_ms()
+#     │                  ──┬──  
+#     │                    ╰──── 
+# ────╯
+#
+# 87 errors, 1 warning
+# --- end wish check ---
