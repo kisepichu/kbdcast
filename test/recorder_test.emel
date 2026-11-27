@@ -71,11 +71,28 @@ fn a_key_that_cannot_be_sent_fails_with_its_line() {
 @test
 fn an_exit_before_the_last_step_fails_with_the_line_of_the_step() {
   assert failure("run app\nsleep 1s\n> q", 0, Exits(ProcessExited(code: 3))) == Some((2, Exited(3)))
+  # In the idle after the key.
+  assert failure("run app\n> a\nsleep 1s", 1, Exits(ProcessExited(code: 0))) == Some((2, Exited(0)))
 }
 
+# The calls show that the fault came at the last one.
 @test
 fn an_exit_in_the_last_step_ends_the_recording() {
-  assert failure("run app\nsleep 1s\n> :q<CR>", 6, Exits(ProcessExited(code: 0))) == None
+  fault = Exits(ProcessExited(code: 0))
+  assert failure("run app\nsleep 1s\n> :q<CR>", 6, fault) == None
+  assert calls("run app\nsleep 1s\n> :q<CR>", Some((6, fault)))
+    == [Idle(1000), press(":"), Idle(50), press("q"), Idle(50), press("<CR>"), Idle(50)]
+  assert failure("run app\nsleep 1s", 0, fault) == None
+  assert calls("run app\nsleep 1s", Some((0, fault))) == [Idle(1000)]
+}
+
+# A `set` line calls nothing, so the step before it is still the last.
+@test
+fn an_exit_in_the_last_step_before_set_lines_ends_the_recording() {
+  fault = Exits(ProcessExited(code: 0))
+  assert failure("run app\n> :q<CR>\nset typing 10ms", 5, fault) == None
+  assert calls("run app\n> :q<CR>\nset typing 10ms", Some((5, fault)))
+    == [press(":"), Idle(50), press("q"), Idle(50), press("<CR>"), Idle(50)]
 }
 
 @test

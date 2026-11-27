@@ -49,8 +49,8 @@ pub error RecordError(line: Int, reason: Reason) derive Eq, Show
 ## Carries out the steps of `tape` in order. `Keys` presses each key and lets the typing pass after
 ## it, `Sleep` lets its duration pass, and `Wait` waits for its pattern for the timeout; `set typing`
 ## and `set timeout` change them for the steps after. An exit of the application in the middle of
-## the last step ends the recording (`> :wq<CR>`), unless that step is a `Wait`; anywhere else it
-## fails.
+## the last step that drives the terminal (only `set` lines may follow it) ends the recording
+## (`> :wq<CR>`), unless that step is a `Wait`; anywhere else it fails.
 pub fn run_tape(tape: Tape) -> () fails RecordError uses { Driver } {
   run_steps(tape.steps, tape.typing, tape.timeout)
 }
@@ -62,7 +62,7 @@ fn run_steps(steps: List[Step], typing: Duration, timeout: Duration) -> ()
   steps match {
     [] -> ()
     [step, ..rest] -> {
-      last = rest.is_empty()
+      last = !rest.any(drives)
       step match {
         SetTyping(_, d)  -> run_steps(rest, d, timeout)
         SetTimeout(_, d) -> run_steps(rest, typing, d)
@@ -101,7 +101,17 @@ fn run_steps(steps: List[Step], typing: Duration, timeout: Duration) -> ()
 }
 
 # An exit with `code` in the middle of the step on line `line`: the end of the recording if the
-# step is the last one, and a failure if it is not.
+# step is the last one that drives the terminal, and a failure if it is not.
 fn exited(line: Int, code: Int, last: Bool) -> () fails RecordError {
   if last { () } else { fail RecordError(line, Exited(code)) }
+}
+
+# Whether `step` drives the terminal, calling Driver: every step but a `set` line.
+fn drives(step: Step) -> Bool {
+  step match {
+    # FRICTION(015): there is no or-pattern, so the two `set` steps have an arm each.
+    SetTyping(_, _)  -> False
+    SetTimeout(_, _) -> False
+    _                -> True
+  }
 }

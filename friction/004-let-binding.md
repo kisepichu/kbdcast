@@ -85,7 +85,7 @@
   tape のパーサ（サブプロジェクト 1 の Task 1、`src/tape.emel`）も同じく `let` を消した（`lines = ...`、`(name, arg) = ...`、`(setting, value) = ...`、`(cols, rows) = size(value)` など）。`here = fn(message) { ... }` の closure は、どの関数も行の一部（`Span`）から error を作るので、top-level の `at(span, message)` にした（回り道ではない）
   cast の writer（サブプロジェクト 1 の Task 2、`src/cast.emel`）では、`header` と `event` の束縛は、literal の中に呼び出しをそのまま書いたので要らなくなり、`interval` は `let` を消した（`millis = ms % 1000`。0 で埋める所は 060）
   BunPty（サブプロジェクト 1 の Task 3、`pty-bun/src/lib.emel`）も同じく `let` を消した（`host = open(...)`、`message = open_error(host)`、`b = read_output(self.host)`）
-  recorder（サブプロジェクト 1 の Task 4、`src/recorder.emel` の `run_steps`）も同じく `let` を消した（`last = rest.is_empty()`）
+  recorder（サブプロジェクト 1 の Task 4、`src/recorder.emel` の `run_steps`）も同じく `let` を消した（`last = rest.is_empty()`。最終レビューの後の修正で、後ろに `set` の行だけが続く step も最後とする `last = !rest.any(drives)` になった）
   LiveDriver（サブプロジェクト 1 の Task 5、`src/recorder/live.emel`）も同じく `let` を消した（`bytes = Encode.encode(...)`、`left = ...`、`(decoder, text) = Utf8.feed(...)`、`(vt, replies) = Vt.feed(...)`、`(writer, line) = Cast.event(...)`）。`start` は、`read_window` の引数に `(use Clock).now()` を直に渡したので要らなくなった
   cli の main（サブプロジェクト 1 の Task 6、`cli/src/main.emel` の `rec`）も同じく `let` を消した（`tape = Tape.parse(...)`、`command = tape.command`）。`dir` は、`with` の項目の引数に `directory(path)` を直に渡したので要らなくなった
 - コスト:
