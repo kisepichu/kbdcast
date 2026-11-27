@@ -1,0 +1,66 @@
+# wish-target: pty-bun/src/lib.emel
+
+## Bun の Bun.Terminal で PTY のプロセスを動かす Pty の handler．
+
+import Pty.{Output, Pty}
+
+# プロセスを起動できなかった．
+pub error SpawnFailed(message: String)
+
+# JS の側（./pty.mjs）が持つ 1 つの端末とプロセス．
+@external(js, "./pty.mjs")
+type Host
+
+@external(js, "./pty.mjs", "open")
+fn open(argv: Array[String], cols: Int, rows: Int, cwd: String, env: Array[String]) -> Host uses { ProcessHost }
+
+@external(js, "./pty.mjs", "openError")
+fn open_error(h: Host) -> String
+
+@external(js, "./pty.mjs", "read")
+suspend fn read_host(h: Host) -> Bytes
+
+@external(js, "./pty.mjs", "write")
+fn write_host(h: Host, b: Bytes) -> ()
+
+@external(js, "./pty.mjs", "exitCode")
+fn exit_code(h: Host) -> Int
+
+@external(js, "./pty.mjs", "close")
+suspend fn close(h: Host) -> ()
+
+# argv を cols × rows の端末の上で cwd で起動する．環境変数は kbdcast のものに env（NAME=value）を上書きする．
+# with を出るとき，プロセスが残っていれば止め（SIGTERM，1 秒で終わらなければ SIGKILL），端末を閉じる．
+pub handler BunPty: Pty {
+  host: Host
+
+  init(argv: List[String], cols: Int, rows: Int, cwd: String, env: List[String]) fails SpawnFailed {
+    let h = open(argv.to_array(), cols, rows, cwd, env.to_array())
+    let message = open_error(h)
+    if message != "" {
+      fail SpawnFailed(message)
+    }
+    { host: h }
+  }
+
+  release {
+    close(host)
+  }
+
+  suspend fn read() -> Output {
+    let bytes = read_host(host)
+    if bytes.is_empty() { Exited(exit_code(host)) } else { Data(bytes) }
+  }
+
+  fn write(b: Bytes) -> () {
+    write_host(host, b)
+  }
+}
+
+# --- wish check (emela 0.28.2) ---
+# (Pome.toml は wish check が仮に置いた: pty-bun/Pome.toml)
+#
+# thread 'main' (4098061) panicked at crates/emela-syntax/src/parser.rs:219:9:
+# expected to be at L_BRACE, found LOWER_NAME
+# note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+# --- end wish check ---
