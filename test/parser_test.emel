@@ -109,11 +109,13 @@ fn advance_carries_a_cut_sequence_to_the_next_call_but_not_the_characters_writte
 }
 
 # Each golden input, cut into 2 to 4 pieces at random places and advanced through piece by piece,
-# gives the same actions as the whole input at once, once adjacent Prints are joined.
+# gives the same actions as the whole input at once, once adjacent Prints are joined. Each case
+# draws its cuts from a seed of its own.
 @test
 fn where_a_golden_input_is_cut_does_not_change_the_actions() {
-  CASES.each(|(_, _, _, input, _)| {
-    Property.check_with(Cut.cuts(), Config(cases: 4, ..Property.config()), |at| {
+  CASES.enumerate().each(|(i, (_, _, _, input, _))| {
+    config = Config(seed: 20261127 + i, cases: 4, ..Property.config())
+    Property.check_with(Cut.cuts(), config, |at| {
       # FRICTION(053): assert takes no label, and the input is not a drawn value that the property
       # would show, so the input is on both sides.
       assert (input, cut_and_advanced(input, at)) == (input, joined(actions(input)))
