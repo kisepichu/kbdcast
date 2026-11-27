@@ -15,6 +15,7 @@ kbdcast は、端末アプリのデモ GIF を、操作を書いた tape から�
 | `pty/` | effect Pty の宣言だけ | 置かない |
 | `pty-bun/` | handler BunPty | ここだけ |
 | `cli/` | main | 置かない |
+| `examples/` | tape の例（E2E の smoke に使う） | — |
 | `wish/` | 理想のコード（src の外）。`wish/README.md` | — |
 | `friction/` | 回り道の記録。`friction/README.md` | — |
 | `tools/` | 検査と生成の道具（Bun 上の TypeScript）。golden を作る Rust の harness（key codec の `tools/termwiz-golden/`、VT の `tools/avt-golden/`） | — |

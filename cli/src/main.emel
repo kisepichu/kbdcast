@@ -1,0 +1,131 @@
+# The entry of kbdcast (spec §9). `kbdcast rec <tape>` reads the tape, parses it, and records it
+# under BunPty, SystemClock and SystemStdout, writing the cast to stdout. An error goes to stderr
+# with exit code 1, and wrong arguments write the usage with exit code 2.
+
+import Kbdcast.Key.Encode
+import Kbdcast.Key.Encode.{Unencodable, NeedsOtherKeys, NeedsKitty, One, Two}
+import Kbdcast.Key.Notation
+import Kbdcast.Recorder.{RecordError, Reason, CannotSend, Exited, TimedOut}
+import Kbdcast.Recorder.Live
+import Kbdcast.Tape.{Command, TapeError}
+import PtyBun.{BunPty, SpawnFailed}
+import Std.Clock.{SystemClock}
+import Std.Duration.{Duration}
+import Std.FileSystem.{
+  FileSystem,
+  SystemFileSystem,
+  FileNotFound,
+  FileAccessDenied,
+  IsADirectory,
+  InvalidText,
+  FileSystemFailure,
+}
+import Std.Path
+import Std.Process.{
+  Args,
+  Stderr,
+  ExitCode,
+  SystemArgs,
+  SystemStderr,
+  SystemStdout,
+  exit_code,
+  EXIT_SUCCESS,
+  EXIT_FAILURE,
+}
+
+fn main() -> ExitCode {
+  with SystemArgs, SystemStderr, SystemFileSystem {
+    (use Args).list() match {
+      ["rec", path] -> rec(path)
+      _ -> {
+        (use Stderr).print_line("usage: kbdcast rec <tape>")
+        exit_code(2)
+      }
+    }
+  }
+}
+
+# Records the tape at `path`, writing the cast to stdout. The process runs in the directory that
+# holds the tape (spec §2).
+fn rec(path: String) -> ExitCode {
+  {
+    tape = Tape.parse((use FileSystem).read_text(path))
+    command = tape.command
+    {
+      with BunPty(
+        command.argv,
+        tape.cols,
+        tape.rows,
+        directory(path),
+        ["TERM=xterm-256color"],
+      ), SystemClock, SystemStdout {
+        Live.record(tape)
+      }
+      EXIT_SUCCESS
+    } escape {
+      SpawnFailed(message:) -> failure(
+        "#{path}:#{command.line}: cannot start #{program(command)}: #{message}",
+      )
+      RecordError(line:, reason:) -> failure("#{path}:#{line}: #{describe(reason)}")
+    }
+  } escape {
+    FileNotFound(..)                    -> failure("#{path}: no such file")
+    FileAccessDenied(..)                -> failure("#{path}: permission denied")
+    IsADirectory(..)                    -> failure("#{path}: is a directory")
+    InvalidText(..)                     -> failure("#{path}: not valid UTF-8")
+    FileSystemFailure(message:, ..)     -> failure("#{path}: #{message}")
+    TapeError(line:, column:, message:) -> failure("#{path}:#{line}:#{column}: #{message}")
+  }
+}
+
+# Writes `message` to stderr; the exit code of a failure.
+fn failure(message: String) -> ExitCode {
+  (use Stderr).print_line(message)
+  EXIT_FAILURE
+}
+
+# The directory that holds the file at `path`.
+# FRICTION(077): Path.parent has no parent for a bare file name, which is in the current directory.
+fn directory(path: String) -> String {
+  Path.parent(path) match {
+    Some(dir) -> dir
+    None      -> "."
+  }
+}
+
+# The program that the `run` line starts.
+# FRICTION(040): `parse` makes no `run` line without a word, but the List can be empty.
+fn program(command: Command) -> String {
+  command.argv match {
+    [name, ..] -> name
+    []         -> panic("a run line without a program: #{command.text}")
+  }
+}
+
+# What went wrong in a step, for the user.
+fn describe(reason: Reason) -> String {
+  reason match {
+    CannotSend(Unencodable(key:, reason:)) -> {
+      "cannot send #{Notation.print(key)}: #{unsendable(reason)}"
+    }
+    Exited(code) -> "the program exited with code #{code} before the end of the tape"
+    TimedOut(pattern, timeout, screen) -> {
+      "/#{pattern} did not appear within #{dur(timeout)}\nscreen:\n#{screen}"
+    }
+  }
+}
+
+# Why a key cannot be sent, for the user.
+fn unsendable(reason: Encode.Reason) -> String {
+  reason match {
+    NeedsOtherKeys(One) -> "it needs modifyOtherKeys level 1, which the program has not enabled"
+    NeedsOtherKeys(Two) -> "it needs modifyOtherKeys level 2, which the program has not enabled"
+    NeedsKitty          -> "it needs the kitty keyboard protocol, which kbdcast does not support"
+  }
+}
+
+# `d` as a tape writes it: `<n>s` for whole seconds, `<n>ms` otherwise.
+fn dur(d: Duration) -> String {
+  seconds = d.to_seconds()
+  if Duration.seconds(seconds) == d { "#{seconds}s" } else { d.to_string() }
+}
