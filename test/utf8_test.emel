@@ -1,0 +1,158 @@
+import Brix.Pbt.Gen.{Gen}
+import Brix.Pbt.Property.{Config}
+import Std.Array.{Array}
+import Std.Bytes.{Bytes}
+import Utf8
+
+# The test-only oracle `utf8_oracle.mjs`: JavaScript's TextDecoder, which follows the UTF-8 decoder
+# of the WHATWG Encoding Standard and keeps a BOM. What it decodes from each of `chunks` with
+# `stream: true`, and then what its final flush gives.
+@external(js, "./utf8_oracle.mjs", "decode")
+fn oracle(chunks: Array[Bytes]) -> Array[String] uses {}
+
+# What `Utf8.feed` gives for each of `chunks` in turn, and then what `Utf8.finish` gives.
+fn decode(chunks: List[Bytes]) -> List[String] {
+  (d, strings) = chunks.fold((Utf8.decoder(), []), |(d, strings), chunk| {
+    (next, s) = Utf8.feed(d, chunk)
+    (next, [s, ..strings])
+  })
+  [Utf8.finish(d), ..strings].reverse()
+}
+
+# `decode` of the chunks written in hexadecimal.
+fn decoded(chunks: List[String]) -> List[String] {
+  decode(chunks.map(|chunk| Bytes.hex(chunk)))
+}
+
+@test
+fn feed_reads_whole_characters() {
+  assert decoded(["61"]) == ["a", ""]
+  assert decoded(["e38182"]) == ["あ", ""]
+  # A BOM is kept.
+  assert decoded(["efbbbf61"]) == ["\u{FEFF}a", ""]
+}
+
+@test
+fn feed_carries_a_character_cut_between_chunks_into_the_next() {
+  assert decoded(["e3", "8182"]) == ["", "あ", ""]
+  assert decoded(["f09f98", "80"]) == ["", "😀", ""]
+  assert decoded(["f0", "9f", "98", "80"]) == ["", "", "", "😀", ""]
+  assert decoded(["", "61"]) == ["", "a", ""]
+}
+
+@test
+fn finish_gives_a_replacement_character_for_a_character_left_unfinished() {
+  assert decoded(["e381"]) == ["", "\u{FFFD}"]
+  assert decoded(["e3", "82"]) == ["", "", "\u{FFFD}"]
+  assert decoded([]) == [""]
+}
+
+@test
+fn feed_replaces_each_maximal_subpart_of_an_ill_formed_sequence() {
+  assert decoded(["ff"]) == ["\u{FFFD}", ""]
+  assert decoded(["80"]) == ["\u{FFFD}", ""]
+  # Overlong.
+  assert decoded(["c0af"]) == ["\u{FFFD}\u{FFFD}", ""]
+  assert decoded(["e080"]) == ["\u{FFFD}\u{FFFD}", ""]
+  # A surrogate.
+  assert decoded(["eda080"]) == ["\u{FFFD}\u{FFFD}\u{FFFD}", ""]
+  # Above U+10FFFF.
+  assert decoded(["f4908080"]) == ["\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}", ""]
+  # The byte that does not continue the character is read again as the start of the next one.
+  assert decoded(["e382", "61"]) == ["", "\u{FFFD}a", ""]
+}
+
+@test
+fn feed_and_finish_agree_with_text_decoder() {
+  Property.check_with(inputs(), Config(cases: 3000, ..Property.config()), |chunks| {
+    assert decode(chunks) == oracle(Array.from_list(chunks)).to_list()
+  })
+}
+
+@test
+fn where_the_bytes_are_cut_does_not_change_the_string() {
+  Property.check_with(inputs(), Config(cases: 3000, ..Property.config()), |chunks| {
+    assert decode(chunks).join("") == decode([Bytes.concat(chunks)]).join("")
+  })
+}
+
+# Bytes made of the parts of `part()`, cut into chunks of random sizes (0 to 5, and the rest).
+fn inputs() -> Gen[List[Bytes]] {
+  Gen.pair(Gen.list(part()), Gen.list(Gen.int_between(0, 5)))
+    |> Gen.map(|(parts, sizes)| {
+      bytes = Bytes.from_list(parts.flatten()) |> expect("every part is made of bytes")
+      cut(bytes, sizes)
+    })
+}
+
+# `bytes` cut into chunks of the sizes in `sizes`, then the rest as the last chunk.
+fn cut(bytes: Bytes, sizes: List[Int]) -> List[Bytes] {
+  (at, chunks) = sizes.fold((0, []), |(at, chunks), size| {
+    (at + size, [bytes.slice(at, at + size), ..chunks])
+  })
+  [bytes.slice(at, bytes.size()), ..chunks].reverse()
+}
+
+# The bytes of a piece of UTF-8 or of something that is not: a character of 1, 2, 3 or 4 bytes, a
+# character of 2 to 4 bytes cut before its last byte, an overlong encoding (after C0, C1, E0 or
+# F0), a surrogate (after ED), a value above U+10FFFF (after F4), a continuation byte on its own,
+# or one of F5 to FF. Through the bias of `Gen.int_between`, an ASCII character comes about 5/16
+# of the time, one of F5 to FF about 3/16, and each of the others about 1/16. Shrinks toward an
+# ASCII character.
+# FRICTION(028): brix has no choice between generators, so every value is drawn each time, and
+# `kind` picks what the bytes are made from (the ranges of the parts come from the draws by `%`).
+fn part() -> Gen[List[Int]] {
+  Gen.pair(
+    Gen.pair(Gen.int_between(0, 9), Gen.int_between(0, 0x10FFFF)),
+    Gen.pair(
+      Gen.int_between(0, 0x3F),
+      Gen.pair(Gen.int_between(0, 0x3F), Gen.int_between(0, 0x3F)),
+    ),
+  )
+    |> Gen.map(|((kind, n), (a, (b, c)))| {
+      kind match {
+        0 -> [n % 0x80]
+        1 -> encoded(0x80 + n % (0x800 - 0x80))
+        2 -> encoded(three_byte(n))
+        3 -> encoded(0x10000 + n % 0x100000)
+        4 -> {
+          whole = a % 3 match {
+            0 -> encoded(0x80 + n % (0x800 - 0x80))
+            1 -> encoded(three_byte(n))
+            _ -> encoded(0x10000 + n % 0x100000)
+          }
+          whole.take(1 + b % (whole.length() - 1))
+        }
+        5 -> a % 3 match {
+          0 -> [0xC0 + b % 2, 0x80 + c]
+          1 -> [0xE0, 0x80 + b % 0x20, 0x80 + c]
+          _ -> [0xF0, 0x80 + b % 0x10, 0x80 + c, 0x80 + a]
+        }
+        6 -> [0xED, 0xA0 + b % 0x20, 0x80 + c]
+        7 -> [0xF4, 0x90 + b % 0x30, 0x80 + c, 0x80 + a]
+        8 -> [0x80 + c]
+        _ -> [0xF5 + c % 11]
+      }
+    })
+}
+
+# A scalar value of 3 bytes in UTF-8 (U+0800 to U+FFFF, without the surrogates) made from `n`.
+fn three_byte(n: Int) -> Int {
+  c = 0x800 + n % (0x10000 - 0x800 - 0x800)
+  if c < 0xD800 { c } else { c + 0x800 }
+}
+
+# The UTF-8 bytes of the scalar value `c`.
+# FRICTION(003): there is no String from a scalar value that cannot fail, so its None goes to
+# `expect`.
+fn encoded(c: Int) -> List[Int] {
+  Bytes.encode_utf8(String.from_code_point(c) |> expect("c is a scalar value")).to_list()
+}
+
+# FRICTION(040): Option has no `expect`, so a None that cannot happen is a match with a panic.
+fn expect[A](opt: Option[A], why: String) -> A {
+  opt match {
+    Some(a) -> a
+    None    -> panic("None, but #{why}")
+  }
+}

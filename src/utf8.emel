@@ -1,0 +1,120 @@
+# A UTF-8 decoder for bytes that come in chunks, as from a PTY: the UTF-8 decoder of the WHATWG
+# Encoding Standard (https://encoding.spec.whatwg.org/#utf-8-decoder). Each maximal subpart of an
+# ill-formed sequence becomes one U+FFFD, and a BOM is kept as U+FEFF. A character cut between two
+# chunks is carried to the next one in the Decoder.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
+
+import Std.Bytes.{Bytes}
+
+## What a character cut at the end of a chunk leaves: the variables of the WHATWG decoder (UTF-8
+## code point, bytes seen, bytes needed, lower boundary and upper boundary). `bytes_needed` is 0
+## when no character is carried.
+pub opaque type Decoder(
+  code_point: Int,
+  bytes_seen: Int,
+  bytes_needed: Int,
+  lower_boundary: Int,
+  upper_boundary: Int,
+)
+
+const REPLACEMENT: String = "\u{FFFD}"
+
+## A decoder that carries nothing.
+pub fn decoder() -> Decoder {
+  Decoder(code_point: 0, bytes_seen: 0, bytes_needed: 0, lower_boundary: 0x80, upper_boundary: 0xBF)
+}
+
+## The characters that `b` ends, after the character that `d` carries, and the decoder that carries
+## the character cut at the end of `b`, if there is one.
+pub fn feed(d: Decoder, b: Bytes) -> (Decoder, String) {
+  (next, strings) = read(b, 0, d, [])
+  (next, strings.reverse().join(""))
+}
+
+## U+FFFD if `d` carries a character, which the end of the bytes leaves unfinished, and the empty
+## string otherwise.
+pub fn finish(d: Decoder) -> String {
+  if d.bytes_needed == 0 { "" } else { REPLACEMENT }
+}
+
+# What the handler of the WHATWG decoder does with one byte.
+enum Step {
+  # The byte goes on with the character, which the Decoder carries.
+  Continue(Decoder)
+  # The byte ends the character of this code point.
+  Emit(Int)
+  # The byte is an error.
+  Error
+  # The byte does not go on with the character that was carried: that character is an error, and
+  # the byte is read again with nothing carried.
+  ErrorAgain
+}
+
+# The bytes of `b` from `at` read after `d`, with the strings made so far (the last one first).
+# FRICTION(055): Bytes has no fold, so this walks the bytes by position with `Bytes.get`.
+fn read(b: Bytes, at: Int, d: Decoder, strings: List[String]) -> (Decoder, List[String]) {
+  b.get(at) match {
+    None -> (d, strings)
+    Some(byte) -> step(d, byte) match {
+      Continue(next)   -> read(b, at + 1, next, strings)
+      Emit(code_point) -> read(b, at + 1, decoder(), [character(code_point), ..strings])
+      Error            -> read(b, at + 1, decoder(), [REPLACEMENT, ..strings])
+      ErrorAgain       -> read(b, at, decoder(), [REPLACEMENT, ..strings])
+    }
+  }
+}
+
+# What the handler does with `byte` after `d` (the steps of the WHATWG decoder).
+fn step(d: Decoder, byte: Int) -> Step {
+  if d.bytes_needed == 0 {
+    # FRICTION(038): Emela has no range patterns, so the ranges of lead bytes are guards.
+    byte match {
+      _ if byte <= 0x7F -> Emit(byte)
+      _ if byte >= 0xC2 && byte <= 0xDF -> Continue(
+        Decoder(code_point: byte.bit_and(0x1F), bytes_needed: 1, ..decoder()),
+      )
+      _ if byte >= 0xE0 && byte <= 0xEF -> Continue(
+        Decoder(
+          code_point: byte.bit_and(0x0F),
+          bytes_needed: 2,
+          lower_boundary: if byte == 0xE0 { 0xA0 } else { 0x80 },
+          upper_boundary: if byte == 0xED { 0x9F } else { 0xBF },
+          ..decoder(),
+        ),
+      )
+      _ if byte >= 0xF0 && byte <= 0xF4 -> Continue(
+        Decoder(
+          code_point: byte.bit_and(0x07),
+          bytes_needed: 3,
+          lower_boundary: if byte == 0xF0 { 0x90 } else { 0x80 },
+          upper_boundary: if byte == 0xF4 { 0x8F } else { 0xBF },
+          ..decoder(),
+        ),
+      )
+      _                 -> Error
+    }
+  } else if byte < d.lower_boundary || byte > d.upper_boundary {
+    ErrorAgain
+  } else {
+    code_point = d.code_point.shift_left(6).bit_or(byte.bit_and(0x3F))
+    bytes_seen = d.bytes_seen + 1
+    if bytes_seen == d.bytes_needed {
+      Emit(code_point)
+    } else {
+      Continue(Decoder(code_point:, bytes_seen:, lower_boundary: 0x80, upper_boundary: 0xBF, ..d))
+    }
+  }
+}
+
+# FRICTION(003): Emela has no character type, and no String from a scalar value that cannot fail,
+# so the code point goes through `String.from_code_point`.
+# FRICTION(040): Its None cannot happen (the boundaries keep out surrogates, values above
+# U+10FFFF and overlong encodings), so it is a panic.
+fn character(code_point: Int) -> String {
+  String.from_code_point(code_point) match {
+    Some(s) -> s
+    None    -> panic("the UTF-8 decoder made #{code_point}, which is not a scalar value")
+  }
+}
