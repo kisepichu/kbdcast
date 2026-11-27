@@ -24,7 +24,7 @@ cast の reader は overlay（4）で作る。
 | cast の時刻 | tape の時間で刻む。`sleep` と、キーの後の `typing` の間は、窓の始まりからの実際の経過で刻む（窓の長さに丸める）。`wait` の間は時間を進めない | 実際の時刻で刻む（`wait` やアプリの起動にかかった時間が GIF に入り、同じ tape でも GIF の時間が毎回変わる） |
 | 端末への返事 | VT の返事は PTY に書き戻すが、`i` イベントには書かない | `i` に書く（overlay がキーでないものを読むことになる） |
 | cast の header | `{"version": 3, "term": {"cols": C, "rows": R, "type": "xterm-256color"}, "command": "<run の行の引数の文字列>"}` | timestamp や env を入れる（同じ tape から同じ header にならない。v3 は env を勝手に入れないことを勧める） |
-| interval | ミリ秒の精度（小数 3 桁）で書き、丸めの誤差を次に持ち越す（v3 の推奨） | 6 桁で書く（揺れが大きく見えて読みにくい） |
+| interval | ミリ秒の精度（小数 3 桁）。tape の時間はミリ秒の整数で進むので、前の時刻との差をそのまま書けば丸めの誤差は出ず、v3 が勧める誤差の持ち越しは要らない | 6 桁で書く（揺れが大きく見えて読みにくい） |
 | `o` イベント | PTY の `read` の 1 回を 1 つのイベントにする。bytes は `Utf8` のデコーダで文字列にする。空の文字列は書かない | 時間で束ねる（決める根拠が無い） |
 | cast の出力 | 書けた所から stdout に書く（`Std.Process.Stdout`）。全体設計 §9 の `CastSink` は作らない | `CastSink` の effect（`TestStdout` があるので test に要らない） |
 | PTY の読み方 | pull 型。Bun が `data` callback に渡す出力を JS の側で貯め、`read` が貯まった分を全部返す。読み込みを打ち切られても貯めた分は残る | push 型の callback を Emela に渡す（fiber 1 本の設計に合わない） |
@@ -74,14 +74,15 @@ pub fn parse(source: String) -> Tape fails TapeError
 ## 5. cast の writer
 
 ```emela
-pub opaque type Writer                                   # 前のイベントの時刻と、持ち越した丸めの誤差
+pub opaque type Writer                                   # 前のイベントの時刻
 pub fn header(cols: Int, rows: Int, command: String) -> String
 pub fn writer() -> Writer
 pub fn event(w: Writer, at_ms: Int, code: String, data: String) -> (Writer, String)  # 1 行。at は録画の始まりからの tape の時間
 ```
 
-- 時刻は内部では録画の始まりからのミリ秒で持ち、interval への変換はここだけで行う（全体設計 §8）。tape の時間がミリ秒で進むので、ミリ秒の精度では丸めの誤差が出ない。それでも、マイクロ秒の時刻が来ても累積しないよう、誤差を持ち越す形で書く（`at` をマイクロ秒にする余地を残す）。
-- JSON は `Std.Json` で書く。制御文字は `\uXXXX` にする（v3 の要求）。
+- 時刻は内部では録画の始まりからのミリ秒の整数で持ち、interval への変換はここだけで行う（全体設計 §8）。interval は前のイベントとの差を秒で小数 3 桁に書く（`1234` ミリ秒の差は `1.234`）。
+- 文字列は `Std.Json` で JSON の文字列にする。v3 は印字できない文字を `\uXXXX` にすることを求めるので、`Std.Json` が escape しない印字できない文字（0x7F と C1 の 0x80〜0x9F）があれば、それも `\uXXXX` にする。
+- 行の形は、header が `{"version": 3, "term": {"cols": C, "rows": R, "type": "xterm-256color"}, "command": <文字列>}`、イベントが `[<interval>, "<code>", <文字列>]`（区切りは `, ` と `: `。v3 の文書の例と同じ）。
 - 書くイベントは `o`、`i`、`x`（`x` の data は終了コードの 10 進）。
 
 ## 6. Driver と run_tape
