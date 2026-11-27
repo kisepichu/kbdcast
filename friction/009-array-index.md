@@ -14,12 +14,14 @@
   regex の vm（`wish/vm.emel`、計画の Task 6）でも、`:109` の `prog.insts[t.pc]`（スレッドの命令を読む）、`:111`、`:137`、`:138`、`:145` の `input[pos]`、`input[pos - 1]`、`input[i]`（入力の code point を読む）、`:164` の `prog.enclosing[g]` に添字を書いた
   regex の時間のテスト（`regex/test/linear_test.emel` の `replace_builds_its_result_in_time_proportional_to_the_matches` と、それが使う `took`、friction-review の後の修正）でも、10 回の時間を並べ替えた List の中央値を `(sorted[4] + sorted[5]) / 2` と読みたかった。テストの中の 1 行で新しい単位ではないので、wish は書いていない
   key codec の encode の wish（`wish/encode.emel:174`、`:177`、サブプロジェクト 2 の計画の Task 6）でも、F キーの列の終わりの文字と番号を、List の literal の位置で読んだ: `["P", "Q", "R", "S"][n - 1]`（F1〜F4 の SS3 の文字）と `[15, 17, 18, 19, 20, 21, 23, 24][n - 5]`（F5〜F12 の `CSI n~` の n）。`n` は `FKey` の番号で 1〜12 なので、範囲外にならない
+  幅の wish（`wish/width.emel:12`、サブプロジェクト 3 の計画の Task 2）でも、`partition_point` で数えた範囲の数 `n` の 1 つ前の範囲の終わりを、生成した List の表の位置で `WIDE_LAST[n - 1]` と読んだ。`n > 0` のときだけ読むので、範囲外にならない
 - 診断:
   wish check（emela 0.28.2）の 14 行目の診断は `=>` のもの（``error[E0110]: expected `->` `` ほか 2 つ）だけで、`TARGETS[i]` には何も出なかった。`[grammar.expr]` の `postfix` に添字の形は無く、位置で読むのは `Array.get(a, index) -> Option[A]` だけ
   class の wish check（v0.28.2）では、`:75` の `sort_by(fn(i) { TARGETS[i] })` に E0148 と ``error[E0301]: type mismatch: expected `fn(Int, Int) -> Ordering`, found `fn(?5) -> List[Int]` `` が出た（本体の値が `[i]` の List と読まれている）。添字が無いとは言わない。`:70` と `:105` には届かなかった（`let` の 004 と、`=` で書いた関数の本体の 020）
   vm の wish check（v0.28.2）では、どの添字にも診断が届かなかった（`let` の 004、`=>` の E0110、`or` の 016 の後ろにあった）
   テストの中央値は wish を書かずに std の `List.get` で書いたので、診断は無い
   encode の wish check（v0.28.2）: `:177` の `[15, ...][n - 5]` に ``error[E0110]: expected `)` `` と E0122、続けて List を引数と読んだ ``error[E0301]: type mismatch: expected `Int`, found `List[Int]` `` と ``error[E0305]: wrong number of arguments: `tilde` takes 2, found 1``。添字が無いとは言わない。`:174` は範囲パターン（038）で崩れた腕の中にあり、届かなかった
+  幅の wish check（v0.28.2、サブプロジェクト 3 の Task 2）: `:12` の `[` に ``error[E0122]: expected newline or `}` after statement`` の 1 つ。添字が無いとは言わない
 - 回避策:
   `TARGET_ARRAY.get(i) match { Some(folded) -> folded; None -> panic(...) }`（`regex/src/fold.emel`、`FRICTION(009)` の印）。`None` は表が壊れたときだけ起きるので、`Option.or(c)` で探索の失敗と混ぜずに defect にした
   class（`regex/src/class.emel`）:
@@ -32,6 +34,7 @@
   テスト（`regex/test/linear_test.emel`）:
   - 中央値: `(Assert.some(sorted.get(4)) + Assert.some(sorted.get(5))) / 2`（`FRICTION(009)` の印）。`sorted` は 10 回の時間を `List.sort` したもので、4 と 5 は範囲内なので `None` は起きない。brix の `Assert.some` が `None` で panic する match を持つので、起きない分岐は自分では書いていない。読むのは Array ではなく List なので `Array.at` の提案の直接の例にはならないが、範囲内と分かっている位置を読むのに Option が返る形は同じ
   encode（`src/key/encode.emel` の `function`、`FRICTION(009)` の印）: List を位置で読まず、F キーの番号ごとの match の腕にした（F1〜F4 の 4 つの腕が `f1_to_f4("P", m)` などを呼び、F5 と F11 は番号の腕、F6〜F10 は guard の腕（038）、F12 は `_` の腕）。`List.get` と起きない `None` の panic（040）を書くより、腕の方が短い。decode の `tilde` と `letter`（015、038）が逆向きの対応を同じ形で書いている
+  幅（`src/vt/width.emel` の `is_wide`、サブプロジェクト 3 の Task 2）: class の `contains` と同じ形にした。範囲の終わりの Array を `lower_bound(c)` で引き、その位置の始まりを `get` で読む。ここの `None` は「`c` 以降で終わる範囲が無い」という本当の結果なので、起きない分岐は残らない。印は付けない。始まりでなく終わりの表を引く形に変えたのは、std の二分探索が述語を受けないからで、それは 031 に書いた
 - コスト:
   起きない分岐 1 つ（3 行）。普段のコードに基盤レベルは漏れていない。std も同じ形を書いている: `Std.Array` の `bisect` と `binary_search`（`crates/emela-core/lib/std/array.emel:154-174`）は、範囲内と分かっている `get(a, mid)` の `None` を `_` の腕に混ぜる。`proposals/array.md:76` の例は `Array.get(counts, b) |> Option.or(0)` で既定値にする
   class でも vm でも、起きない分岐 1 つ（印のコメントを含めて 3 行）

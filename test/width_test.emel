@@ -1,0 +1,42 @@
+import Vt.Width
+import Vt.WidthTable.{WIDE_FIRST, WIDE_LAST}
+import VtGolden.{CASES}
+
+@test
+fn the_table_has_123_ranges_and_starts_with_hangul_choseong() {
+  assert WIDE_FIRST.length() == 123
+  assert WIDE_LAST.length() == 123
+  assert WIDE_FIRST.head() == Some(0x1100)
+  assert WIDE_LAST.head() == Some(0x115F)
+}
+
+@test
+fn is_wide_holds_at_both_ends_of_every_range_and_not_next_to_them() {
+  # The ranges are maximal, so the code point next to each end is one column wide.
+  assert List.zip(WIDE_FIRST, WIDE_LAST).filter(|(first, last)| {
+    (
+      !Width.is_wide(first)
+        || !Width.is_wide(last)
+        || Width.is_wide(first - 1)
+        || Width.is_wide(last + 1)
+    )
+  })
+    == []
+}
+
+@test
+fn is_wide_tells_common_characters_apart() {
+  assert !Width.is_wide(0x61) # a
+  assert !Width.is_wide(0x7E) # ~
+  assert !Width.is_wide(0xE9) # é
+  assert !Width.is_wide(0x301) # COMBINING ACUTE ACCENT
+  assert Width.is_wide(0x3042) # あ
+  assert Width.is_wide(0xAC00) # 가
+  assert Width.is_wide(0x1F600) # 😀
+}
+
+@test
+fn golden_has_2012_cases_whose_snapshots_have_the_cursor_the_keys_mode_and_each_row() {
+  assert CASES.length() == 2012
+  assert CASES.filter(|(_, _, rows, _, snapshot)| snapshot.split("\n").length() != rows + 2) == []
+}

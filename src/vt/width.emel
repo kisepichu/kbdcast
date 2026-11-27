@@ -1,0 +1,26 @@
+# How many columns avt 0.18.0 draws a character in, from the table that tools/gen-vt-golden.ts
+# generates from unicode-width 0.1.14 (src/vt/width_table.emel).
+# The behavior follows avt 0.18.0 (Apache-2.0, https://github.com/asciinema/avt)
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
+
+import Std.Array.{Array}
+import Vt.WidthTable.{WIDE_FIRST, WIDE_LAST}
+
+# The generated table as Arrays, built once, so that a lookup is a binary search over reads in
+# constant time.
+const FIRST_ARRAY: Array[Int] = Array.from_list(WIDE_FIRST)
+const LAST_ARRAY: Array[Int] = Array.from_list(WIDE_LAST)
+
+## Whether avt draws the code point `c` two columns wide (avt's `char_display_width`): it is in one
+## of the ranges of the table. O(log of the number of ranges).
+pub fn is_wide(c: Int) -> Bool {
+  # The first range that does not end before `c`. `c` is in it if it starts at or before `c`.
+  # FRICTION(031): std's `lower_bound` takes a value, not a predicate, so the search is over the
+  # last code points, not the first ones.
+  FIRST_ARRAY.get(LAST_ARRAY.lower_bound(c)) match {
+    Some(first) -> first <= c
+    None        -> False
+  }
+}

@@ -18,6 +18,7 @@
   - key codec の表記（サブプロジェクト 2 の計画の Task 3）: wish（`wish/notation.emel:3`）も、モジュールの説明をファイルの先頭の `##` に書いた（wish check は何も言わない）。`src/key/notation.emel` の先頭は `#` のコメントにした（`FRICTION(008)` の印）
   - key codec の decode（サブプロジェクト 2 の計画の Task 4）: wish（`wish/decode.emel:3-4`）も、モジュールの説明をファイルの先頭の `##` の 2 行に書いた（wish check は何も言わない）。`src/key/decode.emel` の先頭は `#` のコメントにした（`FRICTION(008)` の印）。読む順の規則は、公開の関数の `decode` の doc に書いた
   - key codec の encode（サブプロジェクト 2 の計画の Task 6）: wish（`wish/encode.emel`）にはモジュールの説明を書かず、Elm などの `module Key.Encode` の宣言を書いた（048）。`src/key/encode.emel` の先頭の説明（何を真似るか: WezTerm の既定、termwiz 0.22.0 の xterm の符号化）は `#` のコメントにした（`FRICTION(008)` の印）。真似る相手の版と、表せないキーで失敗することは、公開の関数の `encode` の doc に書いた
+  - 幅（サブプロジェクト 3 の計画の Task 2）: wish（`wish/width.emel:2-3`）も、モジュールの説明（何の幅か、avt 0.18.0 に従うことと、その license と URL）をファイルの先頭の `##` の 2 行に書いた（wish check は何も言わない）。`src/vt/width.emel` の先頭は `#` のコメントにした（`FRICTION(008)` の印）
 - コスト: 計画の「モジュールの doc comment」を、生成した文書に出ないコメントで代えた。`emela doc` の文書にも hover にもモジュールの説明が出ない。std も同じ書き方なので、std のモジュールの説明も生成した文書には出ない。普段のコードに基盤レベルは漏れていない
 - spec:
   `[lex.comment]`（`spec/language/02-lexical.md:14`: 「`##` is a doc comment. It attaches to the declaration, local fn, variant, field, effect operation, or handler item that immediately follows it.」。モジュールは入っていない）、`[lsp.doc]`。`emela doc` の節は `spec/tooling/commands.md` に無い（`04-modules.md:181` と `lsp.md:240` で触れているだけ）
