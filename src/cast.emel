@@ -25,7 +25,8 @@ pub fn writer() -> Writer {
 
 ## The line of the event `code` with `data` at `at_ms` milliseconds of tape time from the start of
 ## the recording, without a newline, and the Writer for the event after it. The interval is the time
-## since the previous event, in seconds with three decimals.
+## since the previous event, in seconds with three decimals. `at_ms` must not be before the time of
+## the previous event: a negative interval makes a line that is not JSON.
 pub fn event(w: Writer, at_ms: Int, code: String, data: String) -> (Writer, String) {
   (Writer(last_ms: at_ms), "[#{interval(at_ms - w.last_ms)}, #{quote(code)}, #{quote(data)}]")
 }
