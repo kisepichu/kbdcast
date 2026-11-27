@@ -61,6 +61,10 @@ const DEFAULTS: Settings = Settings(
   timeout: Duration.seconds(10),
 )
 
+# The longest duration that a tape may give, in milliseconds: the largest Int, as the recorder
+# waits for a duration with an Int of milliseconds.
+const LONGEST_MS: Int = 2147483647
+
 # Where the lines read so far leave the tape.
 enum Phase {
   # No `run` line yet.
@@ -206,8 +210,8 @@ fn dimension(digits: String, value: Span, text: String) -> Int fails TapeError {
   if n < 1 || n > 1000 { fail out_of_range } else { n }
 }
 
-# The duration `<integer>ms` or `<integer>s` that `value`, the rest of a line, gives. `what` is the
-# start of the line (`sleep`, `set typing`, `set timeout`).
+# The duration `<integer>ms` or `<integer>s` that `value`, the rest of a line, gives, which is at
+# most LONGEST_MS. `what` is the start of the line (`sleep`, `set typing`, `set timeout`).
 fn duration(value: Span, what: String) -> Duration fails TapeError {
   cps = trim_end(value.cps)
   text = string_of(cps)
@@ -225,21 +229,22 @@ fn duration(value: Span, what: String) -> Duration fails TapeError {
     string_of(cps.drop(n)) match {
       ""   -> fail at(value, "duration needs a unit: #{number}ms or #{number}s")
       "m"  -> fail at(value, "use ms for milliseconds: #{number}ms")
-      "ms" -> Duration.milliseconds(count(number, value, text))
-      "s"  -> Duration.seconds(count(number, value, text))
+      "ms" -> Duration.milliseconds(count(number, LONGEST_MS, value, text))
+      "s"  -> Duration.seconds(count(number, LONGEST_MS / 1000, value, text))
       _    -> fail at(value, "invalid duration: #{text}")
     }
   }
 }
 
-# The number `digits` of the duration `text` that `value` holds.
-fn count(digits: String, value: Span, text: String) -> Int64 fails TapeError {
-  # More digits than an Int holds.
+# The number `digits` of the duration `text` that `value` holds, which must be at most `max`.
+fn count(digits: String, max: Int, value: Span, text: String) -> Int64 fails TapeError {
+  too_long = at(value, "duration too long: #{text}")
+  # More digits than an Int holds is too long too.
   n = Int.parse(digits) escape {
-    ParseError(_) -> fail at(value, "invalid duration: #{text}")
+    ParseError(_) -> fail too_long
   }
   # FRICTION(061): Int64 has no `parse`, so the number is read as an Int and widened.
-  Int64.from_int(n)
+  if n > max { fail too_long } else { Int64.from_int(n) }
 }
 
 # The keys of a `>` line, whose text after the `>` is `arg`.

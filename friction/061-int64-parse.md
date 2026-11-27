@@ -14,9 +14,9 @@
   wish check（v0.28.2）は `Duration.ms` と `Duration.s` の ``error[E0212]: module `Std.Duration` has no `ms` ``（と `s`）で止まり、型の違いには届かなかった
   実装を一時的に `Int64.parse(digits) escape { ParseError(_) -> ... }` に書き換えた `emela check`（v0.28.2、2026-11-27）: ``error[E0212]: module `Int64` has no `parse` `` と、その escape の腕に ``warning[W0302]: error `ParseError` is never raised here``。help は付かない
 - 回避策:
-  `Int.parse` で Int として読み、`Int64.from_int` で広げてから `Duration.milliseconds` と `Duration.seconds` に渡した（`src/tape.emel` の `count`、`FRICTION(061)` の印）。数字だけの列であることは先に確かめるので、`Int.parse` が失敗するのは Int の範囲を超えたときだけで、それは `invalid duration: <text>` の TapeError にした
+  `Int.parse` で Int として読み、`Int64.from_int` で広げてから `Duration.milliseconds` と `Duration.seconds` に渡した（`src/tape.emel` の `count`、`FRICTION(061)` の印）。数字だけの列であることは先に確かめるので、`Int.parse` が失敗するのは Int の範囲を超えたときだけ。Task 1 ではそれを `invalid duration: <text>` の TapeError にした。最終レビューの後の修正で、tape の duration は 2147483647 ms（Int の最大）までになり（recorder が Int のミリ秒で待つため。074）、Int の範囲を超える列も `duration too long: <text>` になった
 - コスト:
-  変換の呼び出し 1 つ。読める長さが Int の上限（2147483647）で切られる: `sleep 2147483648ms`（約 24.8 日）は Duration には入るのに `invalid duration` になる。デモの tape では困らない。普段のコードに基盤レベルは漏れていない
+  変換の呼び出し 1 つ。Task 1 では、読める長さが Int の上限（2147483647）で切られた: `sleep 2147483648ms`（約 24.8 日）は Duration には入るのに `invalid duration` になった。今は tape の duration の上限がその値と同じなので、Int で読むことで読めなくなる長さは無い（`<n>s` の上限の n = 2147483 も Int の範囲の内）。デモの tape では困らない。普段のコードに基盤レベルは漏れていない
 - spec:
   `[api.int]`（`parse` は Int だけ）、`[api.int64]`（`from_int` と `to_string` はあるが `parse` は無い）、`[api.std.duration]`（v0.28.2 の構成子は Int64 を受け、文字列から読む関数は無い）
 - 既存:
