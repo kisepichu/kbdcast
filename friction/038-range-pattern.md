@@ -11,7 +11,7 @@
   key codec の decode（`wish/decode.emel:156`、サブプロジェクト 2 の計画の Task 4）でも、`CSI n~` の F6〜F10 の番号 17〜21 を `17..=21 -> Some(Function(f_key(n - 11)?))` と 1 つの腕にした
   key codec の encode（`wish/encode.emel:100-101`、`:173`、サブプロジェクト 2 の計画の Task 6）でも、termwiz の `ctrl_mapping` の英字を `'a'..='z' -> Some(c - 'a' + 1)` と `'A'..='Z' -> ...` に、F1〜F4 を `1..=4 -> { ... }` の 1 つの腕にした
   ストリーム用の UTF-8 デコーダ（`wish/utf8.emel:32-47`、サブプロジェクト 3 の計画の Task 1）でも、WHATWG の UTF-8 decoder の lead byte の 4 つの範囲を `0x00..=0x7F =>`、`0xC2..=0xDF =>`、`0xE0..=0xEF =>`、`0xF0..=0xF4 =>` の腕にした（WHATWG の手順の書き方そのまま）
-  VT の parser（`wish/parser.emel:70-105`、サブプロジェクト 3 の計画の Task 3）でも、avt 0.18.0 の `Parser::feed` の文字の範囲（`'\u{20}'..='\u{7f}'` など）を写し、35 の腕のうち 22 に `(Ground, 0x20..=0x7f) =>`、`(Escape, 0x30..=0x4f | 0x51..=0x57 | ...) =>` のような範囲パターンを書いた（or-pattern と組み合わせた腕は 015）
+  VT の parser（`wish/parser.emel:70-105`、サブプロジェクト 3 の計画の Task 3）でも、avt 0.18.0 の `Parser::feed` の文字の範囲（`'\u{20}'..='\u{7f}'` など）を写し、35 の腕のうち 23 に `(Ground, 0x20..=0x7f) =>`、`(Escape, 0x30..=0x4f | 0x51..=0x57 | ...) =>` のような範囲パターンを書いた（or-pattern と組み合わせた腕は 015）
 - 診断:
   wish check（v0.28.2）では、`=` で書いた関数の本体（020）の中にあり、読まれなかった
   repo の外の使い捨ての Pome での最小の形（`c match { 0x1C..=0x1F -> 1  _ -> 0 }`、2026-11-27）で 3 つ: ``E0110: expected `->` `` と ``E0118: expected expression``（どちらも `..` を指す）、``E0122: expected newline or `}` after match arm``。spec の `[fn.match]` は「use a guard instead」と書くが、診断はそれを言わない

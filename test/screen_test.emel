@@ -57,6 +57,8 @@ fn chars(s: Screen) -> List[List[Int]] {
 
 # The same with the spaces at the end of each line removed (avt's `Buffer::text`, with no wrapped
 # line).
+# FRICTION(041): List has no `drop_while`, so each line is reversed and dropped up to the
+# `find_index` of its first character that is not a space.
 fn text(s: Screen) -> List[List[Int]] {
   chars(s).map(|line| {
     reversed = line.reverse()

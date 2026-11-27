@@ -34,7 +34,7 @@
 - コスト: 補助関数 3 つ（`code_point`，`string_of`，表記の `text_of`．`string_of` は 002 を避けるためでもある）と，起きない分岐 4 つ（25 行ほど）と `expect`（040）の呼び出し 1 つ．普段のコードに基盤レベルは漏れていない
   encode（Task 6）: 補助関数 1 つ（`text_of`、起きない分岐を含めて 6 行）。表記の `text_of` は private で別の module から呼べないので、同じ働きのものをもう 1 つ書いた
   UTF-8 デコーダ（Task 1）: 補助関数 1 つ（`character`、起きない分岐を含めて 6 行）。読めた文字ごとに 1 文字の String を作ってからつなぐ（1,000,000 byte を 4096 byte ずつ読んで 118–165 ms。055 の計測）。テストの生成器にも補助関数 1 つ（`encoded`、3 行）
-  VT の parser（Task 3）: 補助関数 1 つ（`character`、起きない分岐を含めて 6 行）。書く文字は code point の List に逆順で持ち、`Print` にする所で 1 文字ずつ String にしてつなぐ。テストにも同じ補助関数 1 つ（6 行。`test/cut.emel`）
+  VT の parser（Task 3）: 補助関数 1 つ（`character`、起きない分岐を含めて 6 行）。書く文字は code point の List に逆順で持ち、`Print` にする所で 1 文字ずつ String にしてつなぐ。テストにも同じ補助関数 1 つ（6 行。`test/cut.emel`）。唯一の使い手の `Vt.Terminal` は、`Print` の文字列と中間の文字を `code_points()` ですぐ code point に戻す（`src/vt/terminal.emel` の `apply`。中間の文字は `code_points().last()`）ので、この String は `Action` の型（計画の Task 3 の Interfaces）と、テストで比べやすくするためだけに作る
   VT の解釈（Task 5）: test の補助に補助関数 1 つ（`character`、起きない分岐を含めて 6 行）。スナップショットの各セルで 1 文字の String を作ってつなぐ
   VT の公開 API（Task 6）: 補助関数 1 つ（`character`、起きない分岐を含めて 6 行）。`text` を呼ぶたびに、見えている画面の各セルで 1 文字の String を作ってつなぐ（80 × 24 で 1920 個）。テストは parser のテストと `test/cut.emel` の `character` を共有し、補助関数は増えない
 - spec: `[api.string]`（`from_code_point`），`[target.string]`（「There is no character type」），`[lib.api-rules]`（「A precondition of the caller is broken: it is a defect」）

@@ -68,6 +68,8 @@ fn color(c: Option[Color]) -> String {
   }
 }
 
+# FRICTION(060): Int has no function that writes it in hexadecimal with a width, so the channels
+# go through Bytes to use `Bytes.to_hex`.
 # FRICTION(040): the channels of a color are 0 to 255, so `Bytes.from_list` cannot return `None`,
 # and Option has no `expect`.
 fn hex(channels: List[Int]) -> String {
