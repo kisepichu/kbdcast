@@ -378,9 +378,9 @@ flowchart LR
 | brix の pbt の組み合わせの関数 | brix v0.4.0 の `Brix.Pbt.Gen` に、選択（`one_of`、`frequency`、`element`）、値から次の生成器を作る `and_then`、長さに上下限のある list が無い。R の差分テストの生成器で、`Gen` と `Tree` を直に使って書いた | friction 028。brix への issue にする（下書きは friction 028） | R（regex の差分テスト） |
 | PTY | std にも ecosystem にも無い | pty と pty-bun の Pome として公開する | 1 |
 | native の C FFI で Bytes、Array、callback を渡せない | open question #38（`[ext.boundary]`）。issue は無い | PTY の使い道を添えて issue にする | pty-native |
-| `Array.set` が in place になるかを確かめられない | WASM と C では「最後の参照なら in place」と約束されている（`[api.std.array]`）。in place になるかをコンパイラが教える仕組みは無く、JS は常にコピーする | VT の画面バッファで測った数字を添えて、前提の範囲内の proposal の候補にする | 3 |
+| `Array.set` が in place になるかを確かめられない | WASM と C では「最後の参照なら in place」と約束されている（`[api.std.array]`）。in place になるかをコンパイラが教える仕組みは無く、JS は常にコピーする | VT の画面バッファで測った（3。1 MB あたり 0.62〜0.89 秒で、回避は要らなかった。数字は friction 024）。今のところ proposal の動機にはならない | 3 |
 | native に `String.chars` が無い | Known limitations に記載（grapheme の表が無い） | 使い道を添える | 3 を native で動かすとき |
-| ストリーム用の UTF-8 デコーダが無い | `Bytes.decode_utf8` は入力全体が正しくないと `None` を返す | 実装してから、std か Pome かを判断する | 3 |
+| ストリーム用の UTF-8 デコーダが無い | `Bytes.decode_utf8` は入力全体が正しくないと `None` を返す | 3 で root の Pome に `Utf8` として作った（WHATWG の手順、`TextDecoder` との差分テスト）。当面は root の Pome に置き、recorder（1）で使ってから、std の proposal にするか x の Pome にするかを決める | 3 |
 | 複数の Pome をまとめる workspace | spec が「後の版で考える」としている（Bushel）。`[replace]` だけでもネットワーク無しで動くことは確かめた | 兄弟の Pome を `[replace]` で扱った実例を添える | 0 以降 |
 | 公式の Linux バイナリが glibc 2.39 の weak シンボル（`pidfd_spawnp`、`pidfd_getpid`）を要求する | README は「Linux (x86_64)」とだけ書いている。release は `ubuntu-latest` で build している。issue は無い | friction 001。issue にする | 0 |
 | FileSystem でバイナリを扱えない | Known limitations に記載 | kbdcast では当たらない（GIF は agg が書き、kbdcast が書くのは cast だけ） | なし |

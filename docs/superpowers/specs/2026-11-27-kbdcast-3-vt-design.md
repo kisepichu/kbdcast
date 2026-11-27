@@ -2,7 +2,7 @@
 
 - 日付: 2026-11-27
 - 全体設計: `docs/superpowers/specs/2026-11-23-kbdcast-design.md`（§5 の 3）
-- 状態: spec
+- 状態: 実装済み（PR #17）
 
 ## 1. 目的と範囲
 
@@ -69,12 +69,12 @@ avt 0.18.0 の `parser.rs` と同じ状態機械（Paul Williams の DEC の状�
 
 - avt 0.18.0 の `terminal.rs`、`buffer.rs`、`line.rs` と同じ振る舞いにする。扱う制御は avt と同じで、次のとおり。
   - 文字を書く（全角と折り返しと insert mode を含む）。BS、HT、LF、VT、FF、CR、SO、SI
-  - `ESC 7` `ESC 8`（DECSC、DECRC）、`ESC D` `ESC E` `ESC M`、`ESC H`（HTS）、`ESC c`（RIS）、`ESC ( 0`、`ESC ( B`、`ESC ) 0`、`ESC ) B`、`ESC # 8`（DECALN）
-  - CSI の `@ A B C D E F G H I J K L M P S T W X Z ` a b d e f g h l m r s u`、`CSI ? … h/l`、`CSI ! p`（DECSTR）
+  - `ESC 7` `ESC 8`（DECSC、DECRC）、`ESC D` `ESC E` `ESC M`、`ESC H`（HTS）、`ESC c`（RIS）、`ESC ( X` と `ESC ) X`（`X` が `0` なら DEC の罫線、ほかのどの終わりの文字でも ASCII）、`ESC # 8`（DECALN）。`ESC @`〜`ESC _` は、その文字 + 0x40 の C1 の制御文字として扱う（`ESC D` は IND と同じ）
+  - CSI の `@ A B C D E F G H I J K L M P S T W X Z ` a b d e f g h l m r s u`、`CSI ? … h/l`、`CSI ! p`（DECSTR）。`CSI c` と `CSI n` は §7 の返事。`CSI … t`（xtwinops）は、agg と同じく無視する
   - SGR の 16 色、256 色、RGB（`;` と `:` の書き方）、太字、faint、斜体、下線、点滅、反転、取り消し線と、その解除
   - DEC の mode: 1（DECCKM）、6（DECOM）、7（DECAWM）、25（DECTCEM）、47、1047、1048、1049。ANSI の mode: 4（IRM）、20（LNM）
 - セルは、文字、占め方（幅 1、全角の左、全角の右）、pen。pen は、前景色と背景色（無し、256 色の番号、RGB）、強さ（普通、太字、faint）、斜体、下線、取り消し線、点滅、反転。
-- カーソルは列と行と見えるかどうか。avt と同じく、最後の列に書いた直後の列は `cols` になる（次の文字で折り返す）。
+- カーソルは列と行と見えるかどうか。avt と同じく、最後の列に書いた直後の列は `cols` になる（次の文字で折り返す）。`cursor` の列もそのまま `cols` になりうる（overlay の spec で扱う）。
 - 画面は primary と alternate の 2 つ。どちらも scrollback を持たない（agg の `scrollback_limit(0)` と同じ）。
 - avt は Apache-2.0。写すのは振る舞いで、golden の表で合わせる。avt のコードを読んで写すときは、module の頭のコメントに出どころを書く（kbdcast の license を決めるときに NOTICE を考える）。
 
@@ -86,7 +86,7 @@ avt 0.18.0 の `parser.rs` と同じ状態機械（Paul Williams の DEC の状�
 |---|---|
 | DA1（`CSI c`、`CSI 0 c`） | `CSI ? 62 ; 22 c`（VT220、ANSI の色） |
 | DSR（`CSI 5 n`） | `CSI 0 n` |
-| CPR（`CSI 6 n`） | `CSI <行> ; <列> R`。1 から数える。列は最後の列より右にならない（`cols` のときは `cols`）。DECOM のときは、行をスクロール領域の上端から数える |
+| CPR（`CSI 6 n`） | `CSI <行> ; <列> R`。1 から数える。列は最後の列より右にならない（`cols` のときは `cols`）。DECOM のときは、行をスクロール領域の上端から数える。DECRC で余白の上端より上に戻ったときも、行は 1 より小さくしない |
 
 ほかの問い合わせ（kitty の `CSI ? u`、DA2、XTVERSION、DECRQM、OSC の色の問い合わせ）には答えない。kitty に対応しない端末は `CSI ? u` に答えず、アプリは後に送る DA1 の返事でそれを知る。
 
@@ -94,7 +94,7 @@ avt 0.18.0 の `parser.rs` と同じ状態機械（Paul Williams の DEC の状�
 
 - `cursor_keys`: DECCKM（avt の cursor keys mode と同じ）。
 - `newline`: LNM（avt の new line mode と同じ）。
-- `other_keys`: `CSI > 4 ; n m` の n が 0 なら `Off`、1 なら `On(One)`、2 なら `On(Two)`。`CSI > 4 m` は `Off`。ほかの n は無視する。RIS で `Off` に戻す。DECSTR では変えない。
+- `other_keys`: `CSI > 4 ; n m` の n が 0 なら `Off`、1 なら `On(One)`、2 なら `On(Two)`。`CSI > 4 m` と、引数の無い `CSI > m` は `Off`（xterm の XTMODKEYS と同じ）。ほかの n は無視する。下位の引数（`CSI > 4 : 2 m`）は読まず、各引数の最初の部分だけを見る（この例は `CSI > 4 m` と同じく `Off`）。RIS で `Off` に戻す。DECSTR では変えない。
 
 ## 8. 公開 API
 
@@ -102,7 +102,6 @@ avt 0.18.0 の `parser.rs` と同じ状態機械（Paul Williams の DEC の状�
 pub opaque type Terminal
 pub fn new(cols: Int, rows: Int) -> Terminal               # 1 未満は defect（tape のパーサが先に断る）
 pub fn feed(t: Terminal, s: String) -> (Terminal, List[Reply])
-pub enum Reply { DeviceAttributes | Status | CursorPosition(Int, Int) }  # 行と列は 1 から
 pub fn reply_bytes(r: Reply) -> Bytes
 pub fn size(t: Terminal) -> (Int, Int)                     # 列と行
 pub fn lines(t: Terminal) -> List[List[Cell]]              # 見えている画面の各行のセル
@@ -111,7 +110,8 @@ pub fn text(t: Terminal) -> String                         # wait が見る文�
 pub fn input_modes(t: Terminal) -> InputModes
 ```
 
-- `text` は、各行の文字をつなぎ、行の末尾の空白を除き、行を `\n` でつなぐ。全角の右のセルは飛ばす。折り返した行はつながない。
+- `Reply`（`DeviceAttributes | Status | CursorPosition(Int, Int)`。行と列は 1 から）は `Vt.Terminal` に、`Cell` と `Pen` は `Vt.Screen` にある。Emela に再公開が無いので、使う側はそこから import する（friction 012）。
+- `text` は、見えている画面（alt screen のときは alternate）の各行の文字をつなぎ、行の末尾の空白（Unicode の White_Space）を除き、行を `\n` でつなぐ。全角の右のセルは飛ばす。折り返した行はつながない。avt の公開の `Vt::text` は alt screen のときも primary を読むが、`wait` は全画面の TUI が alt screen に出すものを見る必要があるので、見えている画面にする。
 
 ## 9. テスト
 
@@ -130,18 +130,23 @@ pub fn input_modes(t: Terminal) -> InputModes
 
 golden の表:
 
-- 手で書いた 12 個の例（折り返し、最後の列の全角、全角の右への上書き、DECAWM の解除、スクロール領域、alt screen、insert mode、DEC の罫線、SGR の色、カーソルを隠す、タブ、pen を持つ消去）と、種 20261127 のランダムな 2000 個。ランダムな例は、1〜10 列、1〜6 行の画面に、1〜40 個の部品（文字、全角、結合文字、C0、ESC の列、CSI、DEC と ANSI の mode、SGR、OSC、DCS、壊れた列、C1）をつないだもの。
+- 手で書いた 42 個の例と、種 20261127 のランダムな 2000 個で、全部で 2042 個。手で書いた例は、計画の 12 個（折り返し、最後の列の全角、全角の右への上書き、DECAWM の解除、スクロール領域、alt screen、insert mode、DEC の罫線、SGR の色、カーソルを隠す、タブ、pen を持つ消去）に、ランダムな部品が作らない入力の 30 個（C1、U+00A0 以上の終わりの文字、`ESC (`/`ESC )` の `0`/`B` 以外、SGR の下位の引数と切れた形、DEC の罫線や最後の列や全角の後の REP、DECOM で余白の上に戻した DECRC、2 つ以上のタブ、余白の外の IL/DL など）を足したもの。ランダムな例は、1〜10 列、1〜6 行の画面に、1〜40 個の部品（文字、全角、結合文字、C0、ESC の列、CSI、DEC と ANSI の mode、SGR、OSC、DCS、壊れた列、C1）をつないだもの。
 - harness は種と数を引数で変えられる。表に入れるのは既定の種と数だけで、実装の途中では別の種で多く試してよい（R と同じ探索）。
 - avt は `=0.18.0`、unicode-width は `=0.1.14` に固定し、`Cargo.lock` を commit する。
 - 試作で確かめた（2026-11-27）: 2012 個の例の表は fmt の後 13,790 行で、`emela fmt --check`、`emela check`、`emela test` は合わせて 0.5 秒。
 
 性能: 80 列 × 24 行の画面に、全画面の描き直し（カーソルの移動、SGR、文字）を 1 MB 分 `feed` して、かかる時間を測り、PR に書く。permanent な test にはしない（壁時計が飛ぶ。friction 032）。10 秒を超えたら、§2 の「画面の持ち方」のとおり書き方を変え、`Array.set` のコピーの数字を friction 024 に足す。
 
+結果（PR #17）:
+
+- golden の 2042 個がすべて avt と一致する。実装の途中に、別の種で 470,000 個を試し、誤りは 0（最初の実装がすべて通った）。
+- 速さは、計画の描き直しで 1 MB あたり 0.62〜0.89 秒、REP の多い描き直しで 3.7〜4.2 秒。閾値の内なので、`Vt.Screen.print` は `Array.set` で素直に書いたまま。REP が遅いのは、前のセルを 1 つ読むのに画面全体を List にするため。overlay（4）がセルを 1 つずつ読むときに、`Vt.Screen` にセルを 1 つ読む関数を足す。
+
 ## 10. 検査の仕組みとの関係
 
 - wish-first の単位: utf8、width、parser、screen、terminal、vt の公開 API。
 - `fails` を宣言する公開 API は無い（`new` の誤りは defect）。`tools/lint/foundation.allow` に足すものは無い見込み。
-- 先に予想しておく friction: 1 文字ずつの状態機械を再帰で書く（ループ構文が無い）、`Array.set` のコピー（024）、大きな enum の dispatch、Bytes から文字列への変換、`Char` の literal（013）。
+- 先に予想しておく friction: 1 文字ずつの状態機械を再帰で書く（ループ構文が無い）、`Array.set` のコピー（024）、大きな enum の dispatch、Bytes から文字列への変換、`Char` の literal（013）。→ 結果（PR #17）: String の状態機械は `code_points().fold` で素直に書けたが、Bytes には `fold` が無く `Utf8` は位置で歩く（055）。`Array.set` のコピーは閾値の内で回避は要らず、代わりに Array に範囲の操作が無いことが出た（057）。dispatch は素直な match で書け、苦しさは既存の 013、015、030、038 として出た。予想しなかったものは 056、058、059、060。
 - PR を出す前に、別の session で friction-review skill を走らせる。
 
 ## 11. 周辺の変更
