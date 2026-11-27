@@ -1,0 +1,730 @@
+# wish-target: src/utf8.emel
+
+# ストリーム用の UTF-8 デコーダ。WHATWG Encoding Standard の UTF-8 decoder の手順のとおり。
+# 途中で切れた文字は Decoder に持ち越し、次の feed で続きを読む。
+
+# 持ち越す状態。WHATWG の UTF-8 code point、bytes needed、bytes seen、lower boundary、upper boundary。
+pub opaque type Decoder = {
+  code_point: Int,
+  needed: Int,
+  seen: Int,
+  lower: Int,
+  upper: Int,
+}
+
+let replacement: Char = '\u{FFFD}'
+
+pub fn decoder() -> Decoder {
+  { code_point: 0, needed: 0, seen: 0, lower: 0x80, upper: 0xBF }
+}
+
+# 1 byte を読んだ結果。
+type Step =
+  | Continue(Decoder)
+  | Emit(Decoder, Char)
+  | Error(Decoder)
+  # 不正な継続 byte。U+FFFD を出し、同じ byte を始めから読み直す。
+  | ErrorAgain(Decoder)
+
+fn step(d: Decoder, byte: Int) -> Step {
+  if d.needed == 0 {
+    match byte {
+      0x00..=0x7F => Emit(d, Char.from_int(byte)),
+      0xC2..=0xDF => Continue({ ..d, needed: 1, code_point: byte & 0x1F }),
+      0xE0..=0xEF => Continue({
+        ..d,
+        needed: 2,
+        code_point: byte & 0x0F,
+        lower: if byte == 0xE0 { 0xA0 } else { 0x80 },
+        upper: if byte == 0xED { 0x9F } else { 0xBF },
+      }),
+      0xF0..=0xF4 => Continue({
+        ..d,
+        needed: 3,
+        code_point: byte & 0x07,
+        lower: if byte == 0xF0 { 0x90 } else { 0x80 },
+        upper: if byte == 0xF4 { 0x8F } else { 0xBF },
+      }),
+      _ => Error(d),
+    }
+  } else if byte < d.lower || byte > d.upper {
+    ErrorAgain(decoder())
+  } else {
+    let code_point = (d.code_point << 6) | (byte & 0x3F)
+    let seen = d.seen + 1
+    if seen == d.needed {
+      Emit(decoder(), Char.from_int(code_point))
+    } else {
+      Continue({ ..d, code_point: code_point, seen: seen, lower: 0x80, upper: 0xBF })
+    }
+  }
+}
+
+fn push(acc: (Decoder, List[Char]), byte: Int) -> (Decoder, List[Char]) {
+  let (d, out) = acc
+  match step(d, byte) {
+    Continue(next) => (next, out),
+    Emit(next, c) => (next, [c, ..out]),
+    Error(next) => (next, [replacement, ..out]),
+    ErrorAgain(next) => push((next, [replacement, ..out]), byte),
+  }
+}
+
+# 読めた文字を返す。途中で切れた文字は次に持ち越す。
+pub fn feed(d: Decoder, b: Bytes) -> (Decoder, String) {
+  let (next, out) = b.fold((d, []), push)
+  (next, String.from_chars(out.reverse()))
+}
+
+# 持ち越した途中の文字があれば U+FFFD 1 つ、無ければ空。
+pub fn finish(d: Decoder) -> String {
+  if d.needed == 0 { "" } else { "\u{FFFD}" }
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/utf8.emel:15:25 ]
+#     │
+#  15 │ let replacement: Char = '\u{FFFD}'
+#     │                         ┬  
+#     │                         ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\\`
+#     ╭─[ src/utf8.emel:15:26 ]
+#     │
+#  15 │ let replacement: Char = '\u{FFFD}'
+#     │                          ┬  
+#     │                          ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/utf8.emel:15:34 ]
+#     │
+#  15 │ let replacement: Char = '\u{FFFD}'
+#     │                                  ┬  
+#     │                                  ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `&`
+#     ╭─[ src/utf8.emel:33:66 ]
+#     │
+#  33 │       0xC2..=0xDF => Continue({ ..d, needed: 1, code_point: byte & 0x1F }),
+#     │                                                                  ┬  
+#     │                                                                  ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `&`
+#     ╭─[ src/utf8.emel:37:26 ]
+#     │
+#  37 │         code_point: byte & 0x0F,
+#     │                          ┬  
+#     │                          ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `&`
+#     ╭─[ src/utf8.emel:44:26 ]
+#     │
+#  44 │         code_point: byte & 0x07,
+#     │                          ┬  
+#     │                          ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `&`
+#     ╭─[ src/utf8.emel:53:50 ]
+#     │
+#  53 │     let code_point = (d.code_point << 6) | (byte & 0x3F)
+#     │                                                  ┬  
+#     │                                                  ╰── 
+# ────╯
+#
+# error[E0130]: a type without fields must be `@external`
+#    ╭─[ src/utf8.emel:7:17 ]
+#    │
+#  7 │ pub opaque type Decoder = {
+#    │                 ───┬───  
+#    │                    ╰───── 
+# ───╯
+#
+# error[E0122]: expected newline after declaration
+#    ╭─[ src/utf8.emel:7:25 ]
+#    │
+#  7 │ pub opaque type Decoder = {
+#    │                         ┬  
+#    │                         ╰── 
+# ───╯
+#
+# error[E0111]: expected type
+#     ╭─[ src/utf8.emel:18:17 ]
+#     │
+#  18 │   { code_point: 0, needed: 0, seen: 0, lower: 0x80, upper: 0xBF }
+#     │                 ┬  
+#     │                 ╰── 
+# ────╯
+#
+# error[E0110]: expected `=`
+#     ╭─[ src/utf8.emel:18:18 ]
+#     │
+#  18 │   { code_point: 0, needed: 0, seen: 0, lower: 0x80, upper: 0xBF }
+#     │                  ┬  
+#     │                  ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/utf8.emel:18:18 ]
+#     │
+#  18 │   { code_point: 0, needed: 0, seen: 0, lower: 0x80, upper: 0xBF }
+#     │                  ┬  
+#     │                  ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/utf8.emel:18:18 ]
+#     │
+#  18 │   { code_point: 0, needed: 0, seen: 0, lower: 0x80, upper: 0xBF }
+#     │                  ┬  
+#     │                  ╰── 
+# ────╯
+#
+# error[E0130]: a type without fields must be `@external`
+#     ╭─[ src/utf8.emel:22:6 ]
+#     │
+#  22 │ type Step =
+#     │      ──┬─  
+#     │        ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/utf8.emel:22:11 ]
+#     │
+#  22 │ type Step =
+#     │           ┬  
+#     │           ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/utf8.emel:31:5 ]
+#     │
+#  31 │     match byte {
+#     │     ──┬──  
+#     │       ╰──── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/utf8.emel:32:11 ]
+#     │
+#  32 │       0x00..=0x7F => Emit(d, Char.from_int(byte)),
+#     │           ─┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/utf8.emel:32:11 ]
+#     │
+#  32 │       0x00..=0x7F => Emit(d, Char.from_int(byte)),
+#     │           ─┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/utf8.emel:32:13 ]
+#     │
+#  32 │       0x00..=0x7F => Emit(d, Char.from_int(byte)),
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/utf8.emel:33:11 ]
+#     │
+#  33 │       0xC2..=0xDF => Continue({ ..d, needed: 1, code_point: byte & 0x1F }),
+#     │           ─┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/utf8.emel:33:11 ]
+#     │
+#  33 │       0xC2..=0xDF => Continue({ ..d, needed: 1, code_point: byte & 0x1F }),
+#     │           ─┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/utf8.emel:33:13 ]
+#     │
+#  33 │       0xC2..=0xDF => Continue({ ..d, needed: 1, code_point: byte & 0x1F }),
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/utf8.emel:34:11 ]
+#     │
+#  34 │       0xE0..=0xEF => Continue({
+#     │           ─┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/utf8.emel:34:11 ]
+#     │
+#  34 │       0xE0..=0xEF => Continue({
+#     │           ─┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/utf8.emel:34:13 ]
+#     │
+#  34 │       0xE0..=0xEF => Continue({
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/utf8.emel:41:11 ]
+#     │
+#  41 │       0xF0..=0xF4 => Continue({
+#     │           ─┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/utf8.emel:41:11 ]
+#     │
+#  41 │       0xF0..=0xF4 => Continue({
+#     │           ─┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/utf8.emel:41:13 ]
+#     │
+#  41 │       0xF0..=0xF4 => Continue({
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/utf8.emel:48:9 ]
+#     │
+#  48 │       _ => Error(d),
+#     │         ┬  
+#     │         ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/utf8.emel:48:9 ]
+#     │
+#  48 │       _ => Error(d),
+#     │         ┬  
+#     │         ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/utf8.emel:48:9 ]
+#     │
+#  48 │       _ => Error(d),
+#     │         ┬  
+#     │         ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/utf8.emel:53:5 ]
+#     │
+#  53 │     let code_point = (d.code_point << 6) | (byte & 0x3F)
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/utf8.emel:53:9 ]
+#     │
+#  53 │     let code_point = (d.code_point << 6) | (byte & 0x3F)
+#     │         ─────┬────  
+#     │              ╰────── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/utf8.emel:54:5 ]
+#     │
+#  54 │     let seen = d.seen + 1
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/utf8.emel:54:9 ]
+#     │
+#  54 │     let seen = d.seen + 1
+#     │         ──┬─  
+#     │           ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/utf8.emel:58:18 ]
+#     │
+#  58 │       Continue({ ..d, code_point: code_point, seen: seen, lower: 0x80, upper: 0xBF })
+#     │                  ─┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/utf8.emel:58:20 ]
+#     │
+#  58 │       Continue({ ..d, code_point: code_point, seen: seen, lower: 0x80, upper: 0xBF })
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/utf8.emel:64:3 ]
+#     │
+#  64 │   let (d, out) = acc
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/utf8.emel:64:7 ]
+#     │
+#  64 │   let (d, out) = acc
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/utf8.emel:65:3 ]
+#     │
+#  65 │   match step(d, byte) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/utf8.emel:66:20 ]
+#     │
+#  66 │     Continue(next) => (next, out),
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/utf8.emel:66:20 ]
+#     │
+#  66 │     Continue(next) => (next, out),
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/utf8.emel:66:20 ]
+#     │
+#  66 │     Continue(next) => (next, out),
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/utf8.emel:67:19 ]
+#     │
+#  67 │     Emit(next, c) => (next, [c, ..out]),
+#     │                   ┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/utf8.emel:67:19 ]
+#     │
+#  67 │     Emit(next, c) => (next, [c, ..out]),
+#     │                   ┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/utf8.emel:67:19 ]
+#     │
+#  67 │     Emit(next, c) => (next, [c, ..out]),
+#     │                   ┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/utf8.emel:68:17 ]
+#     │
+#  68 │     Error(next) => (next, [replacement, ..out]),
+#     │                 ┬  
+#     │                 ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/utf8.emel:68:17 ]
+#     │
+#  68 │     Error(next) => (next, [replacement, ..out]),
+#     │                 ┬  
+#     │                 ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/utf8.emel:68:17 ]
+#     │
+#  68 │     Error(next) => (next, [replacement, ..out]),
+#     │                 ┬  
+#     │                 ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/utf8.emel:69:22 ]
+#     │
+#  69 │     ErrorAgain(next) => push((next, [replacement, ..out]), byte),
+#     │                      ┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/utf8.emel:69:22 ]
+#     │
+#  69 │     ErrorAgain(next) => push((next, [replacement, ..out]), byte),
+#     │                      ┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/utf8.emel:69:22 ]
+#     │
+#  69 │     ErrorAgain(next) => push((next, [replacement, ..out]), byte),
+#     │                      ┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/utf8.emel:75:3 ]
+#     │
+#  75 │   let (next, out) = b.fold((d, []), push)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/utf8.emel:75:7 ]
+#     │
+#  75 │   let (next, out) = b.fold((d, []), push)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `ErrorAgain` in this scope
+#     ╭─[ src/utf8.emel:51:5 ]
+#     │
+#  51 │     ErrorAgain(decoder())
+#     │     ─────┬────  
+#     │          ╰────── 
+# ────╯
+#
+# error[E0211]: cannot find value `seen` in this scope
+#     ╭─[ src/utf8.emel:55:8 ]
+#     │
+#  55 │     if seen == d.needed {
+#     │        ──┬─  
+#     │          ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Emit` in this scope
+#     ╭─[ src/utf8.emel:56:7 ]
+#     │
+#  56 │       Emit(decoder(), Char.from_int(code_point))
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Char` in this scope
+#     ╭─[ src/utf8.emel:56:23 ]
+#     │
+#  56 │       Emit(decoder(), Char.from_int(code_point))
+#     │                       ──┬─  
+#     │                         ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `code_point` in this scope
+#     ╭─[ src/utf8.emel:56:37 ]
+#     │
+#  56 │       Emit(decoder(), Char.from_int(code_point))
+#     │                                     ─────┬────  
+#     │                                          ╰────── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Continue` in this scope
+#     ╭─[ src/utf8.emel:58:7 ]
+#     │
+#  58 │       Continue({ ..d, code_point: code_point, seen: seen, lower: 0x80, upper: 0xBF })
+#     │       ────┬───  
+#     │           ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find type `Char` in this scope
+#     ╭─[ src/utf8.emel:63:29 ]
+#     │
+#  63 │ fn push(acc: (Decoder, List[Char]), byte: Int) -> (Decoder, List[Char]) {
+#     │                             ──┬─  
+#     │                               ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find type `Char` in this scope
+#     ╭─[ src/utf8.emel:63:66 ]
+#     │
+#  63 │ fn push(acc: (Decoder, List[Char]), byte: Int) -> (Decoder, List[Char]) {
+#     │                                                                  ──┬─  
+#     │                                                                    ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `d` in this scope
+#     ╭─[ src/utf8.emel:65:14 ]
+#     │
+#  65 │   match step(d, byte) {
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Continue` in this scope
+#     ╭─[ src/utf8.emel:66:5 ]
+#     │
+#  66 │     Continue(next) => (next, out),
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Emit` in this scope
+#     ╭─[ src/utf8.emel:67:5 ]
+#     │
+#  67 │     Emit(next, c) => (next, [c, ..out]),
+#     │     ──┬─  
+#     │       ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Error` in this scope
+#     ╭─[ src/utf8.emel:68:5 ]
+#     │
+#  68 │     Error(next) => (next, [replacement, ..out]),
+#     │     ──┬──  
+#     │       ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `ErrorAgain` in this scope
+#     ╭─[ src/utf8.emel:69:5 ]
+#     │
+#  69 │     ErrorAgain(next) => push((next, [replacement, ..out]), byte),
+#     │     ─────┬────  
+#     │          ╰────── 
+# ────╯
+#
+# error[E0211]: cannot find type `Bytes` in this scope
+#     ╭─[ src/utf8.emel:74:28 ]
+#     │
+#  74 │ pub fn feed(d: Decoder, b: Bytes) -> (Decoder, String) {
+#     │                            ──┬──  
+#     │                              ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `next` in this scope
+#     ╭─[ src/utf8.emel:76:4 ]
+#     │
+#  76 │   (next, String.from_chars(out.reverse()))
+#     │    ──┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0212]: module `String` has no `from_chars`
+#     ╭─[ src/utf8.emel:76:17 ]
+#     │
+#  76 │   (next, String.from_chars(out.reverse()))
+#     │                 ─────┬────  
+#     │                      ╰────── 
+# ────╯
+#
+# error[E0211]: cannot find value `out` in this scope
+#     ╭─[ src/utf8.emel:76:28 ]
+#     │
+#  76 │   (next, String.from_chars(out.reverse()))
+#     │                            ─┬─  
+#     │                             ╰─── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `Decoder`, found `()`
+#     ╭─[ src/utf8.emel:18:3 ]
+#     │
+#  18 │   { code_point: 0, needed: 0, seen: 0, lower: 0x80, upper: 0xBF }
+#     │   ───────────────────────────────┬───────────────────────────────  
+#     │                                  ╰───────────────────────────────── 
+# ────╯
+#
+# error[E0313]: type `Decoder` has no field or function `needed`
+#     ╭─[ src/utf8.emel:30:8 ]
+#     │
+#  30 │   if d.needed == 0 {
+#     │        ───┬──  
+#     │           ╰──── 
+# ────╯
+#
+# error[E0313]: type `Decoder` has no field or function `lower`
+#     ╭─[ src/utf8.emel:50:22 ]
+#     │
+#  50 │   } else if byte < d.lower || byte > d.upper {
+#     │                      ──┬──  
+#     │                        ╰──── 
+# ────╯
+#
+# error[E0313]: type `Decoder` has no field or function `upper`
+#     ╭─[ src/utf8.emel:50:40 ]
+#     │
+#  50 │   } else if byte < d.lower || byte > d.upper {
+#     │                                        ──┬──  
+#     │                                          ╰──── 
+# ────╯
+#
+# error[E0313]: type `Decoder` has no field or function `needed`
+#     ╭─[ src/utf8.emel:55:18 ]
+#     │
+#  55 │     if seen == d.needed {
+#     │                  ───┬──  
+#     │                     ╰──── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/utf8.emel:67:5 ]
+#     │
+#  67 │     Emit(next, c) => (next, [c, ..out]),
+#     │     ──────┬──────  
+#     │           ╰──────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/utf8.emel:68:5 ]
+#     │
+#  68 │     Error(next) => (next, [replacement, ..out]),
+#     │     ─────┬─────  
+#     │          ╰─────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/utf8.emel:69:5 ]
+#     │
+#  69 │     ErrorAgain(next) => push((next, [replacement, ..out]), byte),
+#     │     ────────┬───────  
+#     │             ╰───────── 
+# ────╯
+#
+# error[E0313]: type `Decoder` has no field or function `needed`
+#     ╭─[ src/utf8.emel:81:8 ]
+#     │
+#  81 │   if d.needed == 0 { "" } else { "\u{FFFD}" }
+#     │        ───┬──  
+#     │           ╰──── 
+# ────╯
+#
+# 77 errors, 4 warnings
+# --- end wish check ---
