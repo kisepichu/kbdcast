@@ -1,0 +1,66 @@
+# The lines of an asciicast v3 file (https://docs.asciinema.org/manual/asciicast/v3/): the header,
+# and one line per event. Times come in as whole milliseconds of tape time from the start of the
+# recording; only this module turns them into intervals in seconds.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
+
+import Std.Bytes
+import Std.Json
+
+## What `event` keeps from one line to the next: the time of the previous event, in milliseconds
+## from the start of the recording.
+pub opaque type Writer(last_ms: Int)
+
+## The header line, without a newline: the size of the terminal, its type, and the command that was
+## recorded (the text of the `run` line).
+pub fn header(cols: Int, rows: Int, command: String) -> String {
+  "{\"version\": 3, \"term\": {\"cols\": #{cols}, \"rows\": #{rows}, \"type\": \"xterm-256color\"}, \"command\": #{quote(command)}}"
+}
+
+## The Writer before the first event, whose interval is counted from the start of the recording.
+pub fn writer() -> Writer {
+  Writer(last_ms: 0)
+}
+
+## The line of the event `code` with `data` at `at_ms` milliseconds of tape time from the start of
+## the recording, without a newline, and the Writer for the event after it. The interval is the time
+## since the previous event, in seconds with three decimals.
+pub fn event(w: Writer, at_ms: Int, code: String, data: String) -> (Writer, String) {
+  (Writer(last_ms: at_ms), "[#{interval(at_ms - w.last_ms)}, #{quote(code)}, #{quote(data)}]")
+}
+
+# `ms` milliseconds in seconds with three decimals (1234 is "1.234").
+fn interval(ms: Int) -> String {
+  millis = ms % 1000
+  # FRICTION(060): there is no function that pads a number with zeros to a width.
+  zeros = if millis < 10 { "00" } else if millis < 100 { "0" } else { "" }
+  "#{ms / 1000}.#{zeros}#{millis}"
+}
+
+# `s` as a JSON string, with the control characters (below 0x20, 0x7F, and C1 from 0x80 to 0x9F)
+# escaped.
+# FRICTION(062): Std.Json escapes the control characters below 0x20 but keeps 0x7F and the C1
+# controls (0x80 to 0x9F) as they are, and v3 wants every unprintable code point as `\uXXXX`. They
+# are escaped here, in the text that Json wrote. Each of them is a grapheme cluster by itself (UAX
+# #29 GB4 and GB5), so `chars` finds them without turning code points back into Strings (003).
+fn quote(s: String) -> String {
+  Json.encode(s).chars().map(escape_unprintable).join("")
+}
+
+fn escape_unprintable(c: String) -> String {
+  c.code_points() match {
+    [p] if p >= 0x7F && p <= 0x9F -> "\\u00#{hex(p)}"
+    _                             -> c
+  }
+}
+
+# FRICTION(060): Int has no hexadecimal form, so the byte goes through Bytes to use `Bytes.to_hex`.
+# FRICTION(040): `byte` is 0x7F to 0x9F, so `Bytes.from_list` cannot return `None`, and Option has
+# no `expect`.
+fn hex(byte: Int) -> String {
+  Bytes.from_list([byte]) match {
+    Some(b) -> Bytes.to_hex(b)
+    None    -> panic("a byte out of 0 to 255: #{byte}")
+  }
+}

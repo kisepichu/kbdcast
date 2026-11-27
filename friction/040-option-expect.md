@@ -12,6 +12,7 @@
   VT の解釈（`src/vt/terminal.emel`、サブプロジェクト 3 の計画の Task 5）でも、DEC の罫線の表を位置で読む所（`at`、009）と、REP がカーソルの前の文字を読む所（`repeat`）で、起きない `None` を defect にする。`repeat` の `None` は、カーソルの行を `Screen.lines` の List から `get` で読む所（カーソルの行は画面の中にある）と、カーソルより前のセルから全角の右でないものを `find` で探す所（1 列目のセルは全角の右にならない）の 2 つ。test の補助（`test/vt_snapshot.emel`）でも、色の 0〜255 の 3 つの値を 16 進にするために `Bytes.from_list` で Bytes にする所（`hex`。16 進にするのに Bytes を経由するのは 060）と、セルの code point を `String.from_code_point` で String にする所（`character`、003）の、起きない `None` を defect にする
   VT の解釈の CSI の引数を読む所（`src/vt/terminal.emel` の `value`、サブプロジェクト 3 の最終レビューの後の fix）でも、引数の最初の部分を読む所で、部分の無い引数を defect にする。parser は引数ごとに今の部分を必ず 1 つ持たせる（`src/vt/parser.emel` の `current`）ので起きない。Task 5 では `[] -> 0` と既定値で上書きしていた（friction-review の C1）
   tape のパーサ（`src/tape.emel` の `string_of`、サブプロジェクト 1 の計画の Task 1）でも、tape の行の code point を `Text.from_code_points` で String に戻す所の起きない `None`（003。code point は tape の String から取ったもの）を defect にする
+  cast の writer（`src/cast.emel` の `hex`、サブプロジェクト 1 の計画の Task 2）でも、0x7F〜0x9F の 1 つの値を 16 進にするために `Bytes.from_list` で Bytes にする所（060）の、起きない `None` を defect にする
 - こう書きたかった:
   `wish/notation.emel:38`、`:127`。Rust の `Option::expect`
   ```emela
@@ -48,6 +49,7 @@
   VT の解釈の `value`（`src/vt/terminal.emel`、`FRICTION(040)` の印、最終レビューの後の fix）: `p.head()` の Option を受けず、部分の List を `[n, ..] -> n` と `[] -> panic(...)` の match で読む（Task 5 の match の形のまま、`[]` の腕を panic にした）。wish（`wish/terminal.emel:76`、`:125-126`、`:137-138`）は `List.first` と `p.first()` を Int を返すものとして書いた（016）ので、`.expect` は書いていない
   VT の公開 API（`src/vt.emel` の `character`、`FRICTION(040)` の印）: `None` を defect にする所は 1 つなので、parser と同じくその場の match にした。wish（`wish/vt.emel:68`）は `String.from_code_point` が String を返すと思っていたので、`.expect` は書いていない（003）。テスト（`test/vt_test.emel`）は、parser のテストと `test/cut.emel` の `character` を共有する（Task 6 では写しを `test/vt_test.emel` に置いたが、review の後でまとめた）
   tape のパーサ（`src/tape.emel` の `string_of`、`FRICTION(040)` の印）: `None` を defect にする所は 1 つなので、VT の公開 API と同じくその場の match にした。wish（`wish/tape.emel:158-159`）は文字を `Char` で持ち、String に足せると思っていたので、`.expect` は書いていない（003）
+  cast の writer（`src/cast.emel` の `hex`、`FRICTION(040)` の印）: `None` を defect にする所は 1 つなので、`test/vt_snapshot.emel` の `hex` と同じくその場の match にした。wish（`wish/cast.emel`）は Json がすべて escape すると思っていた（062）ので、16 進の所も `.expect` も書いていない
 - コスト:
   補助関数 3 つ（6 行ずつ。表記、テストの生成器、decode）。method の形（`.expect(...)`）では書けず、pipe で書く（`[type.rules]`: method の形で呼べるのは、型を定義した module の関数だけ）。普段のコードに基盤レベルは漏れていない
   repo の中で同じ match を所ごとに書いている所が、これまでに 11 ある: `regex/src/fold.emel`、`regex/src/class.emel`、`regex/src/vm.emel`（どれも 009）、`regex/src/syntax.emel`、`regex/src/lib.emel`、`text/src/lib.emel`、`text/test/text_test.emel`（どれも 003）、`regex/test/differential_test.emel`、`regex/test/linear_test.emel`、`regex/test/find_test.emel`、`test/golden.emel`。std の `Std.Bytes.hex` も `from_hex(s)` の `None` を同じ形で `panic` にする（v0.28.2 の `std/bytes.emel:157-160`）
@@ -59,6 +61,7 @@
   VT の公開 API（Task 6）: その場の match が 1 つ（`src/vt.emel` の `character`）。テストは parser のテストと `test/cut.emel` の `character` を共有する（Task 6 では写しを置いて 2 つと数えたが、review の後でまとめた）。repo の中でその場の match を書いている所は 18 になった
   VT の解釈の `value`（最終レビューの後の fix）: その場の match が 1 つ（`src/vt/terminal.emel` の `value`。Option でなく List のパターンだが、起きない場合を panic にするのは同じ）。repo の中でその場の match を書いている所は 19 になった
   tape のパーサ（サブプロジェクト 1 の Task 1）: その場の match が 1 つ（`src/tape.emel` の `string_of`）。repo の中でその場の match を書いている所は 20 になった
+  cast の writer（サブプロジェクト 1 の Task 2）: その場の match が 1 つ（`src/cast.emel` の `hex`）。repo の中でその場の match を書いている所は 21 になった
 - spec: `[api.option]`（`map`、`and_then`、`or`、`is_some`、`is_none`、`or_fail`）、`[lib.api-rules]`（「A precondition of the caller is broken: it is a defect.」）、`[type.rules]`、`spec/history.md:459`（`Option.unwrap_or` を `Option.or` にした。`unwrap` と `expect` には触れていない）
 - 既存: emela の issue と PR に無い（2026-11-27、`gh search issues --repo emela-lang/emela --include-prs` で「Option expect」「unwrap」を検索。「unwrap」で当たったのは `unwrap_or` を `or` にした #191 などで、別の話題）。checkout の main（596b6038）の core にも無い。009（範囲外を defect にする `Array.at`）と 003（失敗しない `String.from_scalars`）は、それぞれの所で起きない `None` を無くす案で、このメモはどの Option にも使える形
 - 行き先: 前提の範囲内で spec に足りない → proposal の下書きの材料（まだ書かない）。`Option.expect(opt, message) -> A`（`None` は `message` の defect）。`[lib.api-rules]` の「呼ぶ側の前提が壊れたら defect」を、呼ぶ側が 1 行で書ける形。009 と 003 と合わせ、repo と std の `None -> panic` の数を使い道に添える。未提出。出すのは user
