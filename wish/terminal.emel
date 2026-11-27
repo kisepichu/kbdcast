@@ -1,0 +1,5345 @@
+# wish-target: src/vt/terminal.emel
+# Interprets the parser's actions as the terminal avt 0.18.0 does, and answers the queries kbdcast answers.
+# The behavior follows avt 0.18.0 (Apache-2.0, https://github.com/asciinema/avt)
+
+import Vt.Parser.{Action, Print, Execute, Csi, Esc}
+import Vt.Screen
+import Vt.Screen.{Screen, Pen, Color, Indexed, Rgb, Intensity, Normal, Bold, Faint, Erase, DEFAULT_PEN}
+import Key.Encode.{InputModes, CursorKeys, Application, Newline, Cr, CrLf, OtherKeys, Off, On, Level, One, Two, DEFAULT_MODES}
+
+pub enum Reply {
+  DeviceAttributes,
+  Status,
+  CursorPosition(Int, Int),
+} derive Eq, Show
+
+enum Charset { Ascii, Drawing }
+
+# What DECSC and mode 1048 save.
+type Saved(col: Int, row: Int, pen: Pen, origin: Bool, auto_wrap: Bool)
+
+const SAVED: Saved = Saved(col: 0, row: 0, pen: DEFAULT_PEN, origin: false, auto_wrap: true)
+
+pub opaque type Terminal(
+  cols: Int,
+  rows: Int,
+  screen: Screen,         # the one in view
+  other: Screen,          # the primary one while the alternate one is in view
+  alternate: Bool,
+  col: Int,               # 0..=cols: cols right after printing in the last column
+  row: Int,
+  visible: Bool,
+  pen: Pen,
+  g0: Charset,
+  g1: Charset,
+  shifted: Bool,          # SO: G1 is in use
+  tabs: List[Int],        # ascending
+  insert: Bool,
+  origin: Bool,
+  auto_wrap: Bool,
+  top: Int,
+  bottom: Int,            # inclusive, as in avt
+  saved: Saved,
+  other_saved: Saved,
+  modes: InputModes,
+)
+
+pub fn terminal(cols: Int, rows: Int) -> Terminal {
+  assert cols >= 1 && rows >= 1
+  Terminal(
+    cols: cols, rows: rows,
+    screen: Screen.blank(cols, rows, DEFAULT_PEN), other: Screen.blank(cols, rows, DEFAULT_PEN), alternate: false,
+    col: 0, row: 0, visible: true, pen: DEFAULT_PEN,
+    g0: Ascii, g1: Ascii, shifted: false,
+    tabs: range(8, cols, step: 8),
+    insert: false, origin: false, auto_wrap: true,
+    top: 0, bottom: rows - 1,
+    saved: SAVED, other_saved: SAVED,
+    modes: DEFAULT_MODES,
+  )
+}
+
+pub fn screen(t: Terminal) -> Screen = t.screen
+pub fn cursor(t: Terminal) -> (Int, Int, Bool) = (t.col, t.row, t.visible)
+pub fn input_modes(t: Terminal) -> InputModes = t.modes
+
+pub fn apply(t: Terminal, a: Action) -> (Terminal, List[Reply]) {
+  match a {
+    Print(s) => (s.chars().fold(t, print), [])
+    Execute(c) => (execute(t, c), [])
+    Csi(ps, inter, f) => csi(t, ps, inter.last(), f)
+    Esc(inter, f) => (esc(t, inter.last(), f), [])
+  }
+}
+
+# avt reads a parameter it was not given as 0, and 0 as the default.
+fn arg(ps: List[List[Int]], i: Int) -> Int = ps.get(i).and_then(List.first).unwrap_or(0)
+fn count(ps: List[List[Int]], i: Int, default: Int) -> Int = if arg(ps, i) == 0 { default } else { arg(ps, i) }
+
+fn csi(t: Terminal, ps: List[List[Int]], inter: Option[Char], f: Char) -> (Terminal, List[Reply]) {
+  let n = count(ps, 0, 1)
+  match (inter, f) {
+    (None, '@') => (ich(t, n), [])
+    (None, 'A') => (cursor_up(t, n), [])
+    (None, 'B') | (None, 'e') => (cursor_down(t, n), [])
+    (None, 'C') | (None, 'a') => (to_rel_col(t, n), [])
+    (None, 'D') => (to_rel_col(t, if t.col == t.cols { -n - 1 } else { -n }), [])
+    (None, 'E') => (Terminal(..cursor_down(t, n), col: 0), [])
+    (None, 'F') => (Terminal(..cursor_up(t, n), col: 0), [])
+    (None, 'G') | (None, '`') => (to_col(t, n - 1), [])
+    (None, 'H') | (None, 'f') => (to_row(to_col(t, count(ps, 1, 1) - 1), n - 1), [])
+    (None, 'I') => (next_tab(t, n), [])
+    (None, 'J') => match arg(ps, 0) {
+      0 => (erase(t, Erase.ToEndOfScreen), [])
+      1 => (erase(t, Erase.ToStartOfScreen), [])
+      2 => (erase(t, Erase.WholeScreen), [])
+      _ => (t, [])
+    }
+    (None, 'K') => match arg(ps, 0) {
+      0 => (erase(t, Erase.ToEndOfLine), [])
+      1 => (erase(t, Erase.ToStartOfLine), [])
+      2 => (erase(t, Erase.WholeLine), [])
+      _ => (t, [])
+    }
+    (None, 'L') => (insert_lines(t, n), [])
+    (None, 'M') => (delete_lines(t, n), [])
+    (None, 'P') => (dch(t, n), [])
+    (None, 'S') => (scroll_up(t, n), [])
+    (None, 'T') => (scroll_down(t, n), [])
+    (None, 'W') => match arg(ps, 0) {
+      0 => (set_tab(t), [])
+      2 => (clear_tab(t), [])
+      5 => (Terminal(..t, tabs: []), [])
+      _ => (t, [])
+    }
+    (None, 'X') => (erase(t, Erase.NextChars(n)), [])
+    (None, 'Z') => (prev_tab(t, n), [])
+    (None, 'b') => (rep(t, n), [])
+    (None, 'c') if arg(ps, 0) == 0 => (t, [DeviceAttributes])
+    (None, 'd') => (to_row(t, n - 1), [])
+    (None, 'g') => match arg(ps, 0) {
+      0 => (clear_tab(t), [])
+      3 => (Terminal(..t, tabs: []), [])
+      _ => (t, [])
+    }
+    (None, 'h') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), true)), [])
+    (None, 'l') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), false)), [])
+    (None, 'm') => (sgr(t, if ps == [] { [[0]] } else { ps }), [])
+    (None, 'n') => match arg(ps, 0) {
+      5 => (t, [Status])
+      6 => (t, [CursorPosition(t.row - (if t.origin { t.top } else { 0 }) + 1, min(t.col, t.cols - 1) + 1)])
+      _ => (t, [])
+    }
+    (None, 'r') => (set_margins(t, count(ps, 0, 1) - 1, count(ps, 1, t.rows) - 1), [])
+    (None, 's') => (save_cursor(t), [])
+    (None, 'u') => (restore_cursor(t), [])
+    (Some('!'), 'p') => (soft_reset(t), [])
+    (Some('?'), 'h') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), true)), [])
+    (Some('?'), 'l') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), false)), [])
+    (Some('>'), 'm') if arg(ps, 0) == 4 => (other_keys(t, ps.get(1)), [])
+    _ => (t, [])
+  }
+}
+
+# `CSI > 4 ; n m`: modifyOtherKeys. A missing n turns it off; an unknown n leaves it.
+fn other_keys(t: Terminal, n: Option[List[Int]]) -> Terminal {
+  let level = match n.and_then(List.first) {
+    None | Some(0) => Some(Off)
+    Some(1) => Some(On(One))
+    Some(2) => Some(On(Two))
+    _ => None
+  }
+  match level {
+    Some(k) => Terminal(..t, modes: InputModes(..t.modes, other_keys: k))
+    None => t
+  }
+}
+
+fn esc(t: Terminal, inter: Option[Char], f: Char) -> Terminal {
+  match (inter, f) {
+    (None, 'D') => execute(t, 0x84)
+    (None, 'E') => execute(t, 0x85)
+    (None, 'H') => execute(t, 0x88)
+    (None, 'M') => execute(t, 0x8D)
+    (None, '7') => save_cursor(t)
+    (None, '8') => restore_cursor(t)
+    (None, 'c') => terminal(t.cols, t.rows)
+    (Some('#'), '8') => decaln(t)
+    (Some('('), '0') => Terminal(..t, g0: Drawing)
+    (Some('('), _) => Terminal(..t, g0: Ascii)
+    (Some(')'), '0') => Terminal(..t, g1: Drawing)
+    (Some(')'), _) => Terminal(..t, g1: Ascii)
+    _ => t
+  }
+}
+
+fn execute(t: Terminal, c: Int) -> Terminal {
+  match c {
+    0x08 => to_rel_col(t, if t.col == t.cols { -2 } else { -1 })
+    0x09 => next_tab(t, 1)
+    0x0A | 0x0B | 0x0C | 0x84 => linefeed(t)
+    0x0D => Terminal(..t, col: 0)
+    0x0E => Terminal(..t, shifted: true)
+    0x0F => Terminal(..t, shifted: false)
+    0x85 => Terminal(..down_with_scroll(t), col: 0)
+    0x88 => set_tab(t)
+    0x8D => reverse_index(t)
+    _ => t
+  }
+}
+
+fn sgr(t: Terminal, ps: List[List[Int]]) -> Terminal {
+  let p = t.pen
+  match ps {
+    [] => t
+    [[0], ..rest] => sgr(Terminal(..t, pen: DEFAULT_PEN), rest)
+    [[1], ..rest] => sgr(Terminal(..t, pen: Pen(..p, intensity: Bold)), rest)
+    [[2], ..rest] => sgr(Terminal(..t, pen: Pen(..p, intensity: Faint)), rest)
+    [[3], ..rest] => sgr(Terminal(..t, pen: Pen(..p, italic: true)), rest)
+    [[4], ..rest] => sgr(Terminal(..t, pen: Pen(..p, underline: true)), rest)
+    [[5], ..rest] => sgr(Terminal(..t, pen: Pen(..p, blink: true)), rest)
+    [[7], ..rest] => sgr(Terminal(..t, pen: Pen(..p, inverse: true)), rest)
+    [[9], ..rest] => sgr(Terminal(..t, pen: Pen(..p, strikethrough: true)), rest)
+    [[21], ..rest] | [[22], ..rest] => sgr(Terminal(..t, pen: Pen(..p, intensity: Normal)), rest)
+    [[23], ..rest] => sgr(Terminal(..t, pen: Pen(..p, italic: false)), rest)
+    [[24], ..rest] => sgr(Terminal(..t, pen: Pen(..p, underline: false)), rest)
+    [[25], ..rest] => sgr(Terminal(..t, pen: Pen(..p, blink: false)), rest)
+    [[27], ..rest] => sgr(Terminal(..t, pen: Pen(..p, inverse: false)), rest)
+    [[29], ..rest] => sgr(Terminal(..t, pen: Pen(..p, strikethrough: false)), rest)
+    [[n], ..rest] if 30 <= n && n <= 37 => sgr(fg(t, Indexed(n - 30)), rest)
+    [[38, 2, r, g, b], ..rest] | [[38, 2, _, r, g, b], ..rest] => sgr(fg(t, rgb(r, g, b)), rest)
+    [[38, 5, i], ..rest] => sgr(fg(t, Indexed(i % 256)), rest)
+    [[38], [2], [r], [g], [b], ..rest] => sgr(fg(t, rgb(r, g, b)), rest)   # only the first part of r, g, b counts
+    [[38], [2], ..rest] => sgr(t, rest)
+    [[38], [5], [i], ..rest] => sgr(fg(t, Indexed(i % 256)), rest)
+    [[38], [5], ..rest] => sgr(t, rest)
+    [[39], ..rest] => sgr(Terminal(..t, pen: Pen(..p, foreground: None)), rest)
+    # ... the same for 40-49, then 90-97 and 100-107
+    [_, ..rest] => sgr(t, rest)
+  }
+}
+
+fn rgb(r: Int, g: Int, b: Int) -> Color = Rgb(r % 256, g % 256, b % 256)
+
+fn fg(t: Terminal, c: Color) -> Terminal = Terminal(..t, pen: Pen(..t.pen, foreground: Some(c)))
+
+fn print(t: Terminal, c: Char) -> Terminal {
+  let c = if (if t.shifted { t.g1 } else { t.g0 }) == Drawing { drawing(c) } else { c }
+  let s = if t.insert && t.col < t.cols { Screen.shift_right(t.screen, t.col, t.row, 1, t.pen) } else { t.screen }
+  let printed = if t.col < t.cols { Screen.print(s, t.col, t.row, c, t.pen) } else { (s, None) }
+  match printed {
+    (s, Some(w)) => {
+      let col = t.col + w
+      Terminal(..t, screen: s, col: if col == t.cols && !t.auto_wrap { t.cols - 1 } else { col })
+    }
+    (s, None) if t.auto_wrap => wrap_and_print(Terminal(..t, screen: s), c)
+    (s, None) => print_at_line_end(Terminal(..t, screen: s), c)
+  }
+}
+
+const DRAWING: String = "♦▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£⋅"
+
+fn drawing(c: Char) -> Char = if 0x60 <= c && c <= 0x7E { DRAWING[c - 0x60] } else { c }
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:82:12 ]
+#     │
+#  82 │     (None, '@') => (ich(t, n), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:82:14 ]
+#     │
+#  82 │     (None, '@') => (ich(t, n), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:83:12 ]
+#     │
+#  83 │     (None, 'A') => (cursor_up(t, n), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:83:14 ]
+#     │
+#  83 │     (None, 'A') => (cursor_up(t, n), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:84:12 ]
+#     │
+#  84 │     (None, 'B') | (None, 'e') => (cursor_down(t, n), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:84:14 ]
+#     │
+#  84 │     (None, 'B') | (None, 'e') => (cursor_down(t, n), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:84:26 ]
+#     │
+#  84 │     (None, 'B') | (None, 'e') => (cursor_down(t, n), [])
+#     │                          ┬  
+#     │                          ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:84:28 ]
+#     │
+#  84 │     (None, 'B') | (None, 'e') => (cursor_down(t, n), [])
+#     │                            ┬  
+#     │                            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:85:12 ]
+#     │
+#  85 │     (None, 'C') | (None, 'a') => (to_rel_col(t, n), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:85:14 ]
+#     │
+#  85 │     (None, 'C') | (None, 'a') => (to_rel_col(t, n), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:85:26 ]
+#     │
+#  85 │     (None, 'C') | (None, 'a') => (to_rel_col(t, n), [])
+#     │                          ┬  
+#     │                          ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:85:28 ]
+#     │
+#  85 │     (None, 'C') | (None, 'a') => (to_rel_col(t, n), [])
+#     │                            ┬  
+#     │                            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:86:12 ]
+#     │
+#  86 │     (None, 'D') => (to_rel_col(t, if t.col == t.cols { -n - 1 } else { -n }), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:86:14 ]
+#     │
+#  86 │     (None, 'D') => (to_rel_col(t, if t.col == t.cols { -n - 1 } else { -n }), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:87:12 ]
+#     │
+#  87 │     (None, 'E') => (Terminal(..cursor_down(t, n), col: 0), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:87:14 ]
+#     │
+#  87 │     (None, 'E') => (Terminal(..cursor_down(t, n), col: 0), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:88:12 ]
+#     │
+#  88 │     (None, 'F') => (Terminal(..cursor_up(t, n), col: 0), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:88:14 ]
+#     │
+#  88 │     (None, 'F') => (Terminal(..cursor_up(t, n), col: 0), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:89:12 ]
+#     │
+#  89 │     (None, 'G') | (None, '`') => (to_col(t, n - 1), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:89:14 ]
+#     │
+#  89 │     (None, 'G') | (None, '`') => (to_col(t, n - 1), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:89:26 ]
+#     │
+#  89 │     (None, 'G') | (None, '`') => (to_col(t, n - 1), [])
+#     │                          ┬  
+#     │                          ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character ```
+#     ╭─[ src/vt/terminal.emel:89:27 ]
+#     │
+#  89 │     (None, 'G') | (None, '`') => (to_col(t, n - 1), [])
+#     │                           ┬  
+#     │                           ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:89:28 ]
+#     │
+#  89 │     (None, 'G') | (None, '`') => (to_col(t, n - 1), [])
+#     │                            ┬  
+#     │                            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:90:12 ]
+#     │
+#  90 │     (None, 'H') | (None, 'f') => (to_row(to_col(t, count(ps, 1, 1) - 1), n - 1), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:90:14 ]
+#     │
+#  90 │     (None, 'H') | (None, 'f') => (to_row(to_col(t, count(ps, 1, 1) - 1), n - 1), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:90:26 ]
+#     │
+#  90 │     (None, 'H') | (None, 'f') => (to_row(to_col(t, count(ps, 1, 1) - 1), n - 1), [])
+#     │                          ┬  
+#     │                          ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:90:28 ]
+#     │
+#  90 │     (None, 'H') | (None, 'f') => (to_row(to_col(t, count(ps, 1, 1) - 1), n - 1), [])
+#     │                            ┬  
+#     │                            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:91:12 ]
+#     │
+#  91 │     (None, 'I') => (next_tab(t, n), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:91:14 ]
+#     │
+#  91 │     (None, 'I') => (next_tab(t, n), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:92:12 ]
+#     │
+#  92 │     (None, 'J') => match arg(ps, 0) {
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:92:14 ]
+#     │
+#  92 │     (None, 'J') => match arg(ps, 0) {
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:98:12 ]
+#     │
+#  98 │     (None, 'K') => match arg(ps, 0) {
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#     ╭─[ src/vt/terminal.emel:98:14 ]
+#     │
+#  98 │     (None, 'K') => match arg(ps, 0) {
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:104:12 ]
+#      │
+#  104 │     (None, 'L') => (insert_lines(t, n), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:104:14 ]
+#      │
+#  104 │     (None, 'L') => (insert_lines(t, n), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:105:12 ]
+#      │
+#  105 │     (None, 'M') => (delete_lines(t, n), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:105:14 ]
+#      │
+#  105 │     (None, 'M') => (delete_lines(t, n), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:106:12 ]
+#      │
+#  106 │     (None, 'P') => (dch(t, n), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:106:14 ]
+#      │
+#  106 │     (None, 'P') => (dch(t, n), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:107:12 ]
+#      │
+#  107 │     (None, 'S') => (scroll_up(t, n), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:107:14 ]
+#      │
+#  107 │     (None, 'S') => (scroll_up(t, n), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:108:12 ]
+#      │
+#  108 │     (None, 'T') => (scroll_down(t, n), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:108:14 ]
+#      │
+#  108 │     (None, 'T') => (scroll_down(t, n), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:109:12 ]
+#      │
+#  109 │     (None, 'W') => match arg(ps, 0) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:109:14 ]
+#      │
+#  109 │     (None, 'W') => match arg(ps, 0) {
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:115:12 ]
+#      │
+#  115 │     (None, 'X') => (erase(t, Erase.NextChars(n)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:115:14 ]
+#      │
+#  115 │     (None, 'X') => (erase(t, Erase.NextChars(n)), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:116:12 ]
+#      │
+#  116 │     (None, 'Z') => (prev_tab(t, n), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:116:14 ]
+#      │
+#  116 │     (None, 'Z') => (prev_tab(t, n), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:117:12 ]
+#      │
+#  117 │     (None, 'b') => (rep(t, n), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:117:14 ]
+#      │
+#  117 │     (None, 'b') => (rep(t, n), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:118:12 ]
+#      │
+#  118 │     (None, 'c') if arg(ps, 0) == 0 => (t, [DeviceAttributes])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:118:14 ]
+#      │
+#  118 │     (None, 'c') if arg(ps, 0) == 0 => (t, [DeviceAttributes])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:119:12 ]
+#      │
+#  119 │     (None, 'd') => (to_row(t, n - 1), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:119:14 ]
+#      │
+#  119 │     (None, 'd') => (to_row(t, n - 1), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:120:12 ]
+#      │
+#  120 │     (None, 'g') => match arg(ps, 0) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:120:14 ]
+#      │
+#  120 │     (None, 'g') => match arg(ps, 0) {
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:125:12 ]
+#      │
+#  125 │     (None, 'h') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), true)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:125:14 ]
+#      │
+#  125 │     (None, 'h') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), true)), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:126:12 ]
+#      │
+#  126 │     (None, 'l') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), false)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:126:14 ]
+#      │
+#  126 │     (None, 'l') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), false)), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:127:12 ]
+#      │
+#  127 │     (None, 'm') => (sgr(t, if ps == [] { [[0]] } else { ps }), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:127:14 ]
+#      │
+#  127 │     (None, 'm') => (sgr(t, if ps == [] { [[0]] } else { ps }), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:128:12 ]
+#      │
+#  128 │     (None, 'n') => match arg(ps, 0) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:128:14 ]
+#      │
+#  128 │     (None, 'n') => match arg(ps, 0) {
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:133:12 ]
+#      │
+#  133 │     (None, 'r') => (set_margins(t, count(ps, 0, 1) - 1, count(ps, 1, t.rows) - 1), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:133:14 ]
+#      │
+#  133 │     (None, 'r') => (set_margins(t, count(ps, 0, 1) - 1, count(ps, 1, t.rows) - 1), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:134:12 ]
+#      │
+#  134 │     (None, 's') => (save_cursor(t), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:134:14 ]
+#      │
+#  134 │     (None, 's') => (save_cursor(t), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:135:12 ]
+#      │
+#  135 │     (None, 'u') => (restore_cursor(t), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:135:14 ]
+#      │
+#  135 │     (None, 'u') => (restore_cursor(t), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:136:11 ]
+#      │
+#  136 │     (Some('!'), 'p') => (soft_reset(t), [])
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:136:13 ]
+#      │
+#  136 │     (Some('!'), 'p') => (soft_reset(t), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:136:17 ]
+#      │
+#  136 │     (Some('!'), 'p') => (soft_reset(t), [])
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:136:19 ]
+#      │
+#  136 │     (Some('!'), 'p') => (soft_reset(t), [])
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:137:11 ]
+#      │
+#  137 │     (Some('?'), 'h') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), true)), [])
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/vt/terminal.emel:137:12 ]
+#      │
+#  137 │     (Some('?'), 'h') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), true)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:137:13 ]
+#      │
+#  137 │     (Some('?'), 'h') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), true)), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:137:17 ]
+#      │
+#  137 │     (Some('?'), 'h') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), true)), [])
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:137:19 ]
+#      │
+#  137 │     (Some('?'), 'h') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), true)), [])
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:138:11 ]
+#      │
+#  138 │     (Some('?'), 'l') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), false)), [])
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/vt/terminal.emel:138:12 ]
+#      │
+#  138 │     (Some('?'), 'l') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), false)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:138:13 ]
+#      │
+#  138 │     (Some('?'), 'l') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), false)), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:138:17 ]
+#      │
+#  138 │     (Some('?'), 'l') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), false)), [])
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:138:19 ]
+#      │
+#  138 │     (Some('?'), 'l') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), false)), [])
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:139:11 ]
+#      │
+#  139 │     (Some('>'), 'm') if arg(ps, 0) == 4 => (other_keys(t, ps.get(1)), [])
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:139:13 ]
+#      │
+#  139 │     (Some('>'), 'm') if arg(ps, 0) == 4 => (other_keys(t, ps.get(1)), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:139:17 ]
+#      │
+#  139 │     (Some('>'), 'm') if arg(ps, 0) == 4 => (other_keys(t, ps.get(1)), [])
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:139:19 ]
+#      │
+#  139 │     (Some('>'), 'm') if arg(ps, 0) == 4 => (other_keys(t, ps.get(1)), [])
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:160:12 ]
+#      │
+#  160 │     (None, 'D') => execute(t, 0x84)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:160:14 ]
+#      │
+#  160 │     (None, 'D') => execute(t, 0x84)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:161:12 ]
+#      │
+#  161 │     (None, 'E') => execute(t, 0x85)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:161:14 ]
+#      │
+#  161 │     (None, 'E') => execute(t, 0x85)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:162:12 ]
+#      │
+#  162 │     (None, 'H') => execute(t, 0x88)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:162:14 ]
+#      │
+#  162 │     (None, 'H') => execute(t, 0x88)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:163:12 ]
+#      │
+#  163 │     (None, 'M') => execute(t, 0x8D)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:163:14 ]
+#      │
+#  163 │     (None, 'M') => execute(t, 0x8D)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:164:12 ]
+#      │
+#  164 │     (None, '7') => save_cursor(t)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:164:14 ]
+#      │
+#  164 │     (None, '7') => save_cursor(t)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:165:12 ]
+#      │
+#  165 │     (None, '8') => restore_cursor(t)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:165:14 ]
+#      │
+#  165 │     (None, '8') => restore_cursor(t)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:166:12 ]
+#      │
+#  166 │     (None, 'c') => terminal(t.cols, t.rows)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:166:14 ]
+#      │
+#  166 │     (None, 'c') => terminal(t.cols, t.rows)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:167:11 ]
+#      │
+#  167 │     (Some('#'), '8') => decaln(t)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:168:11 ]
+#      │
+#  168 │     (Some('('), '0') => Terminal(..t, g0: Drawing)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:168:13 ]
+#      │
+#  168 │     (Some('('), '0') => Terminal(..t, g0: Drawing)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:168:17 ]
+#      │
+#  168 │     (Some('('), '0') => Terminal(..t, g0: Drawing)
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:168:19 ]
+#      │
+#  168 │     (Some('('), '0') => Terminal(..t, g0: Drawing)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:169:11 ]
+#      │
+#  169 │     (Some('('), _) => Terminal(..t, g0: Ascii)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:169:13 ]
+#      │
+#  169 │     (Some('('), _) => Terminal(..t, g0: Ascii)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:170:11 ]
+#      │
+#  170 │     (Some(')'), '0') => Terminal(..t, g1: Drawing)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:170:13 ]
+#      │
+#  170 │     (Some(')'), '0') => Terminal(..t, g1: Drawing)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:170:17 ]
+#      │
+#  170 │     (Some(')'), '0') => Terminal(..t, g1: Drawing)
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:170:19 ]
+#      │
+#  170 │     (Some(')'), '0') => Terminal(..t, g1: Drawing)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:171:11 ]
+#      │
+#  171 │     (Some(')'), _) => Terminal(..t, g1: Ascii)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/vt/terminal.emel:171:13 ]
+#      │
+#  171 │     (Some(')'), _) => Terminal(..t, g1: Ascii)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/vt/terminal.emel:62:8 ]
+#     │
+#  62 │ pub fn screen(t: Terminal) -> Screen = t.screen
+#     │        ───┬──  
+#     │           ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/terminal.emel:62:38 ]
+#     │
+#  62 │ pub fn screen(t: Terminal) -> Screen = t.screen
+#     │                                      ┬  
+#     │                                      ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/vt/terminal.emel:63:8 ]
+#     │
+#  63 │ pub fn cursor(t: Terminal) -> (Int, Int, Bool) = (t.col, t.row, t.visible)
+#     │        ───┬──  
+#     │           ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/terminal.emel:63:48 ]
+#     │
+#  63 │ pub fn cursor(t: Terminal) -> (Int, Int, Bool) = (t.col, t.row, t.visible)
+#     │                                                ┬  
+#     │                                                ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/vt/terminal.emel:64:8 ]
+#     │
+#  64 │ pub fn input_modes(t: Terminal) -> InputModes = t.modes
+#     │        ─────┬─────  
+#     │             ╰─────── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/terminal.emel:64:47 ]
+#     │
+#  64 │ pub fn input_modes(t: Terminal) -> InputModes = t.modes
+#     │                                               ┬  
+#     │                                               ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/vt/terminal.emel:67:3 ]
+#     │
+#  67 │   match a {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/terminal.emel:68:14 ]
+#     │
+#  68 │     Print(s) => (s.chars().fold(t, print), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/terminal.emel:68:14 ]
+#     │
+#  68 │     Print(s) => (s.chars().fold(t, print), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/terminal.emel:68:14 ]
+#     │
+#  68 │     Print(s) => (s.chars().fold(t, print), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/terminal.emel:69:16 ]
+#     │
+#  69 │     Execute(c) => (execute(t, c), [])
+#     │                ┬  
+#     │                ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/terminal.emel:69:16 ]
+#     │
+#  69 │     Execute(c) => (execute(t, c), [])
+#     │                ┬  
+#     │                ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/terminal.emel:69:16 ]
+#     │
+#  69 │     Execute(c) => (execute(t, c), [])
+#     │                ┬  
+#     │                ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/terminal.emel:70:23 ]
+#     │
+#  70 │     Csi(ps, inter, f) => csi(t, ps, inter.last(), f)
+#     │                       ┬  
+#     │                       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/terminal.emel:70:23 ]
+#     │
+#  70 │     Csi(ps, inter, f) => csi(t, ps, inter.last(), f)
+#     │                       ┬  
+#     │                       ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/terminal.emel:70:23 ]
+#     │
+#  70 │     Csi(ps, inter, f) => csi(t, ps, inter.last(), f)
+#     │                       ┬  
+#     │                       ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/terminal.emel:71:19 ]
+#     │
+#  71 │     Esc(inter, f) => (esc(t, inter.last(), f), [])
+#     │                   ┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/terminal.emel:71:19 ]
+#     │
+#  71 │     Esc(inter, f) => (esc(t, inter.last(), f), [])
+#     │                   ┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/terminal.emel:71:19 ]
+#     │
+#  71 │     Esc(inter, f) => (esc(t, inter.last(), f), [])
+#     │                   ┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/vt/terminal.emel:76:4 ]
+#     │
+#  76 │ fn arg(ps: List[List[Int]], i: Int) -> Int = ps.get(i).and_then(List.first).unwrap_or(0)
+#     │    ─┬─  
+#     │     ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/terminal.emel:76:44 ]
+#     │
+#  76 │ fn arg(ps: List[List[Int]], i: Int) -> Int = ps.get(i).and_then(List.first).unwrap_or(0)
+#     │                                            ┬  
+#     │                                            ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/vt/terminal.emel:77:4 ]
+#     │
+#  77 │ fn count(ps: List[List[Int]], i: Int, default: Int) -> Int = if arg(ps, i) == 0 { default } else { arg(ps, i) }
+#     │    ──┬──  
+#     │      ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/terminal.emel:77:60 ]
+#     │
+#  77 │ fn count(ps: List[List[Int]], i: Int, default: Int) -> Int = if arg(ps, i) == 0 { default } else { arg(ps, i) }
+#     │                                                            ┬  
+#     │                                                            ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/terminal.emel:80:3 ]
+#     │
+#  80 │   let n = count(ps, 0, 1)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vt/terminal.emel:80:7 ]
+#     │
+#  80 │   let n = count(ps, 0, 1)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/vt/terminal.emel:81:3 ]
+#     │
+#  81 │   match (inter, f) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/vt/terminal.emel:82:12 ]
+#     │
+#  82 │     (None, '@') => (ich(t, n), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/terminal.emel:82:13 ]
+#     │
+#  82 │     (None, '@') => (ich(t, n), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/terminal.emel:82:13 ]
+#     │
+#  82 │     (None, '@') => (ich(t, n), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/terminal.emel:82:13 ]
+#     │
+#  82 │     (None, '@') => (ich(t, n), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/terminal.emel:82:14 ]
+#     │
+#  82 │     (None, '@') => (ich(t, n), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/vt/terminal.emel:83:12 ]
+#     │
+#  83 │     (None, 'A') => (cursor_up(t, n), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/terminal.emel:83:13 ]
+#     │
+#  83 │     (None, 'A') => (cursor_up(t, n), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/terminal.emel:83:13 ]
+#     │
+#  83 │     (None, 'A') => (cursor_up(t, n), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/terminal.emel:83:14 ]
+#     │
+#  83 │     (None, 'A') => (cursor_up(t, n), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/vt/terminal.emel:84:12 ]
+#     │
+#  84 │     (None, 'B') | (None, 'e') => (cursor_down(t, n), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/terminal.emel:84:13 ]
+#     │
+#  84 │     (None, 'B') | (None, 'e') => (cursor_down(t, n), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/terminal.emel:84:13 ]
+#     │
+#  84 │     (None, 'B') | (None, 'e') => (cursor_down(t, n), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/terminal.emel:84:14 ]
+#     │
+#  84 │     (None, 'B') | (None, 'e') => (cursor_down(t, n), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/vt/terminal.emel:85:12 ]
+#     │
+#  85 │     (None, 'C') | (None, 'a') => (to_rel_col(t, n), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/terminal.emel:85:13 ]
+#     │
+#  85 │     (None, 'C') | (None, 'a') => (to_rel_col(t, n), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/terminal.emel:85:13 ]
+#     │
+#  85 │     (None, 'C') | (None, 'a') => (to_rel_col(t, n), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/terminal.emel:85:14 ]
+#     │
+#  85 │     (None, 'C') | (None, 'a') => (to_rel_col(t, n), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/vt/terminal.emel:86:12 ]
+#     │
+#  86 │     (None, 'D') => (to_rel_col(t, if t.col == t.cols { -n - 1 } else { -n }), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/terminal.emel:86:13 ]
+#     │
+#  86 │     (None, 'D') => (to_rel_col(t, if t.col == t.cols { -n - 1 } else { -n }), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/terminal.emel:86:13 ]
+#     │
+#  86 │     (None, 'D') => (to_rel_col(t, if t.col == t.cols { -n - 1 } else { -n }), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/terminal.emel:86:14 ]
+#     │
+#  86 │     (None, 'D') => (to_rel_col(t, if t.col == t.cols { -n - 1 } else { -n }), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/vt/terminal.emel:87:12 ]
+#     │
+#  87 │     (None, 'E') => (Terminal(..cursor_down(t, n), col: 0), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/terminal.emel:87:13 ]
+#     │
+#  87 │     (None, 'E') => (Terminal(..cursor_down(t, n), col: 0), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/terminal.emel:87:13 ]
+#     │
+#  87 │     (None, 'E') => (Terminal(..cursor_down(t, n), col: 0), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/terminal.emel:87:14 ]
+#     │
+#  87 │     (None, 'E') => (Terminal(..cursor_down(t, n), col: 0), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/vt/terminal.emel:88:12 ]
+#     │
+#  88 │     (None, 'F') => (Terminal(..cursor_up(t, n), col: 0), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/terminal.emel:88:13 ]
+#     │
+#  88 │     (None, 'F') => (Terminal(..cursor_up(t, n), col: 0), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/terminal.emel:88:13 ]
+#     │
+#  88 │     (None, 'F') => (Terminal(..cursor_up(t, n), col: 0), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/terminal.emel:88:14 ]
+#     │
+#  88 │     (None, 'F') => (Terminal(..cursor_up(t, n), col: 0), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/vt/terminal.emel:89:12 ]
+#     │
+#  89 │     (None, 'G') | (None, '`') => (to_col(t, n - 1), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/terminal.emel:89:13 ]
+#     │
+#  89 │     (None, 'G') | (None, '`') => (to_col(t, n - 1), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/terminal.emel:89:13 ]
+#     │
+#  89 │     (None, 'G') | (None, '`') => (to_col(t, n - 1), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/terminal.emel:89:14 ]
+#     │
+#  89 │     (None, 'G') | (None, '`') => (to_col(t, n - 1), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/vt/terminal.emel:90:12 ]
+#     │
+#  90 │     (None, 'H') | (None, 'f') => (to_row(to_col(t, count(ps, 1, 1) - 1), n - 1), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/terminal.emel:90:13 ]
+#     │
+#  90 │     (None, 'H') | (None, 'f') => (to_row(to_col(t, count(ps, 1, 1) - 1), n - 1), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/terminal.emel:90:13 ]
+#     │
+#  90 │     (None, 'H') | (None, 'f') => (to_row(to_col(t, count(ps, 1, 1) - 1), n - 1), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/terminal.emel:90:14 ]
+#     │
+#  90 │     (None, 'H') | (None, 'f') => (to_row(to_col(t, count(ps, 1, 1) - 1), n - 1), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/vt/terminal.emel:91:12 ]
+#     │
+#  91 │     (None, 'I') => (next_tab(t, n), [])
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/terminal.emel:91:13 ]
+#     │
+#  91 │     (None, 'I') => (next_tab(t, n), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/terminal.emel:91:13 ]
+#     │
+#  91 │     (None, 'I') => (next_tab(t, n), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/terminal.emel:91:14 ]
+#     │
+#  91 │     (None, 'I') => (next_tab(t, n), [])
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/vt/terminal.emel:92:12 ]
+#     │
+#  92 │     (None, 'J') => match arg(ps, 0) {
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/terminal.emel:92:13 ]
+#     │
+#  92 │     (None, 'J') => match arg(ps, 0) {
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/terminal.emel:92:13 ]
+#     │
+#  92 │     (None, 'J') => match arg(ps, 0) {
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/terminal.emel:92:14 ]
+#     │
+#  92 │     (None, 'J') => match arg(ps, 0) {
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/vt/terminal.emel:98:12 ]
+#     │
+#  98 │     (None, 'K') => match arg(ps, 0) {
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/terminal.emel:98:13 ]
+#     │
+#  98 │     (None, 'K') => match arg(ps, 0) {
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/terminal.emel:98:13 ]
+#     │
+#  98 │     (None, 'K') => match arg(ps, 0) {
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/terminal.emel:98:14 ]
+#     │
+#  98 │     (None, 'K') => match arg(ps, 0) {
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:104:12 ]
+#      │
+#  104 │     (None, 'L') => (insert_lines(t, n), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:104:13 ]
+#      │
+#  104 │     (None, 'L') => (insert_lines(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:104:13 ]
+#      │
+#  104 │     (None, 'L') => (insert_lines(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:104:14 ]
+#      │
+#  104 │     (None, 'L') => (insert_lines(t, n), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:105:12 ]
+#      │
+#  105 │     (None, 'M') => (delete_lines(t, n), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:105:13 ]
+#      │
+#  105 │     (None, 'M') => (delete_lines(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:105:13 ]
+#      │
+#  105 │     (None, 'M') => (delete_lines(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:105:14 ]
+#      │
+#  105 │     (None, 'M') => (delete_lines(t, n), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:106:12 ]
+#      │
+#  106 │     (None, 'P') => (dch(t, n), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:106:13 ]
+#      │
+#  106 │     (None, 'P') => (dch(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:106:13 ]
+#      │
+#  106 │     (None, 'P') => (dch(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:106:14 ]
+#      │
+#  106 │     (None, 'P') => (dch(t, n), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:107:12 ]
+#      │
+#  107 │     (None, 'S') => (scroll_up(t, n), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:107:13 ]
+#      │
+#  107 │     (None, 'S') => (scroll_up(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:107:13 ]
+#      │
+#  107 │     (None, 'S') => (scroll_up(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:107:14 ]
+#      │
+#  107 │     (None, 'S') => (scroll_up(t, n), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:108:12 ]
+#      │
+#  108 │     (None, 'T') => (scroll_down(t, n), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:108:13 ]
+#      │
+#  108 │     (None, 'T') => (scroll_down(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:108:13 ]
+#      │
+#  108 │     (None, 'T') => (scroll_down(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:108:14 ]
+#      │
+#  108 │     (None, 'T') => (scroll_down(t, n), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:109:12 ]
+#      │
+#  109 │     (None, 'W') => match arg(ps, 0) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:109:13 ]
+#      │
+#  109 │     (None, 'W') => match arg(ps, 0) {
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:109:13 ]
+#      │
+#  109 │     (None, 'W') => match arg(ps, 0) {
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:109:14 ]
+#      │
+#  109 │     (None, 'W') => match arg(ps, 0) {
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:115:12 ]
+#      │
+#  115 │     (None, 'X') => (erase(t, Erase.NextChars(n)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:115:13 ]
+#      │
+#  115 │     (None, 'X') => (erase(t, Erase.NextChars(n)), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:115:13 ]
+#      │
+#  115 │     (None, 'X') => (erase(t, Erase.NextChars(n)), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:115:14 ]
+#      │
+#  115 │     (None, 'X') => (erase(t, Erase.NextChars(n)), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:116:12 ]
+#      │
+#  116 │     (None, 'Z') => (prev_tab(t, n), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:116:13 ]
+#      │
+#  116 │     (None, 'Z') => (prev_tab(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:116:13 ]
+#      │
+#  116 │     (None, 'Z') => (prev_tab(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:116:14 ]
+#      │
+#  116 │     (None, 'Z') => (prev_tab(t, n), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:117:12 ]
+#      │
+#  117 │     (None, 'b') => (rep(t, n), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:117:13 ]
+#      │
+#  117 │     (None, 'b') => (rep(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:117:13 ]
+#      │
+#  117 │     (None, 'b') => (rep(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:117:14 ]
+#      │
+#  117 │     (None, 'b') => (rep(t, n), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:118:12 ]
+#      │
+#  118 │     (None, 'c') if arg(ps, 0) == 0 => (t, [DeviceAttributes])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:118:13 ]
+#      │
+#  118 │     (None, 'c') if arg(ps, 0) == 0 => (t, [DeviceAttributes])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:118:13 ]
+#      │
+#  118 │     (None, 'c') if arg(ps, 0) == 0 => (t, [DeviceAttributes])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:118:14 ]
+#      │
+#  118 │     (None, 'c') if arg(ps, 0) == 0 => (t, [DeviceAttributes])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:119:12 ]
+#      │
+#  119 │     (None, 'd') => (to_row(t, n - 1), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:119:13 ]
+#      │
+#  119 │     (None, 'd') => (to_row(t, n - 1), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:119:13 ]
+#      │
+#  119 │     (None, 'd') => (to_row(t, n - 1), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:119:14 ]
+#      │
+#  119 │     (None, 'd') => (to_row(t, n - 1), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:120:12 ]
+#      │
+#  120 │     (None, 'g') => match arg(ps, 0) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:120:13 ]
+#      │
+#  120 │     (None, 'g') => match arg(ps, 0) {
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:120:13 ]
+#      │
+#  120 │     (None, 'g') => match arg(ps, 0) {
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:120:14 ]
+#      │
+#  120 │     (None, 'g') => match arg(ps, 0) {
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:125:12 ]
+#      │
+#  125 │     (None, 'h') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), true)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:125:13 ]
+#      │
+#  125 │     (None, 'h') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), true)), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:125:13 ]
+#      │
+#  125 │     (None, 'h') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), true)), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:125:14 ]
+#      │
+#  125 │     (None, 'h') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), true)), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:126:12 ]
+#      │
+#  126 │     (None, 'l') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), false)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:126:13 ]
+#      │
+#  126 │     (None, 'l') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), false)), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:126:13 ]
+#      │
+#  126 │     (None, 'l') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), false)), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:126:14 ]
+#      │
+#  126 │     (None, 'l') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), false)), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:127:12 ]
+#      │
+#  127 │     (None, 'm') => (sgr(t, if ps == [] { [[0]] } else { ps }), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:127:13 ]
+#      │
+#  127 │     (None, 'm') => (sgr(t, if ps == [] { [[0]] } else { ps }), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:127:13 ]
+#      │
+#  127 │     (None, 'm') => (sgr(t, if ps == [] { [[0]] } else { ps }), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:127:14 ]
+#      │
+#  127 │     (None, 'm') => (sgr(t, if ps == [] { [[0]] } else { ps }), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:128:12 ]
+#      │
+#  128 │     (None, 'n') => match arg(ps, 0) {
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:128:13 ]
+#      │
+#  128 │     (None, 'n') => match arg(ps, 0) {
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:128:13 ]
+#      │
+#  128 │     (None, 'n') => match arg(ps, 0) {
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:128:14 ]
+#      │
+#  128 │     (None, 'n') => match arg(ps, 0) {
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:133:12 ]
+#      │
+#  133 │     (None, 'r') => (set_margins(t, count(ps, 0, 1) - 1, count(ps, 1, t.rows) - 1), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:133:13 ]
+#      │
+#  133 │     (None, 'r') => (set_margins(t, count(ps, 0, 1) - 1, count(ps, 1, t.rows) - 1), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:133:13 ]
+#      │
+#  133 │     (None, 'r') => (set_margins(t, count(ps, 0, 1) - 1, count(ps, 1, t.rows) - 1), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:133:14 ]
+#      │
+#  133 │     (None, 'r') => (set_margins(t, count(ps, 0, 1) - 1, count(ps, 1, t.rows) - 1), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:134:12 ]
+#      │
+#  134 │     (None, 's') => (save_cursor(t), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:134:13 ]
+#      │
+#  134 │     (None, 's') => (save_cursor(t), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:134:13 ]
+#      │
+#  134 │     (None, 's') => (save_cursor(t), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:134:14 ]
+#      │
+#  134 │     (None, 's') => (save_cursor(t), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:135:12 ]
+#      │
+#  135 │     (None, 'u') => (restore_cursor(t), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:135:13 ]
+#      │
+#  135 │     (None, 'u') => (restore_cursor(t), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:135:13 ]
+#      │
+#  135 │     (None, 'u') => (restore_cursor(t), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:135:14 ]
+#      │
+#  135 │     (None, 'u') => (restore_cursor(t), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:136:11 ]
+#      │
+#  136 │     (Some('!'), 'p') => (soft_reset(t), [])
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:136:12 ]
+#      │
+#  136 │     (Some('!'), 'p') => (soft_reset(t), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/vt/terminal.emel:136:12 ]
+#      │
+#  136 │     (Some('!'), 'p') => (soft_reset(t), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:136:12 ]
+#      │
+#  136 │     (Some('!'), 'p') => (soft_reset(t), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:136:12 ]
+#      │
+#  136 │     (Some('!'), 'p') => (soft_reset(t), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:136:13 ]
+#      │
+#  136 │     (Some('!'), 'p') => (soft_reset(t), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:136:14 ]
+#      │
+#  136 │     (Some('!'), 'p') => (soft_reset(t), [])
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:137:11 ]
+#      │
+#  137 │     (Some('?'), 'h') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), true)), [])
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:137:12 ]
+#      │
+#  137 │     (Some('?'), 'h') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), true)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/vt/terminal.emel:137:12 ]
+#      │
+#  137 │     (Some('?'), 'h') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), true)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:137:12 ]
+#      │
+#  137 │     (Some('?'), 'h') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), true)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:137:12 ]
+#      │
+#  137 │     (Some('?'), 'h') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), true)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:137:12 ]
+#      │
+#  137 │     (Some('?'), 'h') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), true)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:137:13 ]
+#      │
+#  137 │     (Some('?'), 'h') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), true)), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:138:11 ]
+#      │
+#  138 │     (Some('?'), 'l') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), false)), [])
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:138:12 ]
+#      │
+#  138 │     (Some('?'), 'l') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), false)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/vt/terminal.emel:138:12 ]
+#      │
+#  138 │     (Some('?'), 'l') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), false)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:138:12 ]
+#      │
+#  138 │     (Some('?'), 'l') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), false)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:138:12 ]
+#      │
+#  138 │     (Some('?'), 'l') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), false)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:138:12 ]
+#      │
+#  138 │     (Some('?'), 'l') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), false)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:138:13 ]
+#      │
+#  138 │     (Some('?'), 'l') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), false)), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:139:11 ]
+#      │
+#  139 │     (Some('>'), 'm') if arg(ps, 0) == 4 => (other_keys(t, ps.get(1)), [])
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:139:12 ]
+#      │
+#  139 │     (Some('>'), 'm') if arg(ps, 0) == 4 => (other_keys(t, ps.get(1)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/vt/terminal.emel:139:12 ]
+#      │
+#  139 │     (Some('>'), 'm') if arg(ps, 0) == 4 => (other_keys(t, ps.get(1)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:139:12 ]
+#      │
+#  139 │     (Some('>'), 'm') if arg(ps, 0) == 4 => (other_keys(t, ps.get(1)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:139:12 ]
+#      │
+#  139 │     (Some('>'), 'm') if arg(ps, 0) == 4 => (other_keys(t, ps.get(1)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:139:12 ]
+#      │
+#  139 │     (Some('>'), 'm') if arg(ps, 0) == 4 => (other_keys(t, ps.get(1)), [])
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:139:13 ]
+#      │
+#  139 │     (Some('>'), 'm') if arg(ps, 0) == 4 => (other_keys(t, ps.get(1)), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:140:7 ]
+#      │
+#  140 │     _ => (t, [])
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:140:7 ]
+#      │
+#  140 │     _ => (t, [])
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:140:7 ]
+#      │
+#  140 │     _ => (t, [])
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:146:3 ]
+#      │
+#  146 │   let level = match n.and_then(List.first) {
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/terminal.emel:146:7 ]
+#      │
+#  146 │   let level = match n.and_then(List.first) {
+#      │       ──┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/vt/terminal.emel:152:3 ]
+#      │
+#  152 │   match level {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:153:13 ]
+#      │
+#  153 │     Some(k) => Terminal(..t, modes: InputModes(..t.modes, other_keys: k))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:153:13 ]
+#      │
+#  153 │     Some(k) => Terminal(..t, modes: InputModes(..t.modes, other_keys: k))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:153:13 ]
+#      │
+#  153 │     Some(k) => Terminal(..t, modes: InputModes(..t.modes, other_keys: k))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:154:10 ]
+#      │
+#  154 │     None => t
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:154:10 ]
+#      │
+#  154 │     None => t
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:154:10 ]
+#      │
+#  154 │     None => t
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/vt/terminal.emel:159:3 ]
+#      │
+#  159 │   match (inter, f) {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:160:12 ]
+#      │
+#  160 │     (None, 'D') => execute(t, 0x84)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:160:13 ]
+#      │
+#  160 │     (None, 'D') => execute(t, 0x84)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:160:13 ]
+#      │
+#  160 │     (None, 'D') => execute(t, 0x84)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:160:14 ]
+#      │
+#  160 │     (None, 'D') => execute(t, 0x84)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:161:12 ]
+#      │
+#  161 │     (None, 'E') => execute(t, 0x85)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:161:13 ]
+#      │
+#  161 │     (None, 'E') => execute(t, 0x85)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:161:13 ]
+#      │
+#  161 │     (None, 'E') => execute(t, 0x85)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:161:14 ]
+#      │
+#  161 │     (None, 'E') => execute(t, 0x85)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:162:12 ]
+#      │
+#  162 │     (None, 'H') => execute(t, 0x88)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:162:13 ]
+#      │
+#  162 │     (None, 'H') => execute(t, 0x88)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:162:13 ]
+#      │
+#  162 │     (None, 'H') => execute(t, 0x88)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:162:14 ]
+#      │
+#  162 │     (None, 'H') => execute(t, 0x88)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:163:12 ]
+#      │
+#  163 │     (None, 'M') => execute(t, 0x8D)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:163:13 ]
+#      │
+#  163 │     (None, 'M') => execute(t, 0x8D)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:163:13 ]
+#      │
+#  163 │     (None, 'M') => execute(t, 0x8D)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:163:14 ]
+#      │
+#  163 │     (None, 'M') => execute(t, 0x8D)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:164:12 ]
+#      │
+#  164 │     (None, '7') => save_cursor(t)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:164:13 ]
+#      │
+#  164 │     (None, '7') => save_cursor(t)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:164:13 ]
+#      │
+#  164 │     (None, '7') => save_cursor(t)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:164:14 ]
+#      │
+#  164 │     (None, '7') => save_cursor(t)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:165:12 ]
+#      │
+#  165 │     (None, '8') => restore_cursor(t)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:165:13 ]
+#      │
+#  165 │     (None, '8') => restore_cursor(t)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:165:13 ]
+#      │
+#  165 │     (None, '8') => restore_cursor(t)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:165:14 ]
+#      │
+#  165 │     (None, '8') => restore_cursor(t)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:166:12 ]
+#      │
+#  166 │     (None, 'c') => terminal(t.cols, t.rows)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:166:13 ]
+#      │
+#  166 │     (None, 'c') => terminal(t.cols, t.rows)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:166:13 ]
+#      │
+#  166 │     (None, 'c') => terminal(t.cols, t.rows)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:166:14 ]
+#      │
+#  166 │     (None, 'c') => terminal(t.cols, t.rows)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/vt/terminal.emel:167:11 ]
+#      │
+#  167 │     (Some('#'), '8') => decaln(t)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:168:5 ]
+#      │
+#  168 │     (Some('('), '0') => Terminal(..t, g0: Drawing)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/vt/terminal.emel:168:5 ]
+#      │
+#  168 │     (Some('('), '0') => Terminal(..t, g0: Drawing)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:168:5 ]
+#      │
+#  168 │     (Some('('), '0') => Terminal(..t, g0: Drawing)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:168:5 ]
+#      │
+#  168 │     (Some('('), '0') => Terminal(..t, g0: Drawing)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:168:11 ]
+#      │
+#  168 │     (Some('('), '0') => Terminal(..t, g0: Drawing)
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:168:12 ]
+#      │
+#  168 │     (Some('('), '0') => Terminal(..t, g0: Drawing)
+#      │            ┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:168:13 ]
+#      │
+#  168 │     (Some('('), '0') => Terminal(..t, g0: Drawing)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:168:17 ]
+#      │
+#  168 │     (Some('('), '0') => Terminal(..t, g0: Drawing)
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/terminal.emel:168:18 ]
+#      │
+#  168 │     (Some('('), '0') => Terminal(..t, g0: Drawing)
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:168:18 ]
+#      │
+#  168 │     (Some('('), '0') => Terminal(..t, g0: Drawing)
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/vt/terminal.emel:177:3 ]
+#      │
+#  177 │   match c {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:178:10 ]
+#      │
+#  178 │     0x08 => to_rel_col(t, if t.col == t.cols { -2 } else { -1 })
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:178:10 ]
+#      │
+#  178 │     0x08 => to_rel_col(t, if t.col == t.cols { -2 } else { -1 })
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:178:10 ]
+#      │
+#  178 │     0x08 => to_rel_col(t, if t.col == t.cols { -2 } else { -1 })
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:179:10 ]
+#      │
+#  179 │     0x09 => next_tab(t, 1)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:179:10 ]
+#      │
+#  179 │     0x09 => next_tab(t, 1)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:179:10 ]
+#      │
+#  179 │     0x09 => next_tab(t, 1)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:180:10 ]
+#      │
+#  180 │     0x0A | 0x0B | 0x0C | 0x84 => linefeed(t)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:180:24 ]
+#      │
+#  180 │     0x0A | 0x0B | 0x0C | 0x84 => linefeed(t)
+#      │                        ┬  
+#      │                        ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:181:10 ]
+#      │
+#  181 │     0x0D => Terminal(..t, col: 0)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:181:10 ]
+#      │
+#  181 │     0x0D => Terminal(..t, col: 0)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:181:10 ]
+#      │
+#  181 │     0x0D => Terminal(..t, col: 0)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:182:10 ]
+#      │
+#  182 │     0x0E => Terminal(..t, shifted: true)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:182:10 ]
+#      │
+#  182 │     0x0E => Terminal(..t, shifted: true)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:182:10 ]
+#      │
+#  182 │     0x0E => Terminal(..t, shifted: true)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:183:10 ]
+#      │
+#  183 │     0x0F => Terminal(..t, shifted: false)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:183:10 ]
+#      │
+#  183 │     0x0F => Terminal(..t, shifted: false)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:183:10 ]
+#      │
+#  183 │     0x0F => Terminal(..t, shifted: false)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:184:10 ]
+#      │
+#  184 │     0x85 => Terminal(..down_with_scroll(t), col: 0)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:184:10 ]
+#      │
+#  184 │     0x85 => Terminal(..down_with_scroll(t), col: 0)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:184:10 ]
+#      │
+#  184 │     0x85 => Terminal(..down_with_scroll(t), col: 0)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:185:10 ]
+#      │
+#  185 │     0x88 => set_tab(t)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:185:10 ]
+#      │
+#  185 │     0x88 => set_tab(t)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:185:10 ]
+#      │
+#  185 │     0x88 => set_tab(t)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:186:10 ]
+#      │
+#  186 │     0x8D => reverse_index(t)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:186:10 ]
+#      │
+#  186 │     0x8D => reverse_index(t)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:186:10 ]
+#      │
+#  186 │     0x8D => reverse_index(t)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:187:7 ]
+#      │
+#  187 │     _ => t
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:187:7 ]
+#      │
+#  187 │     _ => t
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:187:7 ]
+#      │
+#  187 │     _ => t
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:192:3 ]
+#      │
+#  192 │   let p = t.pen
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/terminal.emel:192:7 ]
+#      │
+#  192 │   let p = t.pen
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/vt/terminal.emel:193:3 ]
+#      │
+#  193 │   match ps {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:194:8 ]
+#      │
+#  194 │     [] => t
+#      │        ┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:194:8 ]
+#      │
+#  194 │     [] => t
+#      │        ┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:194:8 ]
+#      │
+#  194 │     [] => t
+#      │        ┬  
+#      │        ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:195:19 ]
+#      │
+#  195 │     [[0], ..rest] => sgr(Terminal(..t, pen: DEFAULT_PEN), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:195:19 ]
+#      │
+#  195 │     [[0], ..rest] => sgr(Terminal(..t, pen: DEFAULT_PEN), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:195:19 ]
+#      │
+#  195 │     [[0], ..rest] => sgr(Terminal(..t, pen: DEFAULT_PEN), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:196:19 ]
+#      │
+#  196 │     [[1], ..rest] => sgr(Terminal(..t, pen: Pen(..p, intensity: Bold)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:196:19 ]
+#      │
+#  196 │     [[1], ..rest] => sgr(Terminal(..t, pen: Pen(..p, intensity: Bold)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:196:19 ]
+#      │
+#  196 │     [[1], ..rest] => sgr(Terminal(..t, pen: Pen(..p, intensity: Bold)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:197:19 ]
+#      │
+#  197 │     [[2], ..rest] => sgr(Terminal(..t, pen: Pen(..p, intensity: Faint)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:197:19 ]
+#      │
+#  197 │     [[2], ..rest] => sgr(Terminal(..t, pen: Pen(..p, intensity: Faint)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:197:19 ]
+#      │
+#  197 │     [[2], ..rest] => sgr(Terminal(..t, pen: Pen(..p, intensity: Faint)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:198:19 ]
+#      │
+#  198 │     [[3], ..rest] => sgr(Terminal(..t, pen: Pen(..p, italic: true)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:198:19 ]
+#      │
+#  198 │     [[3], ..rest] => sgr(Terminal(..t, pen: Pen(..p, italic: true)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:198:19 ]
+#      │
+#  198 │     [[3], ..rest] => sgr(Terminal(..t, pen: Pen(..p, italic: true)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:199:19 ]
+#      │
+#  199 │     [[4], ..rest] => sgr(Terminal(..t, pen: Pen(..p, underline: true)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:199:19 ]
+#      │
+#  199 │     [[4], ..rest] => sgr(Terminal(..t, pen: Pen(..p, underline: true)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:199:19 ]
+#      │
+#  199 │     [[4], ..rest] => sgr(Terminal(..t, pen: Pen(..p, underline: true)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:200:19 ]
+#      │
+#  200 │     [[5], ..rest] => sgr(Terminal(..t, pen: Pen(..p, blink: true)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:200:19 ]
+#      │
+#  200 │     [[5], ..rest] => sgr(Terminal(..t, pen: Pen(..p, blink: true)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:200:19 ]
+#      │
+#  200 │     [[5], ..rest] => sgr(Terminal(..t, pen: Pen(..p, blink: true)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:201:19 ]
+#      │
+#  201 │     [[7], ..rest] => sgr(Terminal(..t, pen: Pen(..p, inverse: true)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:201:19 ]
+#      │
+#  201 │     [[7], ..rest] => sgr(Terminal(..t, pen: Pen(..p, inverse: true)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:201:19 ]
+#      │
+#  201 │     [[7], ..rest] => sgr(Terminal(..t, pen: Pen(..p, inverse: true)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:202:19 ]
+#      │
+#  202 │     [[9], ..rest] => sgr(Terminal(..t, pen: Pen(..p, strikethrough: true)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:202:19 ]
+#      │
+#  202 │     [[9], ..rest] => sgr(Terminal(..t, pen: Pen(..p, strikethrough: true)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:202:19 ]
+#      │
+#  202 │     [[9], ..rest] => sgr(Terminal(..t, pen: Pen(..p, strikethrough: true)), rest)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:203:20 ]
+#      │
+#  203 │     [[21], ..rest] | [[22], ..rest] => sgr(Terminal(..t, pen: Pen(..p, intensity: Normal)), rest)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0110]: expected `|`
+#      ╭─[ src/vt/terminal.emel:203:37 ]
+#      │
+#  203 │     [[21], ..rest] | [[22], ..rest] => sgr(Terminal(..t, pen: Pen(..p, intensity: Normal)), rest)
+#      │                                     ┬  
+#      │                                     ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:203:37 ]
+#      │
+#  203 │     [[21], ..rest] | [[22], ..rest] => sgr(Terminal(..t, pen: Pen(..p, intensity: Normal)), rest)
+#      │                                     ┬  
+#      │                                     ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:203:37 ]
+#      │
+#  203 │     [[21], ..rest] | [[22], ..rest] => sgr(Terminal(..t, pen: Pen(..p, intensity: Normal)), rest)
+#      │                                     ┬  
+#      │                                     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:204:20 ]
+#      │
+#  204 │     [[23], ..rest] => sgr(Terminal(..t, pen: Pen(..p, italic: false)), rest)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:204:20 ]
+#      │
+#  204 │     [[23], ..rest] => sgr(Terminal(..t, pen: Pen(..p, italic: false)), rest)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:204:20 ]
+#      │
+#  204 │     [[23], ..rest] => sgr(Terminal(..t, pen: Pen(..p, italic: false)), rest)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:205:20 ]
+#      │
+#  205 │     [[24], ..rest] => sgr(Terminal(..t, pen: Pen(..p, underline: false)), rest)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:205:20 ]
+#      │
+#  205 │     [[24], ..rest] => sgr(Terminal(..t, pen: Pen(..p, underline: false)), rest)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:205:20 ]
+#      │
+#  205 │     [[24], ..rest] => sgr(Terminal(..t, pen: Pen(..p, underline: false)), rest)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:206:20 ]
+#      │
+#  206 │     [[25], ..rest] => sgr(Terminal(..t, pen: Pen(..p, blink: false)), rest)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:206:20 ]
+#      │
+#  206 │     [[25], ..rest] => sgr(Terminal(..t, pen: Pen(..p, blink: false)), rest)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:206:20 ]
+#      │
+#  206 │     [[25], ..rest] => sgr(Terminal(..t, pen: Pen(..p, blink: false)), rest)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:207:20 ]
+#      │
+#  207 │     [[27], ..rest] => sgr(Terminal(..t, pen: Pen(..p, inverse: false)), rest)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:207:20 ]
+#      │
+#  207 │     [[27], ..rest] => sgr(Terminal(..t, pen: Pen(..p, inverse: false)), rest)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:207:20 ]
+#      │
+#  207 │     [[27], ..rest] => sgr(Terminal(..t, pen: Pen(..p, inverse: false)), rest)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:208:20 ]
+#      │
+#  208 │     [[29], ..rest] => sgr(Terminal(..t, pen: Pen(..p, strikethrough: false)), rest)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:208:20 ]
+#      │
+#  208 │     [[29], ..rest] => sgr(Terminal(..t, pen: Pen(..p, strikethrough: false)), rest)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:208:20 ]
+#      │
+#  208 │     [[29], ..rest] => sgr(Terminal(..t, pen: Pen(..p, strikethrough: false)), rest)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:209:41 ]
+#      │
+#  209 │     [[n], ..rest] if 30 <= n && n <= 37 => sgr(fg(t, Indexed(n - 30)), rest)
+#      │                                         ┬  
+#      │                                         ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:209:41 ]
+#      │
+#  209 │     [[n], ..rest] if 30 <= n && n <= 37 => sgr(fg(t, Indexed(n - 30)), rest)
+#      │                                         ┬  
+#      │                                         ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:209:41 ]
+#      │
+#  209 │     [[n], ..rest] if 30 <= n && n <= 37 => sgr(fg(t, Indexed(n - 30)), rest)
+#      │                                         ┬  
+#      │                                         ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:210:32 ]
+#      │
+#  210 │     [[38, 2, r, g, b], ..rest] | [[38, 2, _, r, g, b], ..rest] => sgr(fg(t, rgb(r, g, b)), rest)
+#      │                                ┬  
+#      │                                ╰── 
+# ─────╯
+#
+# error[E0110]: expected `|`
+#      ╭─[ src/vt/terminal.emel:210:64 ]
+#      │
+#  210 │     [[38, 2, r, g, b], ..rest] | [[38, 2, _, r, g, b], ..rest] => sgr(fg(t, rgb(r, g, b)), rest)
+#      │                                                                ┬  
+#      │                                                                ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:210:64 ]
+#      │
+#  210 │     [[38, 2, r, g, b], ..rest] | [[38, 2, _, r, g, b], ..rest] => sgr(fg(t, rgb(r, g, b)), rest)
+#      │                                                                ┬  
+#      │                                                                ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:210:64 ]
+#      │
+#  210 │     [[38, 2, r, g, b], ..rest] | [[38, 2, _, r, g, b], ..rest] => sgr(fg(t, rgb(r, g, b)), rest)
+#      │                                                                ┬  
+#      │                                                                ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:211:26 ]
+#      │
+#  211 │     [[38, 5, i], ..rest] => sgr(fg(t, Indexed(i % 256)), rest)
+#      │                          ┬  
+#      │                          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:211:26 ]
+#      │
+#  211 │     [[38, 5, i], ..rest] => sgr(fg(t, Indexed(i % 256)), rest)
+#      │                          ┬  
+#      │                          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:211:26 ]
+#      │
+#  211 │     [[38, 5, i], ..rest] => sgr(fg(t, Indexed(i % 256)), rest)
+#      │                          ┬  
+#      │                          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:212:40 ]
+#      │
+#  212 │     [[38], [2], [r], [g], [b], ..rest] => sgr(fg(t, rgb(r, g, b)), rest)   # only the first part of r, g, b counts
+#      │                                        ┬  
+#      │                                        ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:212:40 ]
+#      │
+#  212 │     [[38], [2], [r], [g], [b], ..rest] => sgr(fg(t, rgb(r, g, b)), rest)   # only the first part of r, g, b counts
+#      │                                        ┬  
+#      │                                        ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:212:40 ]
+#      │
+#  212 │     [[38], [2], [r], [g], [b], ..rest] => sgr(fg(t, rgb(r, g, b)), rest)   # only the first part of r, g, b counts
+#      │                                        ┬  
+#      │                                        ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:213:25 ]
+#      │
+#  213 │     [[38], [2], ..rest] => sgr(t, rest)
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:213:25 ]
+#      │
+#  213 │     [[38], [2], ..rest] => sgr(t, rest)
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:213:25 ]
+#      │
+#  213 │     [[38], [2], ..rest] => sgr(t, rest)
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:214:30 ]
+#      │
+#  214 │     [[38], [5], [i], ..rest] => sgr(fg(t, Indexed(i % 256)), rest)
+#      │                              ┬  
+#      │                              ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:214:30 ]
+#      │
+#  214 │     [[38], [5], [i], ..rest] => sgr(fg(t, Indexed(i % 256)), rest)
+#      │                              ┬  
+#      │                              ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:214:30 ]
+#      │
+#  214 │     [[38], [5], [i], ..rest] => sgr(fg(t, Indexed(i % 256)), rest)
+#      │                              ┬  
+#      │                              ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:215:25 ]
+#      │
+#  215 │     [[38], [5], ..rest] => sgr(t, rest)
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:215:25 ]
+#      │
+#  215 │     [[38], [5], ..rest] => sgr(t, rest)
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:215:25 ]
+#      │
+#  215 │     [[38], [5], ..rest] => sgr(t, rest)
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:216:20 ]
+#      │
+#  216 │     [[39], ..rest] => sgr(Terminal(..t, pen: Pen(..p, foreground: None)), rest)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:216:20 ]
+#      │
+#  216 │     [[39], ..rest] => sgr(Terminal(..t, pen: Pen(..p, foreground: None)), rest)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:216:20 ]
+#      │
+#  216 │     [[39], ..rest] => sgr(Terminal(..t, pen: Pen(..p, foreground: None)), rest)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:218:17 ]
+#      │
+#  218 │     [_, ..rest] => sgr(t, rest)
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:218:17 ]
+#      │
+#  218 │     [_, ..rest] => sgr(t, rest)
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:218:17 ]
+#      │
+#  218 │     [_, ..rest] => sgr(t, rest)
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#      ╭─[ src/vt/terminal.emel:222:4 ]
+#      │
+#  222 │ fn rgb(r: Int, g: Int, b: Int) -> Color = Rgb(r % 256, g % 256, b % 256)
+#      │    ─┬─  
+#      │     ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline after declaration
+#      ╭─[ src/vt/terminal.emel:222:41 ]
+#      │
+#  222 │ fn rgb(r: Int, g: Int, b: Int) -> Color = Rgb(r % 256, g % 256, b % 256)
+#      │                                         ┬  
+#      │                                         ╰── 
+# ─────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#      ╭─[ src/vt/terminal.emel:224:4 ]
+#      │
+#  224 │ fn fg(t: Terminal, c: Color) -> Terminal = Terminal(..t, pen: Pen(..t.pen, foreground: Some(c)))
+#      │    ─┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline after declaration
+#      ╭─[ src/vt/terminal.emel:224:42 ]
+#      │
+#  224 │ fn fg(t: Terminal, c: Color) -> Terminal = Terminal(..t, pen: Pen(..t.pen, foreground: Some(c)))
+#      │                                          ┬  
+#      │                                          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:227:3 ]
+#      │
+#  227 │   let c = if (if t.shifted { t.g1 } else { t.g0 }) == Drawing { drawing(c) } else { c }
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/terminal.emel:227:7 ]
+#      │
+#  227 │   let c = if (if t.shifted { t.g1 } else { t.g0 }) == Drawing { drawing(c) } else { c }
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:228:3 ]
+#      │
+#  228 │   let s = if t.insert && t.col < t.cols { Screen.shift_right(t.screen, t.col, t.row, 1, t.pen) } else { t.screen }
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/terminal.emel:228:7 ]
+#      │
+#  228 │   let s = if t.insert && t.col < t.cols { Screen.shift_right(t.screen, t.col, t.row, 1, t.pen) } else { t.screen }
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:229:3 ]
+#      │
+#  229 │   let printed = if t.col < t.cols { Screen.print(s, t.col, t.row, c, t.pen) } else { (s, None) }
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/terminal.emel:229:7 ]
+#      │
+#  229 │   let printed = if t.col < t.cols { Screen.print(s, t.col, t.row, c, t.pen) } else { (s, None) }
+#      │       ───┬───  
+#      │          ╰───── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/vt/terminal.emel:230:3 ]
+#      │
+#  230 │   match printed {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:231:18 ]
+#      │
+#  231 │     (s, Some(w)) => {
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:231:18 ]
+#      │
+#  231 │     (s, Some(w)) => {
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:231:18 ]
+#      │
+#  231 │     (s, Some(w)) => {
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:235:30 ]
+#      │
+#  235 │     (s, None) if t.auto_wrap => wrap_and_print(Terminal(..t, screen: s), c)
+#      │                              ┬  
+#      │                              ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:235:30 ]
+#      │
+#  235 │     (s, None) if t.auto_wrap => wrap_and_print(Terminal(..t, screen: s), c)
+#      │                              ┬  
+#      │                              ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:235:30 ]
+#      │
+#  235 │     (s, None) if t.auto_wrap => wrap_and_print(Terminal(..t, screen: s), c)
+#      │                              ┬  
+#      │                              ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/terminal.emel:236:15 ]
+#      │
+#  236 │     (s, None) => print_at_line_end(Terminal(..t, screen: s), c)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/terminal.emel:236:15 ]
+#      │
+#  236 │     (s, None) => print_at_line_end(Terminal(..t, screen: s), c)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/terminal.emel:236:15 ]
+#      │
+#  236 │     (s, None) => print_at_line_end(Terminal(..t, screen: s), c)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#      ╭─[ src/vt/terminal.emel:242:4 ]
+#      │
+#  242 │ fn drawing(c: Char) -> Char = if 0x60 <= c && c <= 0x7E { DRAWING[c - 0x60] } else { c }
+#      │    ───┬───  
+#      │       ╰───── 
+# ─────╯
+#
+# error[E0122]: expected newline after declaration
+#      ╭─[ src/vt/terminal.emel:242:29 ]
+#      │
+#  242 │ fn drawing(c: Char) -> Char = if 0x60 <= c && c <= 0x7E { DRAWING[c - 0x60] } else { c }
+#      │                             ┬  
+#      │                             ╰── 
+# ─────╯
+#
+# error[E0211]: cannot find value `false` in this scope
+#     ╭─[ src/vt/terminal.emel:21:70 ]
+#     │
+#  21 │ const SAVED: Saved = Saved(col: 0, row: 0, pen: DEFAULT_PEN, origin: false, auto_wrap: true)
+#     │                                                                      ──┬──  
+#     │                                                                        ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `true` in this scope
+#     ╭─[ src/vt/terminal.emel:21:88 ]
+#     │
+#  21 │ const SAVED: Saved = Saved(col: 0, row: 0, pen: DEFAULT_PEN, origin: false, auto_wrap: true)
+#     │                                                                                        ──┬─  
+#     │                                                                                          ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `false` in this scope
+#     ╭─[ src/vt/terminal.emel:51:109 ]
+#     │
+#  51 │     screen: Screen.blank(cols, rows, DEFAULT_PEN), other: Screen.blank(cols, rows, DEFAULT_PEN), alternate: false,
+#     │                                                                                                             ──┬──  
+#     │                                                                                                               ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `true` in this scope
+#     ╭─[ src/vt/terminal.emel:52:30 ]
+#     │
+#  52 │     col: 0, row: 0, visible: true, pen: DEFAULT_PEN,
+#     │                              ──┬─  
+#     │                                ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `false` in this scope
+#     ╭─[ src/vt/terminal.emel:53:36 ]
+#     │
+#  53 │     g0: Ascii, g1: Ascii, shifted: false,
+#     │                                    ──┬──  
+#     │                                      ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `range` in this scope
+#     ╭─[ src/vt/terminal.emel:54:11 ]
+#     │
+#  54 │     tabs: range(8, cols, step: 8),
+#     │           ──┬──  
+#     │             ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `false` in this scope
+#     ╭─[ src/vt/terminal.emel:55:13 ]
+#     │
+#  55 │     insert: false, origin: false, auto_wrap: true,
+#     │             ──┬──  
+#     │               ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `false` in this scope
+#     ╭─[ src/vt/terminal.emel:55:28 ]
+#     │
+#  55 │     insert: false, origin: false, auto_wrap: true,
+#     │                            ──┬──  
+#     │                              ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `true` in this scope
+#     ╭─[ src/vt/terminal.emel:55:46 ]
+#     │
+#  55 │     insert: false, origin: false, auto_wrap: true,
+#     │                                              ──┬─  
+#     │                                                ╰─── 
+# ────╯
+#
+# error[E0334]: function `screen` has the same name as a field of `Terminal`
+#     ╭─[ src/vt/terminal.emel:62:8 ]
+#     │
+#  62 │ pub fn screen(t: Terminal) -> Screen = t.screen
+#     │        ───┬──  
+#     │           ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Char` in this scope
+#     ╭─[ src/vt/terminal.emel:79:56 ]
+#     │
+#  79 │ fn csi(t: Terminal, ps: List[List[Int]], inter: Option[Char], f: Char) -> (Terminal, List[Reply]) {
+#     │                                                        ──┬─  
+#     │                                                          ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find type `Char` in this scope
+#     ╭─[ src/vt/terminal.emel:79:66 ]
+#     │
+#  79 │ fn csi(t: Terminal, ps: List[List[Int]], inter: Option[Char], f: Char) -> (Terminal, List[Reply]) {
+#     │                                                                  ──┬─  
+#     │                                                                    ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `A` in this scope
+#     ╭─[ src/vt/terminal.emel:83:13 ]
+#     │
+#  83 │     (None, 'A') => (cursor_up(t, n), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `B` in this scope
+#     ╭─[ src/vt/terminal.emel:84:13 ]
+#     │
+#  84 │     (None, 'B') | (None, 'e') => (cursor_down(t, n), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `C` in this scope
+#     ╭─[ src/vt/terminal.emel:85:13 ]
+#     │
+#  85 │     (None, 'C') | (None, 'a') => (to_rel_col(t, n), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `D` in this scope
+#     ╭─[ src/vt/terminal.emel:86:13 ]
+#     │
+#  86 │     (None, 'D') => (to_rel_col(t, if t.col == t.cols { -n - 1 } else { -n }), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `E` in this scope
+#     ╭─[ src/vt/terminal.emel:87:13 ]
+#     │
+#  87 │     (None, 'E') => (Terminal(..cursor_down(t, n), col: 0), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `F` in this scope
+#     ╭─[ src/vt/terminal.emel:88:13 ]
+#     │
+#  88 │     (None, 'F') => (Terminal(..cursor_up(t, n), col: 0), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `G` in this scope
+#     ╭─[ src/vt/terminal.emel:89:13 ]
+#     │
+#  89 │     (None, 'G') | (None, '`') => (to_col(t, n - 1), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `H` in this scope
+#     ╭─[ src/vt/terminal.emel:90:13 ]
+#     │
+#  90 │     (None, 'H') | (None, 'f') => (to_row(to_col(t, count(ps, 1, 1) - 1), n - 1), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `I` in this scope
+#     ╭─[ src/vt/terminal.emel:91:13 ]
+#     │
+#  91 │     (None, 'I') => (next_tab(t, n), [])
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `J` in this scope
+#     ╭─[ src/vt/terminal.emel:92:13 ]
+#     │
+#  92 │     (None, 'J') => match arg(ps, 0) {
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `K` in this scope
+#     ╭─[ src/vt/terminal.emel:98:13 ]
+#     │
+#  98 │     (None, 'K') => match arg(ps, 0) {
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `L` in this scope
+#      ╭─[ src/vt/terminal.emel:104:13 ]
+#      │
+#  104 │     (None, 'L') => (insert_lines(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `M` in this scope
+#      ╭─[ src/vt/terminal.emel:105:13 ]
+#      │
+#  105 │     (None, 'M') => (delete_lines(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `P` in this scope
+#      ╭─[ src/vt/terminal.emel:106:13 ]
+#      │
+#  106 │     (None, 'P') => (dch(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `S` in this scope
+#      ╭─[ src/vt/terminal.emel:107:13 ]
+#      │
+#  107 │     (None, 'S') => (scroll_up(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `T` in this scope
+#      ╭─[ src/vt/terminal.emel:108:13 ]
+#      │
+#  108 │     (None, 'T') => (scroll_down(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `W` in this scope
+#      ╭─[ src/vt/terminal.emel:109:13 ]
+#      │
+#  109 │     (None, 'W') => match arg(ps, 0) {
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `X` in this scope
+#      ╭─[ src/vt/terminal.emel:115:13 ]
+#      │
+#  115 │     (None, 'X') => (erase(t, Erase.NextChars(n)), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `Z` in this scope
+#      ╭─[ src/vt/terminal.emel:116:13 ]
+#      │
+#  116 │     (None, 'Z') => (prev_tab(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `b` in this scope
+#      ╭─[ src/vt/terminal.emel:117:13 ]
+#      │
+#  117 │     (None, 'b') => (rep(t, n), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `c` in this scope
+#      ╭─[ src/vt/terminal.emel:118:13 ]
+#      │
+#  118 │     (None, 'c') if arg(ps, 0) == 0 => (t, [DeviceAttributes])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `d` in this scope
+#      ╭─[ src/vt/terminal.emel:119:13 ]
+#      │
+#  119 │     (None, 'd') => (to_row(t, n - 1), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `g` in this scope
+#      ╭─[ src/vt/terminal.emel:120:13 ]
+#      │
+#  120 │     (None, 'g') => match arg(ps, 0) {
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `h` in this scope
+#      ╭─[ src/vt/terminal.emel:125:13 ]
+#      │
+#  125 │     (None, 'h') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), true)), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `l` in this scope
+#      ╭─[ src/vt/terminal.emel:126:13 ]
+#      │
+#  126 │     (None, 'l') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), false)), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `m` in this scope
+#      ╭─[ src/vt/terminal.emel:127:13 ]
+#      │
+#  127 │     (None, 'm') => (sgr(t, if ps == [] { [[0]] } else { ps }), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `n` in this scope
+#      ╭─[ src/vt/terminal.emel:128:13 ]
+#      │
+#  128 │     (None, 'n') => match arg(ps, 0) {
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `r` in this scope
+#      ╭─[ src/vt/terminal.emel:133:13 ]
+#      │
+#  133 │     (None, 'r') => (set_margins(t, count(ps, 0, 1) - 1, count(ps, 1, t.rows) - 1), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `s` in this scope
+#      ╭─[ src/vt/terminal.emel:134:13 ]
+#      │
+#  134 │     (None, 's') => (save_cursor(t), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `ps`?
+#
+# error[E0211]: cannot find value `u` in this scope
+#      ╭─[ src/vt/terminal.emel:135:13 ]
+#      │
+#  135 │     (None, 'u') => (restore_cursor(t), [])
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `level` in this scope
+#      ╭─[ src/vt/terminal.emel:152:9 ]
+#      │
+#  152 │   match level {
+#      │         ──┬──  
+#      │           ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Char` in this scope
+#      ╭─[ src/vt/terminal.emel:158:35 ]
+#      │
+#  158 │ fn esc(t: Terminal, inter: Option[Char], f: Char) -> Terminal {
+#      │                                   ──┬─  
+#      │                                     ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Char` in this scope
+#      ╭─[ src/vt/terminal.emel:158:45 ]
+#      │
+#  158 │ fn esc(t: Terminal, inter: Option[Char], f: Char) -> Terminal {
+#      │                                             ──┬─  
+#      │                                               ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `D` in this scope
+#      ╭─[ src/vt/terminal.emel:160:13 ]
+#      │
+#  160 │     (None, 'D') => execute(t, 0x84)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `f`?
+#
+# error[E0211]: cannot find value `E` in this scope
+#      ╭─[ src/vt/terminal.emel:161:13 ]
+#      │
+#  161 │     (None, 'E') => execute(t, 0x85)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `f`?
+#
+# error[E0211]: cannot find value `H` in this scope
+#      ╭─[ src/vt/terminal.emel:162:13 ]
+#      │
+#  162 │     (None, 'H') => execute(t, 0x88)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `f`?
+#
+# error[E0211]: cannot find value `M` in this scope
+#      ╭─[ src/vt/terminal.emel:163:13 ]
+#      │
+#  163 │     (None, 'M') => execute(t, 0x8D)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `f`?
+#
+# error[E0211]: cannot find value `c` in this scope
+#      ╭─[ src/vt/terminal.emel:166:13 ]
+#      │
+#  166 │     (None, 'c') => terminal(t.cols, t.rows)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#    = help: did you mean `f`?
+#
+# error[E0211]: cannot find type `Char` in this scope
+#      ╭─[ src/vt/terminal.emel:226:26 ]
+#      │
+#  226 │ fn print(t: Terminal, c: Char) -> Terminal {
+#      │                          ──┬─  
+#      │                            ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `printed` in this scope
+#      ╭─[ src/vt/terminal.emel:230:9 ]
+#      │
+#  230 │   match printed {
+#      │         ───┬───  
+#      │            ╰───── 
+# ─────╯
+#    = help: did you mean `print`?
+#
+# error[E0211]: cannot find type `Char` in this scope
+#      ╭─[ src/vt/terminal.emel:242:15 ]
+#      │
+#  242 │ fn drawing(c: Char) -> Char = if 0x60 <= c && c <= 0x7E { DRAWING[c - 0x60] } else { c }
+#      │               ──┬─  
+#      │                 ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Char` in this scope
+#      ╭─[ src/vt/terminal.emel:242:24 ]
+#      │
+#  242 │ fn drawing(c: Char) -> Char = if 0x60 <= c && c <= 0x7E { DRAWING[c - 0x60] } else { c }
+#      │                        ──┬─  
+#      │                          ╰─── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?0)`
+#     ╭─[ src/vt/terminal.emel:82:5 ]
+#     │
+#  82 │     (None, '@') => (ich(t, n), [])
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?2)`
+#     ╭─[ src/vt/terminal.emel:83:5 ]
+#     │
+#  83 │     (None, 'A') => (cursor_up(t, n), [])
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/terminal.emel:83:5 ]
+#     │
+#  83 │     (None, 'A') => (cursor_up(t, n), [])
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?4)`
+#     ╭─[ src/vt/terminal.emel:84:5 ]
+#     │
+#  84 │     (None, 'B') | (None, 'e') => (cursor_down(t, n), [])
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/terminal.emel:84:5 ]
+#     │
+#  84 │     (None, 'B') | (None, 'e') => (cursor_down(t, n), [])
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?6)`
+#     ╭─[ src/vt/terminal.emel:85:5 ]
+#     │
+#  85 │     (None, 'C') | (None, 'a') => (to_rel_col(t, n), [])
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/terminal.emel:85:5 ]
+#     │
+#  85 │     (None, 'C') | (None, 'a') => (to_rel_col(t, n), [])
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?8)`
+#     ╭─[ src/vt/terminal.emel:86:5 ]
+#     │
+#  86 │     (None, 'D') => (to_rel_col(t, if t.col == t.cols { -n - 1 } else { -n }), [])
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/terminal.emel:86:5 ]
+#     │
+#  86 │     (None, 'D') => (to_rel_col(t, if t.col == t.cols { -n - 1 } else { -n }), [])
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?10)`
+#     ╭─[ src/vt/terminal.emel:87:5 ]
+#     │
+#  87 │     (None, 'E') => (Terminal(..cursor_down(t, n), col: 0), [])
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/terminal.emel:87:5 ]
+#     │
+#  87 │     (None, 'E') => (Terminal(..cursor_down(t, n), col: 0), [])
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?12)`
+#     ╭─[ src/vt/terminal.emel:88:5 ]
+#     │
+#  88 │     (None, 'F') => (Terminal(..cursor_up(t, n), col: 0), [])
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/terminal.emel:88:5 ]
+#     │
+#  88 │     (None, 'F') => (Terminal(..cursor_up(t, n), col: 0), [])
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?14)`
+#     ╭─[ src/vt/terminal.emel:89:5 ]
+#     │
+#  89 │     (None, 'G') | (None, '`') => (to_col(t, n - 1), [])
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/terminal.emel:89:5 ]
+#     │
+#  89 │     (None, 'G') | (None, '`') => (to_col(t, n - 1), [])
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?16)`
+#     ╭─[ src/vt/terminal.emel:90:5 ]
+#     │
+#  90 │     (None, 'H') | (None, 'f') => (to_row(to_col(t, count(ps, 1, 1) - 1), n - 1), [])
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/terminal.emel:90:5 ]
+#     │
+#  90 │     (None, 'H') | (None, 'f') => (to_row(to_col(t, count(ps, 1, 1) - 1), n - 1), [])
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?18)`
+#     ╭─[ src/vt/terminal.emel:91:5 ]
+#     │
+#  91 │     (None, 'I') => (next_tab(t, n), [])
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/terminal.emel:91:5 ]
+#     │
+#  91 │     (None, 'I') => (next_tab(t, n), [])
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?20)`
+#     ╭─[ src/vt/terminal.emel:92:5 ]
+#     │
+#  92 │     (None, 'J') => match arg(ps, 0) {
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/terminal.emel:92:5 ]
+#     │
+#  92 │     (None, 'J') => match arg(ps, 0) {
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?22)`
+#     ╭─[ src/vt/terminal.emel:98:5 ]
+#     │
+#  98 │     (None, 'K') => match arg(ps, 0) {
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/terminal.emel:98:5 ]
+#     │
+#  98 │     (None, 'K') => match arg(ps, 0) {
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?24)`
+#      ╭─[ src/vt/terminal.emel:104:5 ]
+#      │
+#  104 │     (None, 'L') => (insert_lines(t, n), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:104:5 ]
+#      │
+#  104 │     (None, 'L') => (insert_lines(t, n), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?26)`
+#      ╭─[ src/vt/terminal.emel:105:5 ]
+#      │
+#  105 │     (None, 'M') => (delete_lines(t, n), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:105:5 ]
+#      │
+#  105 │     (None, 'M') => (delete_lines(t, n), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?28)`
+#      ╭─[ src/vt/terminal.emel:106:5 ]
+#      │
+#  106 │     (None, 'P') => (dch(t, n), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:106:5 ]
+#      │
+#  106 │     (None, 'P') => (dch(t, n), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?30)`
+#      ╭─[ src/vt/terminal.emel:107:5 ]
+#      │
+#  107 │     (None, 'S') => (scroll_up(t, n), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:107:5 ]
+#      │
+#  107 │     (None, 'S') => (scroll_up(t, n), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?32)`
+#      ╭─[ src/vt/terminal.emel:108:5 ]
+#      │
+#  108 │     (None, 'T') => (scroll_down(t, n), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:108:5 ]
+#      │
+#  108 │     (None, 'T') => (scroll_down(t, n), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?34)`
+#      ╭─[ src/vt/terminal.emel:109:5 ]
+#      │
+#  109 │     (None, 'W') => match arg(ps, 0) {
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:109:5 ]
+#      │
+#  109 │     (None, 'W') => match arg(ps, 0) {
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?36)`
+#      ╭─[ src/vt/terminal.emel:115:5 ]
+#      │
+#  115 │     (None, 'X') => (erase(t, Erase.NextChars(n)), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:115:5 ]
+#      │
+#  115 │     (None, 'X') => (erase(t, Erase.NextChars(n)), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?38)`
+#      ╭─[ src/vt/terminal.emel:116:5 ]
+#      │
+#  116 │     (None, 'Z') => (prev_tab(t, n), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:116:5 ]
+#      │
+#  116 │     (None, 'Z') => (prev_tab(t, n), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?40)`
+#      ╭─[ src/vt/terminal.emel:117:5 ]
+#      │
+#  117 │     (None, 'b') => (rep(t, n), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:117:5 ]
+#      │
+#  117 │     (None, 'b') => (rep(t, n), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?42)`
+#      ╭─[ src/vt/terminal.emel:118:5 ]
+#      │
+#  118 │     (None, 'c') if arg(ps, 0) == 0 => (t, [DeviceAttributes])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:118:5 ]
+#      │
+#  118 │     (None, 'c') if arg(ps, 0) == 0 => (t, [DeviceAttributes])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?44)`
+#      ╭─[ src/vt/terminal.emel:119:5 ]
+#      │
+#  119 │     (None, 'd') => (to_row(t, n - 1), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:119:5 ]
+#      │
+#  119 │     (None, 'd') => (to_row(t, n - 1), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?46)`
+#      ╭─[ src/vt/terminal.emel:120:5 ]
+#      │
+#  120 │     (None, 'g') => match arg(ps, 0) {
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:120:5 ]
+#      │
+#  120 │     (None, 'g') => match arg(ps, 0) {
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?48)`
+#      ╭─[ src/vt/terminal.emel:125:5 ]
+#      │
+#  125 │     (None, 'h') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), true)), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:125:5 ]
+#      │
+#  125 │     (None, 'h') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), true)), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?50)`
+#      ╭─[ src/vt/terminal.emel:126:5 ]
+#      │
+#  126 │     (None, 'l') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), false)), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:126:5 ]
+#      │
+#  126 │     (None, 'l') => (ps.fold(t, fn(t, p) ansi_mode(t, p.first(), false)), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?52)`
+#      ╭─[ src/vt/terminal.emel:127:5 ]
+#      │
+#  127 │     (None, 'm') => (sgr(t, if ps == [] { [[0]] } else { ps }), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:127:5 ]
+#      │
+#  127 │     (None, 'm') => (sgr(t, if ps == [] { [[0]] } else { ps }), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?54)`
+#      ╭─[ src/vt/terminal.emel:128:5 ]
+#      │
+#  128 │     (None, 'n') => match arg(ps, 0) {
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:128:5 ]
+#      │
+#  128 │     (None, 'n') => match arg(ps, 0) {
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?56)`
+#      ╭─[ src/vt/terminal.emel:133:5 ]
+#      │
+#  133 │     (None, 'r') => (set_margins(t, count(ps, 0, 1) - 1, count(ps, 1, t.rows) - 1), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:133:5 ]
+#      │
+#  133 │     (None, 'r') => (set_margins(t, count(ps, 0, 1) - 1, count(ps, 1, t.rows) - 1), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?58)`
+#      ╭─[ src/vt/terminal.emel:134:5 ]
+#      │
+#  134 │     (None, 's') => (save_cursor(t), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:134:5 ]
+#      │
+#  134 │     (None, 's') => (save_cursor(t), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?60)`
+#      ╭─[ src/vt/terminal.emel:135:5 ]
+#      │
+#  135 │     (None, 'u') => (restore_cursor(t), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:135:5 ]
+#      │
+#  135 │     (None, 'u') => (restore_cursor(t), [])
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?62)`
+#      ╭─[ src/vt/terminal.emel:136:5 ]
+#      │
+#  136 │     (Some('!'), 'p') => (soft_reset(t), [])
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:136:5 ]
+#      │
+#  136 │     (Some('!'), 'p') => (soft_reset(t), [])
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/vt/terminal.emel:136:6 ]
+#      │
+#  136 │     (Some('!'), 'p') => (soft_reset(t), [])
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Terminal, List[Reply])`, found `Bool`
+#      ╭─[ src/vt/terminal.emel:136:12 ]
+#      │
+#  136 │     (Some('!'), 'p') => (soft_reset(t), [])
+#      │            ─┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?64)`
+#      ╭─[ src/vt/terminal.emel:137:5 ]
+#      │
+#  137 │     (Some('?'), 'h') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), true)), [])
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:137:5 ]
+#      │
+#  137 │     (Some('?'), 'h') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), true)), [])
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/vt/terminal.emel:137:6 ]
+#      │
+#  137 │     (Some('?'), 'h') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), true)), [])
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?66)`
+#      ╭─[ src/vt/terminal.emel:138:5 ]
+#      │
+#  138 │     (Some('?'), 'l') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), false)), [])
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:138:5 ]
+#      │
+#  138 │     (Some('?'), 'l') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), false)), [])
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/vt/terminal.emel:138:6 ]
+#      │
+#  138 │     (Some('?'), 'l') => (ps.fold(t, fn(t, p) dec_mode(t, p.first(), false)), [])
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?68)`
+#      ╭─[ src/vt/terminal.emel:139:5 ]
+#      │
+#  139 │     (Some('>'), 'm') if arg(ps, 0) == 4 => (other_keys(t, ps.get(1)), [])
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:139:5 ]
+#      │
+#  139 │     (Some('>'), 'm') if arg(ps, 0) == 4 => (other_keys(t, ps.get(1)), [])
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/vt/terminal.emel:139:6 ]
+#      │
+#  139 │     (Some('>'), 'm') if arg(ps, 0) == 4 => (other_keys(t, ps.get(1)), [])
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:140:5 ]
+#      │
+#  140 │     _ => (t, [])
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?0)`
+#      ╭─[ src/vt/terminal.emel:160:5 ]
+#      │
+#  160 │     (None, 'D') => execute(t, 0x84)
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?2)`
+#      ╭─[ src/vt/terminal.emel:161:5 ]
+#      │
+#  161 │     (None, 'E') => execute(t, 0x85)
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:161:5 ]
+#      │
+#  161 │     (None, 'E') => execute(t, 0x85)
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?4)`
+#      ╭─[ src/vt/terminal.emel:162:5 ]
+#      │
+#  162 │     (None, 'H') => execute(t, 0x88)
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:162:5 ]
+#      │
+#  162 │     (None, 'H') => execute(t, 0x88)
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?6)`
+#      ╭─[ src/vt/terminal.emel:163:5 ]
+#      │
+#  163 │     (None, 'M') => execute(t, 0x8D)
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:163:5 ]
+#      │
+#  163 │     (None, 'M') => execute(t, 0x8D)
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?8)`
+#      ╭─[ src/vt/terminal.emel:164:5 ]
+#      │
+#  164 │     (None, '7') => save_cursor(t)
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:164:5 ]
+#      │
+#  164 │     (None, '7') => save_cursor(t)
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `Terminal`, found `Int`
+#      ╭─[ src/vt/terminal.emel:164:13 ]
+#      │
+#  164 │     (None, '7') => save_cursor(t)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?11)`
+#      ╭─[ src/vt/terminal.emel:165:5 ]
+#      │
+#  165 │     (None, '8') => restore_cursor(t)
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:165:5 ]
+#      │
+#  165 │     (None, '8') => restore_cursor(t)
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `Terminal`, found `Int`
+#      ╭─[ src/vt/terminal.emel:165:13 ]
+#      │
+#  165 │     (None, '8') => restore_cursor(t)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?14)`
+#      ╭─[ src/vt/terminal.emel:166:5 ]
+#      │
+#  166 │     (None, 'c') => terminal(t.cols, t.rows)
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:166:5 ]
+#      │
+#  166 │     (None, 'c') => terminal(t.cols, t.rows)
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Option[{unknown}], {unknown})`, found `(?16)`
+#      ╭─[ src/vt/terminal.emel:167:5 ]
+#      │
+#  167 │     (Some('#'), '8') => decaln(t)
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/terminal.emel:167:5 ]
+#      │
+#  167 │     (Some('#'), '8') => decaln(t)
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0309]: pattern `Some` has 1 fields, found 0
+#      ╭─[ src/vt/terminal.emel:167:6 ]
+#      │
+#  167 │     (Some('#'), '8') => decaln(t)
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `Terminal`, found `(?19)`
+#      ╭─[ src/vt/terminal.emel:168:5 ]
+#      │
+#  168 │     (Some('('), '0') => Terminal(..t, g0: Drawing)
+#      │     ──────┬──────  
+#      │           ╰──────── 
+# ─────╯
+#
+# error[E0305]: wrong number of arguments: `Some` takes 1, found 0
+#      ╭─[ src/vt/terminal.emel:168:6 ]
+#      │
+#  168 │     (Some('('), '0') => Terminal(..t, g0: Drawing)
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `fn() -> ?19`, found `Option[?18]`
+#      ╭─[ src/vt/terminal.emel:168:6 ]
+#      │
+#  168 │     (Some('('), '0') => Terminal(..t, g0: Drawing)
+#      │      ───┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `Terminal`, found `fn(Int) -> Int`
+#      ╭─[ src/vt/terminal.emel:180:10 ]
+#      │
+#  180 │     0x0A | 0x0B | 0x0C | 0x84 => linefeed(t)
+#      │          ──────┬──────  
+#      │                ╰──────── 
+# ─────╯
+#
+# error[E0317]: refutable pattern in binding: pattern `_` not covered
+#      ╭─[ src/vt/terminal.emel:180:12 ]
+#      │
+#  180 │     0x0A | 0x0B | 0x0C | 0x84 => linefeed(t)
+#      │            ──┬─  
+#      │              ╰─── 
+# ─────╯
+#    = help: use `match` to handle the other cases
+#
+# error[E0301]: type mismatch: expected `Terminal`, found `fn(List[List[Int]]) -> {unknown}`
+#      ╭─[ src/vt/terminal.emel:203:20 ]
+#      │
+#  203 │     [[21], ..rest] | [[22], ..rest] => sgr(Terminal(..t, pen: Pen(..p, intensity: Normal)), rest)
+#      │                    ────────┬───────  
+#      │                            ╰───────── 
+# ─────╯
+#
+# error[E0317]: refutable pattern in binding: patterns `[[_], ..]`, `[[], ..]`, `[[_, _, ..], ..]` and 1 more not covered
+#      ╭─[ src/vt/terminal.emel:203:22 ]
+#      │
+#  203 │     [[21], ..rest] | [[22], ..rest] => sgr(Terminal(..t, pen: Pen(..p, intensity: Normal)), rest)
+#      │                      ───────┬──────  
+#      │                             ╰──────── 
+# ─────╯
+#    = help: use `match` to handle the other cases
+#
+# error[E0301]: type mismatch: expected `Terminal`, found `fn(List[List[Int]]) -> {unknown}`
+#      ╭─[ src/vt/terminal.emel:210:32 ]
+#      │
+#  210 │     [[38, 2, r, g, b], ..rest] | [[38, 2, _, r, g, b], ..rest] => sgr(fg(t, rgb(r, g, b)), rest)
+#      │                                ───────────────┬───────────────  
+#      │                                               ╰───────────────── 
+# ─────╯
+#
+# error[E0317]: refutable pattern in binding: patterns `[[38, _, _, _, _, _], ..]`, `[[_, _, _, _, _, _], ..]`, `[[], ..]` and 7 more not covered
+#      ╭─[ src/vt/terminal.emel:210:34 ]
+#      │
+#  210 │     [[38, 2, r, g, b], ..rest] | [[38, 2, _, r, g, b], ..rest] => sgr(fg(t, rgb(r, g, b)), rest)
+#      │                                  ──────────────┬──────────────  
+#      │                                                ╰──────────────── 
+# ─────╯
+#    = help: use `match` to handle the other cases
+#
+# 590 errors, 43 warnings
+# --- end wish check ---
