@@ -1,0 +1,77 @@
+# A handler of Driver for the tests of run_tape: it records the calls it gets, in order, and can
+# make one of them fail.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
+
+import Key.{Key}
+import Key.Encode.{Unencodable}
+import Recorder.{Driver, ProcessExited, WaitTimeout}
+import Std.State.{State}
+
+## A call of Driver, with the durations in milliseconds. `WaitFor` holds the pattern as the tape
+## wrote it.
+pub enum Call {
+  Press(Key)
+  Idle(Int64)
+  WaitFor(String, Int64)
+} derive Eq, Show
+
+## An error that a call of Driver fails with.
+pub enum Fault {
+  Exits(ProcessExited)
+  TimesOut(WaitTimeout)
+  CannotEncode(Unencodable)
+}
+
+## `with TestDriver(fault) { ... }` appends every call to `State[List[Call]]` and resumes at once.
+## With `Some((k, f))`, the call number `k` (from 0, every call counted) fails with `f` instead,
+## after it is recorded. A fault that the operation cannot fail with is a defect.
+pub handler TestDriver(fault: Option[(Int, Fault)]): Driver {
+  init(fault: Option[(Int, Fault)]) {
+    TestDriver(fault:)
+  }
+
+  suspend fn press(key, resume) {
+    fault_at(self.fault, record(Press(key))) match {
+      Some(Exits(e))        -> fail e
+      Some(CannotEncode(e)) -> fail e
+      Some(TimesOut(_))     -> panic("press cannot time out")
+      None                  -> resume(())
+    }
+  }
+
+  suspend fn idle(d, resume) {
+    fault_at(self.fault, record(Idle(d.to_milliseconds()))) match {
+      Some(Exits(e))        -> fail e
+      Some(TimesOut(_))     -> panic("idle cannot time out")
+      Some(CannotEncode(_)) -> panic("idle sends no key")
+      None                  -> resume(())
+    }
+  }
+
+  suspend fn wait_for(pattern, source, timeout, resume) {
+    fault_at(self.fault, record(WaitFor(source, timeout.to_milliseconds()))) match {
+      Some(Exits(e))        -> fail e
+      Some(TimesOut(e))     -> fail e
+      Some(CannotEncode(_)) -> panic("wait_for sends no key")
+      None                  -> resume(())
+    }
+  }
+}
+
+# Appends `call` to the calls so far, and gives its number (from 0).
+fn record(call: Call) -> Int uses { State[List[Call]] } {
+  calls = use State[List[Call]]
+  before = calls.get()
+  calls.set(before.append([call]))
+  before.length()
+}
+
+# The fault of call number `k`, if `fault` makes it fail.
+fn fault_at(fault: Option[(Int, Fault)], k: Int) -> Option[Fault] {
+  fault match {
+    Some((at, f)) if at == k -> Some(f)
+    _                        -> None
+  }
+}

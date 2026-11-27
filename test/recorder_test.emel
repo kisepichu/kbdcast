@@ -1,0 +1,90 @@
+import Key.{Key}
+import Key.Encode.{Unencodable, NeedsKitty}
+import Key.Notation
+import Key.Notation.{NotationError}
+import Recorder.{Reason, RecordError, CannotSend, Exited, TimedOut, ProcessExited, WaitTimeout}
+import Std.Duration.{Duration}
+import Std.State.{State}
+import Tape.{TapeError}
+import TestDriver.{TestDriver, Call, Press, Idle, WaitFor, Fault, Exits, TimesOut, CannotEncode}
+
+# The calls that run_tape makes for the tape `source`, under a TestDriver with `fault`.
+fn calls(source: String, fault: Option[(Int, Fault)]) -> List[Call] fails TapeError | RecordError {
+  tape = Tape.parse(source)
+  (_, calls) = State.run([], || with TestDriver(fault) { Recorder.run_tape(tape) })
+  calls
+}
+
+# The line and the reason of the RecordError that run_tape fails with for the tape `source` when
+# the call number `at` fails with `fault`, or None if it does not fail.
+fn failure(source: String, at: Int, fault: Fault) -> Option[(Int, Reason)] fails TapeError {
+  {
+    calls(source, Some((at, fault)))
+    None
+  } escape {
+    RecordError(line:, reason:) -> Some((line, reason))
+  }
+}
+
+# The one key that `notation` writes.
+fn key(notation: String) -> Key fails NotationError {
+  Notation.parse(notation) match {
+    [k] -> k
+    _   -> panic("not one key: #{notation}")
+  }
+}
+
+fn press(notation: String) -> Call fails NotationError {
+  Press(key(notation))
+}
+
+@test
+fn run_tape_presses_each_key_and_idles_for_the_typing_after_it() {
+  assert calls("set typing 100ms\nrun app\nwait /ready\n> ab\nsleep 1s", None)
+    == [WaitFor("ready", 10000), press("a"), Idle(100), press("b"), Idle(100), Idle(1000)]
+}
+
+@test
+fn set_lines_change_the_typing_and_the_timeout_of_the_steps_after_them() {
+  assert calls("run app\n> a\nset typing 7ms\n> b\nset timeout 2s\nwait /x", None)
+    == [press("a"), Idle(50), press("b"), Idle(7), WaitFor("x", 2000)]
+}
+
+@test
+fn a_tape_without_steps_makes_no_call() {
+  assert calls("run app", None) == []
+}
+
+@test
+fn a_wait_that_times_out_fails_with_its_line_the_pattern_the_timeout_and_the_screen() {
+  assert failure("run app\nwait /ready\n> a", 0, TimesOut(WaitTimeout(screen: "screen")))
+    == Some((2, TimedOut("ready", Duration.seconds(10), "screen")))
+}
+
+@test
+fn a_key_that_cannot_be_sent_fails_with_its_line() {
+  unencodable = Unencodable(key: key("<D-a>"), reason: NeedsKitty)
+  assert failure("run app\n> <D-a>", 0, CannotEncode(unencodable))
+    == Some((2, CannotSend(unencodable)))
+}
+
+@test
+fn an_exit_before_the_last_step_fails_with_the_line_of_the_step() {
+  assert failure("run app\nsleep 1s\n> q", 0, Exits(ProcessExited(code: 3))) == Some((2, Exited(3)))
+}
+
+@test
+fn an_exit_in_the_last_step_ends_the_recording() {
+  assert failure("run app\nsleep 1s\n> :q<CR>", 6, Exits(ProcessExited(code: 0))) == None
+}
+
+@test
+fn an_exit_in_a_wait_fails_even_in_the_last_step() {
+  assert failure("run app\n> :q<CR>\nwait /bye", 6, Exits(ProcessExited(code: 0)))
+    == Some((3, Exited(0)))
+}
+
+@test
+fn an_exit_in_the_last_step_sends_none_of_the_keys_left() {
+  assert calls("run app\n> ab", Some((1, Exits(ProcessExited(code: 0))))) == [press("a"), Idle(50)]
+}

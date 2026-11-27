@@ -1,0 +1,107 @@
+# What a tape means (spec §6): the steps of a tape as calls of the domain port Driver. How a
+# terminal carries them out is the handler's business (LiveDriver records a cast; the tests use
+# TestDriver).
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
+
+import Key.{Key}
+import Key.Encode.{Unencodable}
+import Regex.{Regex}
+import Std.Duration.{Duration}
+import Tape.{Tape, Step, Keys, Sleep, Wait, SetTyping, SetTimeout}
+
+## A terminal that a tape drives, with an application running on it.
+pub effect Driver {
+  ## Sends `key` to the application. Fails with Unencodable if the terminal cannot send it in the
+  ## modes the application has set.
+  suspend fn press(key: Key) -> () fails Unencodable | ProcessExited
+  ## Lets `d` pass, reading what the application writes meanwhile.
+  suspend fn idle(d: Duration) -> () fails ProcessExited
+  ## Waits until the screen matches `pattern`, for at most `timeout`. `source` is the pattern as the
+  ## tape wrote it.
+  # FRICTION(069): a Regex cannot give back the pattern it was compiled from, so its source comes
+  # along with it.
+  suspend fn wait_for(pattern: Regex, source: String, timeout: Duration) -> ()
+    fails WaitTimeout | ProcessExited
+}
+
+## The application has exited with `code`; no operation can reach it any more.
+pub error ProcessExited(code: Int) derive Eq, Show
+
+## The screen did not match the pattern in time. `screen` is the text of the screen then.
+pub error WaitTimeout(screen: String) derive Eq, Show
+
+## Why a step of a tape failed.
+pub enum Reason {
+  ## The key cannot be sent in the modes the application has set.
+  CannotSend(Unencodable)
+  ## The application exited with this code before the tape ended.
+  Exited(Int)
+  ## The screen did not match the pattern (as the tape wrote it) within the timeout. The last
+  ## String is the text of the screen then.
+  TimedOut(String, Duration, String)
+} derive Eq, Show
+
+## The step on line `line` of the tape failed for `reason`.
+pub error RecordError(line: Int, reason: Reason) derive Eq, Show
+
+## Carries out the steps of `tape` in order. `Keys` presses each key and lets the typing pass after
+## it, `Sleep` lets its duration pass, and `Wait` waits for its pattern for the timeout; `set typing`
+## and `set timeout` change them for the steps after. An exit of the application in the middle of
+## the last step ends the recording (`> :wq<CR>`), unless that step is a `Wait`; anywhere else it
+## fails.
+pub fn run_tape(tape: Tape) -> () fails RecordError uses { Driver } {
+  run_steps(tape.steps, tape.typing, tape.timeout)
+}
+
+fn run_steps(steps: List[Step], typing: Duration, timeout: Duration) -> ()
+  fails RecordError
+  uses { Driver } {
+  driver = use Driver
+  steps match {
+    [] -> ()
+    [step, ..rest] -> {
+      last = rest.is_empty()
+      step match {
+        SetTyping(_, d)  -> run_steps(rest, d, timeout)
+        SetTimeout(_, d) -> run_steps(rest, typing, d)
+        Keys(line, keys) -> {
+          keys.each(|key| {
+            driver.press(key)
+            driver.idle(typing)
+          }) escape {
+            # FRICTION(070): an escape arm cannot bind the error itself, so the Unencodable is
+            # built again from its fields.
+            Unencodable(key:, reason:) -> fail RecordError(
+              line,
+              CannotSend(Unencodable(key:, reason:)),
+            )
+            ProcessExited(code) -> exited(line, code, last)
+          }
+          run_steps(rest, typing, timeout)
+        }
+        Sleep(line, d) -> {
+          driver.idle(d) escape {
+            ProcessExited(code) -> exited(line, code, last)
+          }
+          run_steps(rest, typing, timeout)
+        }
+        Wait(line, pattern, source) -> {
+          # An exit while waiting fails even in the last step: the screen never matched.
+          driver.wait_for(pattern, source, timeout) escape {
+            WaitTimeout(screen) -> fail RecordError(line, TimedOut(source, timeout, screen))
+            ProcessExited(code) -> fail RecordError(line, Exited(code))
+          }
+          run_steps(rest, typing, timeout)
+        }
+      }
+    }
+  }
+}
+
+# An exit with `code` in the middle of the step on line `line`: the end of the recording if the
+# step is the last one, and a failure if it is not.
+fn exited(line: Int, code: Int, last: Bool) -> () fails RecordError {
+  if last { () } else { fail RecordError(line, Exited(code)) }
+}
