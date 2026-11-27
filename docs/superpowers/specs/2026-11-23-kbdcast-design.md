@@ -128,7 +128,7 @@ sleep 1s
 
 ### 時間の扱い
 
-- 時間は書いた所だけで流れる。行と行の間には何も足さない。
+- 時間は書いた所だけで流れる。行と行の間には何も足さない。cast の時刻もこの tape の時間で刻む。`wait` の間は進まず、`sleep` と `typing` の間だけ進む（1 の spec §2）。
 - `>` の行: キーを 1 つずつ、その時点の端末のモードで bytes にし、1 キーを 1 つの `i` イベントとして送る。送るたびに `typing` の分だけ待つ。待っている間も出力は読み続ける。
 - `sleep`: 指定した時間、出力を読み続ける。
 - `wait`: パターンが画面に現れた時点で次に進む。`timeout` を過ぎたら失敗し、行番号、パターン、その時点の画面を出す。
@@ -194,7 +194,7 @@ flowchart LR
 | 不正な状態を表現できなくする | Bool を並べずに enum を使う（`CursorKeys = Normal \| Application`）。値に範囲があるもの（F キーの番号の `FKey`）は、opaque な型と検査付きの構築関数で作る |
 | エラーは型で表す | 想定内の失敗は `fails` で返し、tape の行番号を持たせる。バグは defect にする |
 | 純粋な core | VT、key codec、overlay は純粋な関数の fold として書き、effect を付けない |
-| effect は 2 つの層の port | host の port（`Pty`、`Clock`、`CastSink`）と、ドメインの port（`Driver`）。handler が adapter、layer が「本番用」「テスト用」の組み合わせ |
+| effect は 2 つの層の port | host の port（`Pty`、`Clock`、`Stdout`）と、ドメインの port（`Driver`）。handler が adapter、layer が「本番用」「テスト用」の組み合わせ |
 
 opaque な型と構築関数の Emela での書き方は、R の段階で spec を見て確かめる。
 
@@ -237,11 +237,11 @@ encoder は kitty keyboard protocol を扱わない（2 の spec §2。WezTerm �
 flowchart TB
   run[run_tape: tape が何を意味するか] -->|uses Driver| drv
   subgraph live[本番用の layer]
-    drv[LiveDriver handler<br/>状態: Terminal、開始時刻] -->|uses| ports[Pty / Clock / CastSink]
-    ports --> impl[BunPty / SystemClock / StdoutSink]
+    drv[LiveDriver handler<br/>状態: Terminal、tape の時間] -->|uses| ports[Pty / Clock / Stdout]
+    ports --> impl[BunPty / SystemClock / SystemStdout]
   end
   run -.テスト.-> td[TestDriver: 呼ばれた操作を記録]
-  drv -.テスト.-> fake[FakePty + TestClock + TestSink]
+  drv -.テスト.-> fake[FakePty + TestClock + TestStdout]
 ```
 
 - `run_tape` は「tape が何を意味するか」だけを書いた普段のレベルのコードで、`use Driver` しか使わない。
@@ -414,3 +414,4 @@ flowchart LR
 | VT の意味論 | avt 0.18.0（agg 1.9.0）と同じ画面を作る。入力は文字列 | xterm の ctlseqs を正にする（agg が元の cast を描いたときと食い違いうる）、Bytes を受ける（cast の `o` は文字列） |
 | key codec の encode | WezTerm の既定（普通のキー、DECCKM、LNM、modifyOtherKeys）を真似る。今の mode で表せないキーは `Unencodable` | kitty も扱う（flags の扱いが増え、golden に WezTerm の設定の変更が要る）、表せないキーは修飾を落として送る（書いた意図が黙って失われる） |
 | key codec の正解 | termwiz を Rust の harness から呼んで生成した表 | WezTerm で手で打って録る（ConPTY を通り、組み合わせを打ち切れない） |
+| cast の時刻 | tape の時間（`wait` の間は進めない） | 実際の時刻（`wait` やアプリの起動にかかった時間が入り、同じ tape でも GIF の時間が毎回変わる） |
