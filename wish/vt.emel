@@ -1,0 +1,496 @@
+# wish-target: src/vt.emel
+
+## 端末の出力を読んで画面を作る VT の公開 API。
+## recorder は PTY の出力を `feed` して返事を PTY に返し、wait は `text` を見て、
+## overlay は `lines` と `cursor` を描く。
+module Vt
+
+import Vt.Parser
+import Vt.Screen
+import Vt.Screen.{Cell, WideTail}
+import Vt.Terminal.{Reply, DeviceAttributes, Status, CursorPosition}
+import Key.Encode.InputModes
+
+# 使う側が Vt.Terminal と Vt.Screen を知らなくて済むように再公開したい
+pub use Vt.Terminal.Reply
+pub use Vt.Screen.Cell
+
+pub opaque type Terminal(parser: Parser.Parser, term: Vt.Terminal.Terminal)
+
+## cols 列 rows 行の端末。1 未満は defect。
+pub fn new(cols: Int, rows: Int) -> Terminal {
+  Terminal(parser: Parser.parser(), term: Vt.Terminal.terminal(cols, rows))
+}
+
+## 出力 s を読む。問い合わせへの返事を順に返す。
+pub fn feed(t: Terminal, s: String) -> (Terminal, List[Reply]) {
+  let (parser, actions) = Parser.advance(t.parser, s)
+  let (term, replies) = actions.fold((t.term, []), fn((term, replies), a) {
+    let (term, more) = Vt.Terminal.apply(term, a)
+    (term, replies ++ more)
+  })
+  (Terminal(parser: parser, term: term), replies)
+}
+
+## 返事を PTY に書く bytes にする。
+pub fn reply_bytes(r: Reply) -> Bytes {
+  match r {
+    DeviceAttributes => Bytes.from_string("\e[?62;22c")
+    Status => Bytes.from_string("\e[0n")
+    CursorPosition(row, col) => Bytes.from_string("\e[${row};${col}R")
+  }
+}
+
+## 列と行。
+pub fn size(t: Terminal) -> (Int, Int) {
+  let s = Vt.Terminal.screen(t.term)
+  (Screen.cols(s), Screen.rows(s))
+}
+
+## 見えている画面の各行のセル。
+pub fn lines(t: Terminal) -> List[List[Cell]] {
+  Screen.lines(Vt.Terminal.screen(t.term))
+}
+
+## 列と行。見えないときは None。
+pub fn cursor(t: Terminal) -> Option[(Int, Int)] {
+  let (col, row, visible) = Vt.Terminal.cursor(t.term)
+  if visible { Some((col, row)) } else { None }
+}
+
+## 各行の文字をつなぎ、行の末尾の空白を除き、行を改行でつなぐ。
+## 全角の右のセルは飛ばす。折り返した行はつながない。
+pub fn text(t: Terminal) -> String {
+  lines(t)
+    .map(fn(line) {
+      line
+        .filter(fn(c) { c.occupancy != WideTail })
+        .map(fn(c) { String.from_code_point(c.char) })
+        .join("")
+        .trim_end()
+    })
+    .join("\n")
+}
+
+pub fn input_modes(t: Terminal) -> InputModes {
+  Vt.Terminal.input_modes(t.term)
+}
+
+# 使う側（recorder）の形:
+#
+#   let (vt, replies) = Vt.feed(vt, output)
+#   replies.each(fn(r) { Pty.write(pty, Vt.reply_bytes(r)) })
+#   if Vt.text(vt).contains("$ ") { ... }
+#
+# overlay の形:
+#
+#   Vt.lines(vt).each_with_index(fn(line, row) { ... })
+#   match Vt.cursor(vt) { Some((col, row)) => ..., None => () }
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0107]: unknown escape sequence `\e`
+#     ╭─[ src/vt.emel:38:44 ]
+#     │
+#  38 │     DeviceAttributes => Bytes.from_string("\e[?62;22c")
+#     │                                            ─┬  
+#     │                                             ╰── 
+# ────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#     ╭─[ src/vt.emel:39:34 ]
+#     │
+#  39 │     Status => Bytes.from_string("\e[0n")
+#     │                                  ─┬  
+#     │                                   ╰── 
+# ────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#     ╭─[ src/vt.emel:40:52 ]
+#     │
+#  40 │     CursorPosition(row, col) => Bytes.from_string("\e[${row};${col}R")
+#     │                                                    ─┬  
+#     │                                                     ╰── 
+# ────╯
+#
+# error[E0126]: expected declaration
+#    ╭─[ src/vt.emel:6:1 ]
+#    │
+#  6 │ module Vt
+#    │ ───┬──  
+#    │    ╰──── 
+# ───╯
+#
+# error[E0127]: imports must come before declarations
+#    ╭─[ src/vt.emel:8:1 ]
+#    │
+#  8 │ import Vt.Parser
+#    │ ───┬──  
+#    │    ╰──── 
+# ───╯
+#
+# error[E0127]: imports must come before declarations
+#    ╭─[ src/vt.emel:9:1 ]
+#    │
+#  9 │ import Vt.Screen
+#    │ ───┬──  
+#    │    ╰──── 
+# ───╯
+#
+# error[E0127]: imports must come before declarations
+#     ╭─[ src/vt.emel:10:1 ]
+#     │
+#  10 │ import Vt.Screen.{Cell, WideTail}
+#     │ ───┬──  
+#     │    ╰──── 
+# ────╯
+#
+# error[E0127]: imports must come before declarations
+#     ╭─[ src/vt.emel:11:1 ]
+#     │
+#  11 │ import Vt.Terminal.{Reply, DeviceAttributes, Status, CursorPosition}
+#     │ ───┬──  
+#     │    ╰──── 
+# ────╯
+#
+# error[E0127]: imports must come before declarations
+#     ╭─[ src/vt.emel:12:1 ]
+#     │
+#  12 │ import Key.Encode.InputModes
+#     │ ───┬──  
+#     │    ╰──── 
+# ────╯
+#
+# error[E0126]: expected declaration
+#     ╭─[ src/vt.emel:15:5 ]
+#     │
+#  15 │ pub use Vt.Terminal.Reply
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0126]: expected declaration
+#     ╭─[ src/vt.emel:16:5 ]
+#     │
+#  16 │ pub use Vt.Screen.Cell
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt.emel:27:3 ]
+#     │
+#  27 │   let (parser, actions) = Parser.advance(t.parser, s)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vt.emel:27:7 ]
+#     │
+#  27 │   let (parser, actions) = Parser.advance(t.parser, s)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt.emel:28:3 ]
+#     │
+#  28 │   let (term, replies) = actions.fold((t.term, []), fn((term, replies), a) {
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vt.emel:28:7 ]
+#     │
+#  28 │   let (term, replies) = actions.fold((t.term, []), fn((term, replies), a) {
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/vt.emel:37:3 ]
+#     │
+#  37 │   match r {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt.emel:38:22 ]
+#     │
+#  38 │     DeviceAttributes => Bytes.from_string("\e[?62;22c")
+#     │                      ┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt.emel:38:22 ]
+#     │
+#  38 │     DeviceAttributes => Bytes.from_string("\e[?62;22c")
+#     │                      ┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt.emel:38:22 ]
+#     │
+#  38 │     DeviceAttributes => Bytes.from_string("\e[?62;22c")
+#     │                      ┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt.emel:39:12 ]
+#     │
+#  39 │     Status => Bytes.from_string("\e[0n")
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt.emel:39:12 ]
+#     │
+#  39 │     Status => Bytes.from_string("\e[0n")
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt.emel:39:12 ]
+#     │
+#  39 │     Status => Bytes.from_string("\e[0n")
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt.emel:40:30 ]
+#     │
+#  40 │     CursorPosition(row, col) => Bytes.from_string("\e[${row};${col}R")
+#     │                              ┬  
+#     │                              ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt.emel:40:30 ]
+#     │
+#  40 │     CursorPosition(row, col) => Bytes.from_string("\e[${row};${col}R")
+#     │                              ┬  
+#     │                              ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt.emel:40:30 ]
+#     │
+#  40 │     CursorPosition(row, col) => Bytes.from_string("\e[${row};${col}R")
+#     │                              ┬  
+#     │                              ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt.emel:46:3 ]
+#     │
+#  46 │   let s = Vt.Terminal.screen(t.term)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vt.emel:46:7 ]
+#     │
+#  46 │   let s = Vt.Terminal.screen(t.term)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt.emel:57:3 ]
+#     │
+#  57 │   let (col, row, visible) = Vt.Terminal.cursor(t.term)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vt.emel:57:7 ]
+#     │
+#  57 │   let (col, row, visible) = Vt.Terminal.cursor(t.term)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#     ╭─[ src/vt.emel:65:10 ]
+#     │
+#  65 │     .map(fn(line) {
+#     │          ────┬───  
+#     │              ╰───── 
+# ────╯
+#    = help: write `|line| ...`
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#     ╭─[ src/vt.emel:67:17 ]
+#     │
+#  67 │         .filter(fn(c) { c.occupancy != WideTail })
+#     │                 ──┬──  
+#     │                   ╰──── 
+# ────╯
+#    = help: write `|c| c.occupancy != WideTail`
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#     ╭─[ src/vt.emel:68:14 ]
+#     │
+#  68 │         .map(fn(c) { String.from_code_point(c.char) })
+#     │              ──┬──  
+#     │                ╰──── 
+# ────╯
+#    = help: write `|c| String.from_code_point(c.char)`
+#
+# error[E0205]: undefined module `Key.Encode.InputModes`
+#     ╭─[ src/vt.emel:12:8 ]
+#     │
+#  12 │ import Key.Encode.InputModes
+#     │        ──────────┬──────────  
+#     │                  ╰──────────── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Vt` in this scope
+#     ╭─[ src/vt.emel:18:55 ]
+#     │
+#  18 │ pub opaque type Terminal(parser: Parser.Parser, term: Vt.Terminal.Terminal)
+#     │                                                       ─┬  
+#     │                                                        ╰── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Vt` in this scope
+#     ╭─[ src/vt.emel:22:43 ]
+#     │
+#  22 │   Terminal(parser: Parser.parser(), term: Vt.Terminal.terminal(cols, rows))
+#     │                                           ─┬  
+#     │                                            ╰── 
+# ────╯
+#
+# error[E0211]: cannot find value `parser` in this scope
+#     ╭─[ src/vt.emel:32:21 ]
+#     │
+#  32 │   (Terminal(parser: parser, term: term), replies)
+#     │                     ───┬──  
+#     │                        ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `term` in this scope
+#     ╭─[ src/vt.emel:32:35 ]
+#     │
+#  32 │   (Terminal(parser: parser, term: term), replies)
+#     │                                   ──┬─  
+#     │                                     ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `replies` in this scope
+#     ╭─[ src/vt.emel:32:42 ]
+#     │
+#  32 │   (Terminal(parser: parser, term: term), replies)
+#     │                                          ───┬───  
+#     │                                             ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find type `Bytes` in this scope
+#     ╭─[ src/vt.emel:36:33 ]
+#     │
+#  36 │ pub fn reply_bytes(r: Reply) -> Bytes {
+#     │                                 ──┬──  
+#     │                                   ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `s` in this scope
+#     ╭─[ src/vt.emel:47:16 ]
+#     │
+#  47 │   (Screen.cols(s), Screen.rows(s))
+#     │                ┬  
+#     │                ╰── 
+# ────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find value `s` in this scope
+#     ╭─[ src/vt.emel:47:32 ]
+#     │
+#  47 │   (Screen.cols(s), Screen.rows(s))
+#     │                                ┬  
+#     │                                ╰── 
+# ────╯
+#    = help: did you mean `t`?
+#
+# error[E0211]: cannot find module or trait `Vt` in this scope
+#     ╭─[ src/vt.emel:52:16 ]
+#     │
+#  52 │   Screen.lines(Vt.Terminal.screen(t.term))
+#     │                ─┬  
+#     │                 ╰── 
+# ────╯
+#
+# error[E0211]: cannot find value `visible` in this scope
+#     ╭─[ src/vt.emel:58:6 ]
+#     │
+#  58 │   if visible { Some((col, row)) } else { None }
+#     │      ───┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find value `col` in this scope
+#     ╭─[ src/vt.emel:58:22 ]
+#     │
+#  58 │   if visible { Some((col, row)) } else { None }
+#     │                      ─┬─  
+#     │                       ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `row` in this scope
+#     ╭─[ src/vt.emel:58:27 ]
+#     │
+#  58 │   if visible { Some((col, row)) } else { None }
+#     │                           ─┬─  
+#     │                            ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find type `InputModes` in this scope
+#     ╭─[ src/vt.emel:75:36 ]
+#     │
+#  75 │ pub fn input_modes(t: Terminal) -> InputModes {
+#     │                                    ─────┬────  
+#     │                                         ╰────── 
+# ────╯
+#
+# error[E0211]: cannot find module or trait `Vt` in this scope
+#     ╭─[ src/vt.emel:76:3 ]
+#     │
+#  76 │   Vt.Terminal.input_modes(t.term)
+#     │   ─┬  
+#     │    ╰── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `List[String]`, found `List[Option[String]]`
+#     ╭─[ src/vt.emel:66:7 ]
+#     │
+#  66 │ ╭─▶       line
+#     ┆ ┆   
+#  68 │ ├─▶         .map(fn(c) { String.from_code_point(c.char) })
+#     │ │                                                            
+#     │ ╰──────────────────────────────────────────────────────────── 
+# ────╯
+#    = note: the mismatch is between `String` and `Option[String]`
+#
+# error[E0313]: type `String` has no field or function `trim_end`
+#     ╭─[ src/vt.emel:70:10 ]
+#     │
+#  70 │         .trim_end()
+#     │          ────┬───  
+#     │              ╰───── 
+# ────╯
+#
+# 49 errors, 1 warning
+# --- end wish check ---
