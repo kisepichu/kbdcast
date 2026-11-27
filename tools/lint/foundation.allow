@@ -5,6 +5,6 @@ regex/src/syntax.emel  # parser の関数が RegexSyntax で失敗し、その R
 regex/src/lib.emel  # library の公開 API（compile など）が RegexSyntax を宣言する。Syntax.RegexSyntax を詰め替えて返す（FRICTION(012)）
 src/key/notation.emel  # 公開 API の parse が NotationError を宣言する（tape の行の誤りを、tape のパーサが行番号を足して外に出す）
 src/key/encode.emel  # 公開 API の encode が Unencodable を宣言する（今の mode で表せないキーを、recorder が tape の行番号を足して外に出す）
-src/tape.emel  # 公開 API の parse が TapeError を宣言する（cli が行と列を付けて利用者に見せる）
-src/recorder.emel  # ドメインの port の effect Driver を宣言し（操作は suspend fn で、Driver の error を fails に書く）、run_tape が Driver を uses して RecordError で失敗する。run_tape の中の step を行う関数も同じ fails と uses を書く（全体設計 §9 の 2 層の effect）
+src/tape.emel  # 公開 API の parse と、parse の中で行を読む関数（read_line、set、size、dimension、duration、count、keys、wait、command、split_words とその中の go）が TapeError を宣言し、parse まで伝える（cli が行と列を付けて利用者に見せる）
+src/recorder.emel  # ドメインの port の effect Driver を宣言し（操作は suspend fn で、Driver の error を fails に書く）、run_tape が Driver を uses して RecordError で失敗する。run_tape の中で step を行う run_steps も同じ fails と uses を書き、step の途中の終了を RecordError にする exited は fails だけを書く（全体設計 §9 の 2 層の effect）
 src/recorder/live.emel  # 本番用の handler LiveDriver（Driver を Pty、Clock、Stdout で実装する adapter。全体設計 §9）と、それを開く公開 API の record。record は run_tape の RecordError を fails に、Pty、Clock、Stdout と Fiber.timeout の Async を uses に書く。LiveDriver は Driver の操作を suspend fn で実装し、操作を分けた関数は Driver の error（ProcessExited、WaitTimeout）を fails に、使う effect（Async、Clock、Pty、Stdout）を uses に書く。状態を handler の欄に置けないので、State[Recording] も uses に書き、State.run を開くために record を置く（FRICTION(073)）
