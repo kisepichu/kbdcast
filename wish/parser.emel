@@ -1,0 +1,2317 @@
+# wish-target: src/vt/parser.emel
+
+# 端末の出力を action の列にする DEC の状態機械（Paul Williams の状態遷移図）。
+# The behavior follows avt 0.18.0 (Apache-2.0, https://github.com/asciinema/avt)
+# dispatch（どの制御か）はここでせず、Vt.Terminal が action を解釈する。
+
+pub enum Action {
+  Print(String)                       # Ground で書く文字の続き（空でない）
+  Execute(Int)                        # C0 と C1 の制御文字
+  Csi(List[List[Int]], String, Int)   # 引数（各引数は `:` で分けた部分）、中間の文字、終わりの文字
+  Esc(String, Int)                    # 中間の文字、終わりの文字
+} deriving (Eq, Show)
+
+enum State {
+  Ground
+  Escape
+  EscapeIntermediate
+  CsiEntry
+  CsiParam
+  CsiIntermediate
+  CsiIgnore
+  DcsEntry
+  DcsParam
+  DcsIntermediate
+  DcsPassthrough
+  DcsIgnore
+  OscString
+  SosPmApcString
+}
+
+const MAX_PARAMS: Int = 32   # avt の PARAMS_LEN
+const MAX_PARTS: Int = 6     # avt の MAX_PARAM_LEN
+
+pub opaque type Parser = {
+  state: State,
+  params: List[List[Int]],   # 書いた順の逆で、各引数の部分も逆。[] は引数がまだ無い
+  inter: String,             # private の印と中間の文字
+}
+
+pub fn parser() -> Parser = fresh(Ground)
+
+fn fresh(state: State) -> Parser = Parser { state, params: [], inter: "" }
+
+# 1 文字で起きること
+enum Step {
+  Put(Int)       # Ground で書く文字
+  Emit(Action)
+  Nothing
+}
+
+pub fn advance(p: Parser, s: String) -> (Parser, List[Action]) {
+  let (last, text, acts) = s.code_points().fold((p, "", []), |(p, text, acts), c| {
+    let (next, step) = feed(p, c)
+    match step {
+      Put(c) => (next, text + String.from_code_point(c), acts)
+      Emit(a) => (next, "", [a, ..flush(text, acts)])
+      Nothing => (next, text, acts)
+    }
+  })
+  (last, flush(text, acts).reverse())
+}
+
+fn flush(text: String, acts: List[Action]) -> List[Action] =
+  if text == "" { acts } else { [Print(text), ..acts] }
+
+fn feed(p: Parser, c: Int) -> (Parser, Step) {
+  # 0xA0 以上の文字は、どの状態でも `A` と同じに遷移する
+  let k = if c >= 0xa0 { 0x41 } else { c }
+  match (p.state, k) {
+    (Ground, 0x20..=0x7f) => (p, Put(c))
+    (CsiParam, 0x30..=0x3b) => ({ ..p, params: param(p.params, c) }, Nothing)
+    (_, 0x1b) => (fresh(Escape), Nothing)
+    (Escape, 0x5b) => (fresh(CsiEntry), Nothing)
+    (CsiParam | CsiEntry | CsiIntermediate, 0x40..=0x7e) =>
+      (fresh(Ground), Emit(Csi(p.params.map(|ps| ps.reverse()).reverse(), p.inter, c)))
+    (CsiEntry, 0x30..=0x39 | 0x3b) => ({ ..p, state: CsiParam, params: param(p.params, c) }, Nothing)
+    (Ground, 0x00..=0x17 | 0x19 | 0x1c..=0x1f) => (p, Emit(Execute(c)))
+    (OscString, 0x20..=0x7f) => (p, Nothing)
+    (Escape, 0x20..=0x2f) => ({ ..p, state: EscapeIntermediate, inter: p.inter + String.from_code_point(c) }, Nothing)
+    (EscapeIntermediate, 0x30..=0x7e)
+    | (Escape, 0x30..=0x4f | 0x51..=0x57 | 0x59 | 0x5a | 0x5c | 0x60..=0x7e) =>
+      (fresh(Ground), Emit(Esc(p.inter, c)))
+    (CsiEntry, 0x3c..=0x3f) => ({ ..p, state: CsiParam, inter: p.inter + String.from_code_point(c) }, Nothing)
+    (DcsPassthrough, 0x00..=0x17 | 0x19 | 0x1c..=0x7e) => (p, Nothing)
+    (CsiIgnore, 0x40..=0x7e) => (fresh(Ground), Nothing)
+    (CsiParam, 0x3c..=0x3f) | (CsiIntermediate, 0x30..=0x3f) | (CsiEntry, 0x3a) =>
+      ({ ..p, state: CsiIgnore }, Nothing)
+    (Escape, 0x5d) => (fresh(OscString), Nothing)
+    (OscString, 0x07) => (fresh(Ground), Nothing)
+    (_, 0x18 | 0x1a | 0x80..=0x8f | 0x91..=0x97 | 0x99 | 0x9a) => (fresh(Ground), Emit(Execute(c)))
+    (Escape, 0x50) => (fresh(DcsEntry), Nothing)
+    (CsiParam | CsiEntry, 0x20..=0x2f) =>
+      ({ ..p, state: CsiIntermediate, inter: p.inter + String.from_code_point(c) }, Nothing)
+    (DcsParam, 0x30..=0x39 | 0x3b) => (p, Nothing)
+    (DcsEntry, 0x3c..=0x3f) => ({ ..p, state: DcsParam }, Nothing)
+    (DcsEntry | DcsParam | DcsIntermediate, 0x40..=0x7e) => (fresh(DcsPassthrough), Nothing)
+    (DcsEntry | DcsParam, 0x20..=0x2f) => ({ ..p, state: DcsIntermediate }, Nothing)
+    (CsiIntermediate | EscapeIntermediate, 0x20..=0x2f) =>
+      ({ ..p, inter: p.inter + String.from_code_point(c) }, Nothing)
+    (DcsIntermediate, 0x20..=0x2f) => (p, Nothing)
+    (DcsEntry, 0x3a) | (DcsIntermediate, 0x30..=0x3f) | (DcsParam, 0x3a | 0x3c..=0x3f) =>
+      (fresh(DcsIgnore), Nothing)
+    (DcsEntry, 0x30..=0x39 | 0x3b) => ({ ..p, state: DcsParam }, Nothing)
+    (Escape | EscapeIntermediate | CsiEntry | CsiParam | CsiIntermediate | CsiIgnore,
+     0x00..=0x17 | 0x19 | 0x1c..=0x1f) => (p, Emit(Execute(c)))
+    (Escape, 0x58 | 0x5e | 0x5f) => (fresh(SosPmApcString), Nothing)
+    (_, 0x98 | 0x9e | 0x9f) => (fresh(SosPmApcString), Nothing)
+    (_, 0x9c) => (fresh(Ground), Nothing)
+    (_, 0x9d) => (fresh(OscString), Nothing)
+    (_, 0x90) => (fresh(DcsEntry), Nothing)
+    (_, 0x9b) => (fresh(CsiEntry), Nothing)
+    # 残り（DEL、CsiIgnore の引数、DCS と OSC と SOS/PM/APC の中の制御文字と中身）は捨てる
+    _ => (p, Nothing)
+  }
+}
+
+# `;` で次の引数、`:` で次の部分、数字は今の部分に足す（u16 で溢れる）
+fn param(ps: List[List[Int]], c: Int) -> List[List[Int]] =
+  match (c, ps) {
+    (0x3b, []) => [[0], [0]]
+    (0x3b, _) => if ps.length() == MAX_PARAMS { ps } else { [[0], ..ps] }
+    (0x3a, []) => [[0, 0]]
+    (0x3a, [cur, ..rest]) => if cur.length() == MAX_PARTS { ps } else { [[0, ..cur], ..rest] }
+    (d, []) => [[d - 0x30]]
+    (d, [[n, ..parts], ..rest]) => [[(10 * n + d - 0x30) % 65536, ..parts], ..rest]
+  }
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/parser.emel:12:3 ]
+#     │
+#  12 │ } deriving (Eq, Show)
+#     │   ────┬───  
+#     │       ╰───── 
+# ────╯
+#
+# error[E0130]: a type without fields must be `@external`
+#     ╭─[ src/vt/parser.emel:34:17 ]
+#     │
+#  34 │ pub opaque type Parser = {
+#     │                 ───┬──  
+#     │                    ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/parser.emel:34:24 ]
+#     │
+#  34 │ pub opaque type Parser = {
+#     │                        ┬  
+#     │                        ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/vt/parser.emel:40:8 ]
+#     │
+#  40 │ pub fn parser() -> Parser = fresh(Ground)
+#     │        ───┬──  
+#     │           ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/parser.emel:40:27 ]
+#     │
+#  40 │ pub fn parser() -> Parser = fresh(Ground)
+#     │                           ┬  
+#     │                           ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/vt/parser.emel:42:4 ]
+#     │
+#  42 │ fn fresh(state: State) -> Parser = Parser { state, params: [], inter: "" }
+#     │    ──┬──  
+#     │      ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/parser.emel:42:34 ]
+#     │
+#  42 │ fn fresh(state: State) -> Parser = Parser { state, params: [], inter: "" }
+#     │                                  ┬  
+#     │                                  ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:52:3 ]
+#     │
+#  52 │   let (last, text, acts) = s.code_points().fold((p, "", []), |(p, text, acts), c| {
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vt/parser.emel:52:7 ]
+#     │
+#  52 │   let (last, text, acts) = s.code_points().fold((p, "", []), |(p, text, acts), c| {
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/vt/parser.emel:63:4 ]
+#     │
+#  63 │ fn flush(text: String, acts: List[Action]) -> List[Action] =
+#     │    ──┬──  
+#     │      ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/parser.emel:63:60 ]
+#     │
+#  63 │ fn flush(text: String, acts: List[Action]) -> List[Action] =
+#     │                                                            ┬  
+#     │                                                            ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:68:3 ]
+#     │
+#  68 │   let k = if c >= 0xa0 { 0x41 } else { c }
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vt/parser.emel:68:7 ]
+#     │
+#  68 │   let k = if c >= 0xa0 { 0x41 } else { c }
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/vt/parser.emel:69:3 ]
+#     │
+#  69 │   match (p.state, k) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:70:18 ]
+#     │
+#  70 │     (Ground, 0x20..=0x7f) => (p, Put(c))
+#     │                  ─┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:70:18 ]
+#     │
+#  70 │     (Ground, 0x20..=0x7f) => (p, Put(c))
+#     │                  ─┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:70:18 ]
+#     │
+#  70 │     (Ground, 0x20..=0x7f) => (p, Put(c))
+#     │                  ─┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:70:20 ]
+#     │
+#  70 │     (Ground, 0x20..=0x7f) => (p, Put(c))
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:71:20 ]
+#     │
+#  71 │     (CsiParam, 0x30..=0x3b) => ({ ..p, params: param(p.params, c) }, Nothing)
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:71:20 ]
+#     │
+#  71 │     (CsiParam, 0x30..=0x3b) => ({ ..p, params: param(p.params, c) }, Nothing)
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:71:20 ]
+#     │
+#  71 │     (CsiParam, 0x30..=0x3b) => ({ ..p, params: param(p.params, c) }, Nothing)
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:71:22 ]
+#     │
+#  71 │     (CsiParam, 0x30..=0x3b) => ({ ..p, params: param(p.params, c) }, Nothing)
+#     │                      ┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:72:15 ]
+#     │
+#  72 │     (_, 0x1b) => (fresh(Escape), Nothing)
+#     │               ┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:72:15 ]
+#     │
+#  72 │     (_, 0x1b) => (fresh(Escape), Nothing)
+#     │               ┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:72:15 ]
+#     │
+#  72 │     (_, 0x1b) => (fresh(Escape), Nothing)
+#     │               ┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:73:20 ]
+#     │
+#  73 │     (Escape, 0x5b) => (fresh(CsiEntry), Nothing)
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:73:20 ]
+#     │
+#  73 │     (Escape, 0x5b) => (fresh(CsiEntry), Nothing)
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:73:20 ]
+#     │
+#  73 │     (Escape, 0x5b) => (fresh(CsiEntry), Nothing)
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#     ╭─[ src/vt/parser.emel:74:15 ]
+#     │
+#  74 │     (CsiParam | CsiEntry | CsiIntermediate, 0x40..=0x7e) =>
+#     │               ┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:74:15 ]
+#     │
+#  74 │     (CsiParam | CsiEntry | CsiIntermediate, 0x40..=0x7e) =>
+#     │               ┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:74:15 ]
+#     │
+#  74 │     (CsiParam | CsiEntry | CsiIntermediate, 0x40..=0x7e) =>
+#     │               ┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:74:43 ]
+#     │
+#  74 │     (CsiParam | CsiEntry | CsiIntermediate, 0x40..=0x7e) =>
+#     │                                           ┬  
+#     │                                           ╰── 
+# ────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#     ╭─[ src/vt/parser.emel:75:13 ]
+#     │
+#  75 │       (fresh(Ground), Emit(Csi(p.params.map(|ps| ps.reverse()).reverse(), p.inter, c)))
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:75:13 ]
+#     │
+#  75 │       (fresh(Ground), Emit(Csi(p.params.map(|ps| ps.reverse()).reverse(), p.inter, c)))
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:75:13 ]
+#     │
+#  75 │       (fresh(Ground), Emit(Csi(p.params.map(|ps| ps.reverse()).reverse(), p.inter, c)))
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:75:21 ]
+#     │
+#  75 │       (fresh(Ground), Emit(Csi(p.params.map(|ps| ps.reverse()).reverse(), p.inter, c)))
+#     │                     ┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:76:20 ]
+#     │
+#  76 │     (CsiEntry, 0x30..=0x39 | 0x3b) => ({ ..p, state: CsiParam, params: param(p.params, c) }, Nothing)
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:76:20 ]
+#     │
+#  76 │     (CsiEntry, 0x30..=0x39 | 0x3b) => ({ ..p, state: CsiParam, params: param(p.params, c) }, Nothing)
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:76:20 ]
+#     │
+#  76 │     (CsiEntry, 0x30..=0x39 | 0x3b) => ({ ..p, state: CsiParam, params: param(p.params, c) }, Nothing)
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:76:22 ]
+#     │
+#  76 │     (CsiEntry, 0x30..=0x39 | 0x3b) => ({ ..p, state: CsiParam, params: param(p.params, c) }, Nothing)
+#     │                      ┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:77:18 ]
+#     │
+#  77 │     (Ground, 0x00..=0x17 | 0x19 | 0x1c..=0x1f) => (p, Emit(Execute(c)))
+#     │                  ─┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:77:18 ]
+#     │
+#  77 │     (Ground, 0x00..=0x17 | 0x19 | 0x1c..=0x1f) => (p, Emit(Execute(c)))
+#     │                  ─┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:77:18 ]
+#     │
+#  77 │     (Ground, 0x00..=0x17 | 0x19 | 0x1c..=0x1f) => (p, Emit(Execute(c)))
+#     │                  ─┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:77:20 ]
+#     │
+#  77 │     (Ground, 0x00..=0x17 | 0x19 | 0x1c..=0x1f) => (p, Emit(Execute(c)))
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:78:21 ]
+#     │
+#  78 │     (OscString, 0x20..=0x7f) => (p, Nothing)
+#     │                     ─┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:78:21 ]
+#     │
+#  78 │     (OscString, 0x20..=0x7f) => (p, Nothing)
+#     │                     ─┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:78:21 ]
+#     │
+#  78 │     (OscString, 0x20..=0x7f) => (p, Nothing)
+#     │                     ─┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:78:23 ]
+#     │
+#  78 │     (OscString, 0x20..=0x7f) => (p, Nothing)
+#     │                       ┬  
+#     │                       ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:79:18 ]
+#     │
+#  79 │     (Escape, 0x20..=0x2f) => ({ ..p, state: EscapeIntermediate, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │                  ─┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:79:18 ]
+#     │
+#  79 │     (Escape, 0x20..=0x2f) => ({ ..p, state: EscapeIntermediate, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │                  ─┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:79:18 ]
+#     │
+#  79 │     (Escape, 0x20..=0x2f) => ({ ..p, state: EscapeIntermediate, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │                  ─┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:79:20 ]
+#     │
+#  79 │     (Escape, 0x20..=0x2f) => ({ ..p, state: EscapeIntermediate, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:80:30 ]
+#     │
+#  80 │     (EscapeIntermediate, 0x30..=0x7e)
+#     │                              ─┬  
+#     │                               ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:80:30 ]
+#     │
+#  80 │     (EscapeIntermediate, 0x30..=0x7e)
+#     │                              ─┬  
+#     │                               ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:80:30 ]
+#     │
+#  80 │     (EscapeIntermediate, 0x30..=0x7e)
+#     │                              ─┬  
+#     │                               ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:80:32 ]
+#     │
+#  80 │     (EscapeIntermediate, 0x30..=0x7e)
+#     │                                ┬  
+#     │                                ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/vt/parser.emel:81:5 ]
+#     │
+#  81 │     | (Escape, 0x30..=0x4f | 0x51..=0x57 | 0x59 | 0x5a | 0x5c | 0x60..=0x7e) =>
+#     │     ┬  
+#     │     ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:81:7 ]
+#     │
+#  81 │     | (Escape, 0x30..=0x4f | 0x51..=0x57 | 0x59 | 0x5a | 0x5c | 0x60..=0x7e) =>
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:81:20 ]
+#     │
+#  81 │     | (Escape, 0x30..=0x4f | 0x51..=0x57 | 0x59 | 0x5a | 0x5c | 0x60..=0x7e) =>
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:81:20 ]
+#     │
+#  81 │     | (Escape, 0x30..=0x4f | 0x51..=0x57 | 0x59 | 0x5a | 0x5c | 0x60..=0x7e) =>
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#     ╭─[ src/vt/parser.emel:82:13 ]
+#     │
+#  82 │       (fresh(Ground), Emit(Esc(p.inter, c)))
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:82:13 ]
+#     │
+#  82 │       (fresh(Ground), Emit(Esc(p.inter, c)))
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:82:13 ]
+#     │
+#  82 │       (fresh(Ground), Emit(Esc(p.inter, c)))
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:82:21 ]
+#     │
+#  82 │       (fresh(Ground), Emit(Esc(p.inter, c)))
+#     │                     ┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:83:20 ]
+#     │
+#  83 │     (CsiEntry, 0x3c..=0x3f) => ({ ..p, state: CsiParam, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:83:20 ]
+#     │
+#  83 │     (CsiEntry, 0x3c..=0x3f) => ({ ..p, state: CsiParam, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:83:20 ]
+#     │
+#  83 │     (CsiEntry, 0x3c..=0x3f) => ({ ..p, state: CsiParam, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:83:22 ]
+#     │
+#  83 │     (CsiEntry, 0x3c..=0x3f) => ({ ..p, state: CsiParam, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │                      ┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:84:26 ]
+#     │
+#  84 │     (DcsPassthrough, 0x00..=0x17 | 0x19 | 0x1c..=0x7e) => (p, Nothing)
+#     │                          ─┬  
+#     │                           ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:84:26 ]
+#     │
+#  84 │     (DcsPassthrough, 0x00..=0x17 | 0x19 | 0x1c..=0x7e) => (p, Nothing)
+#     │                          ─┬  
+#     │                           ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:84:26 ]
+#     │
+#  84 │     (DcsPassthrough, 0x00..=0x17 | 0x19 | 0x1c..=0x7e) => (p, Nothing)
+#     │                          ─┬  
+#     │                           ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:84:28 ]
+#     │
+#  84 │     (DcsPassthrough, 0x00..=0x17 | 0x19 | 0x1c..=0x7e) => (p, Nothing)
+#     │                            ┬  
+#     │                            ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:85:21 ]
+#     │
+#  85 │     (CsiIgnore, 0x40..=0x7e) => (fresh(Ground), Nothing)
+#     │                     ─┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:85:21 ]
+#     │
+#  85 │     (CsiIgnore, 0x40..=0x7e) => (fresh(Ground), Nothing)
+#     │                     ─┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:85:21 ]
+#     │
+#  85 │     (CsiIgnore, 0x40..=0x7e) => (fresh(Ground), Nothing)
+#     │                     ─┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:85:23 ]
+#     │
+#  85 │     (CsiIgnore, 0x40..=0x7e) => (fresh(Ground), Nothing)
+#     │                       ┬  
+#     │                       ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:86:20 ]
+#     │
+#  86 │     (CsiParam, 0x3c..=0x3f) | (CsiIntermediate, 0x30..=0x3f) | (CsiEntry, 0x3a) =>
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:86:20 ]
+#     │
+#  86 │     (CsiParam, 0x3c..=0x3f) | (CsiIntermediate, 0x30..=0x3f) | (CsiEntry, 0x3a) =>
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:86:20 ]
+#     │
+#  86 │     (CsiParam, 0x3c..=0x3f) | (CsiIntermediate, 0x30..=0x3f) | (CsiEntry, 0x3a) =>
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:86:22 ]
+#     │
+#  86 │     (CsiParam, 0x3c..=0x3f) | (CsiIntermediate, 0x30..=0x3f) | (CsiEntry, 0x3a) =>
+#     │                      ┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/vt/parser.emel:87:8 ]
+#     │
+#  87 │       ({ ..p, state: CsiIgnore }, Nothing)
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#     ╭─[ src/vt/parser.emel:87:8 ]
+#     │
+#  87 │       ({ ..p, state: CsiIgnore }, Nothing)
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:87:8 ]
+#     │
+#  87 │       ({ ..p, state: CsiIgnore }, Nothing)
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:87:8 ]
+#     │
+#  87 │       ({ ..p, state: CsiIgnore }, Nothing)
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:87:10 ]
+#     │
+#  87 │       ({ ..p, state: CsiIgnore }, Nothing)
+#     │          ─┬  
+#     │           ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vt/parser.emel:87:12 ]
+#     │
+#  87 │       ({ ..p, state: CsiIgnore }, Nothing)
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:87:33 ]
+#     │
+#  87 │       ({ ..p, state: CsiIgnore }, Nothing)
+#     │                                 ┬  
+#     │                                 ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:88:20 ]
+#     │
+#  88 │     (Escape, 0x5d) => (fresh(OscString), Nothing)
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:88:20 ]
+#     │
+#  88 │     (Escape, 0x5d) => (fresh(OscString), Nothing)
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:88:20 ]
+#     │
+#  88 │     (Escape, 0x5d) => (fresh(OscString), Nothing)
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:89:23 ]
+#     │
+#  89 │     (OscString, 0x07) => (fresh(Ground), Nothing)
+#     │                       ┬  
+#     │                       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:89:23 ]
+#     │
+#  89 │     (OscString, 0x07) => (fresh(Ground), Nothing)
+#     │                       ┬  
+#     │                       ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:89:23 ]
+#     │
+#  89 │     (OscString, 0x07) => (fresh(Ground), Nothing)
+#     │                       ┬  
+#     │                       ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:90:14 ]
+#     │
+#  90 │     (_, 0x18 | 0x1a | 0x80..=0x8f | 0x91..=0x97 | 0x99 | 0x9a) => (fresh(Ground), Emit(Execute(c)))
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:90:14 ]
+#     │
+#  90 │     (_, 0x18 | 0x1a | 0x80..=0x8f | 0x91..=0x97 | 0x99 | 0x9a) => (fresh(Ground), Emit(Execute(c)))
+#     │              ┬  
+#     │              ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:90:27 ]
+#     │
+#  90 │     (_, 0x18 | 0x1a | 0x80..=0x8f | 0x91..=0x97 | 0x99 | 0x9a) => (fresh(Ground), Emit(Execute(c)))
+#     │                           ─┬  
+#     │                            ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:91:20 ]
+#     │
+#  91 │     (Escape, 0x50) => (fresh(DcsEntry), Nothing)
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:91:20 ]
+#     │
+#  91 │     (Escape, 0x50) => (fresh(DcsEntry), Nothing)
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:91:20 ]
+#     │
+#  91 │     (Escape, 0x50) => (fresh(DcsEntry), Nothing)
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#     ╭─[ src/vt/parser.emel:92:15 ]
+#     │
+#  92 │     (CsiParam | CsiEntry, 0x20..=0x2f) =>
+#     │               ┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:92:15 ]
+#     │
+#  92 │     (CsiParam | CsiEntry, 0x20..=0x2f) =>
+#     │               ┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:92:15 ]
+#     │
+#  92 │     (CsiParam | CsiEntry, 0x20..=0x2f) =>
+#     │               ┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0110]: expected `|`
+#     ╭─[ src/vt/parser.emel:92:31 ]
+#     │
+#  92 │     (CsiParam | CsiEntry, 0x20..=0x2f) =>
+#     │                               ─┬  
+#     │                                ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:92:31 ]
+#     │
+#  92 │     (CsiParam | CsiEntry, 0x20..=0x2f) =>
+#     │                               ─┬  
+#     │                                ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:92:33 ]
+#     │
+#  92 │     (CsiParam | CsiEntry, 0x20..=0x2f) =>
+#     │                                 ┬  
+#     │                                 ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/vt/parser.emel:93:8 ]
+#     │
+#  93 │       ({ ..p, state: CsiIntermediate, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#     ╭─[ src/vt/parser.emel:93:8 ]
+#     │
+#  93 │       ({ ..p, state: CsiIntermediate, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:93:8 ]
+#     │
+#  93 │       ({ ..p, state: CsiIntermediate, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:93:8 ]
+#     │
+#  93 │       ({ ..p, state: CsiIntermediate, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:93:10 ]
+#     │
+#  93 │       ({ ..p, state: CsiIntermediate, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │          ─┬  
+#     │           ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vt/parser.emel:93:12 ]
+#     │
+#  93 │       ({ ..p, state: CsiIntermediate, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:93:83 ]
+#     │
+#  93 │       ({ ..p, state: CsiIntermediate, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │                                                                                   ┬  
+#     │                                                                                   ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:94:20 ]
+#     │
+#  94 │     (DcsParam, 0x30..=0x39 | 0x3b) => (p, Nothing)
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:94:20 ]
+#     │
+#  94 │     (DcsParam, 0x30..=0x39 | 0x3b) => (p, Nothing)
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:94:20 ]
+#     │
+#  94 │     (DcsParam, 0x30..=0x39 | 0x3b) => (p, Nothing)
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:94:22 ]
+#     │
+#  94 │     (DcsParam, 0x30..=0x39 | 0x3b) => (p, Nothing)
+#     │                      ┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:95:20 ]
+#     │
+#  95 │     (DcsEntry, 0x3c..=0x3f) => ({ ..p, state: DcsParam }, Nothing)
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:95:20 ]
+#     │
+#  95 │     (DcsEntry, 0x3c..=0x3f) => ({ ..p, state: DcsParam }, Nothing)
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:95:20 ]
+#     │
+#  95 │     (DcsEntry, 0x3c..=0x3f) => ({ ..p, state: DcsParam }, Nothing)
+#     │                    ─┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:95:22 ]
+#     │
+#  95 │     (DcsEntry, 0x3c..=0x3f) => ({ ..p, state: DcsParam }, Nothing)
+#     │                      ┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#     ╭─[ src/vt/parser.emel:96:15 ]
+#     │
+#  96 │     (DcsEntry | DcsParam | DcsIntermediate, 0x40..=0x7e) => (fresh(DcsPassthrough), Nothing)
+#     │               ┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:96:15 ]
+#     │
+#  96 │     (DcsEntry | DcsParam | DcsIntermediate, 0x40..=0x7e) => (fresh(DcsPassthrough), Nothing)
+#     │               ┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:96:15 ]
+#     │
+#  96 │     (DcsEntry | DcsParam | DcsIntermediate, 0x40..=0x7e) => (fresh(DcsPassthrough), Nothing)
+#     │               ┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:96:43 ]
+#     │
+#  96 │     (DcsEntry | DcsParam | DcsIntermediate, 0x40..=0x7e) => (fresh(DcsPassthrough), Nothing)
+#     │                                           ┬  
+#     │                                           ╰── 
+# ────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#     ╭─[ src/vt/parser.emel:97:15 ]
+#     │
+#  97 │     (DcsEntry | DcsParam, 0x20..=0x2f) => ({ ..p, state: DcsIntermediate }, Nothing)
+#     │               ┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:97:15 ]
+#     │
+#  97 │     (DcsEntry | DcsParam, 0x20..=0x2f) => ({ ..p, state: DcsIntermediate }, Nothing)
+#     │               ┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:97:15 ]
+#     │
+#  97 │     (DcsEntry | DcsParam, 0x20..=0x2f) => ({ ..p, state: DcsIntermediate }, Nothing)
+#     │               ┬  
+#     │               ╰── 
+# ────╯
+#
+# error[E0110]: expected `|`
+#     ╭─[ src/vt/parser.emel:97:31 ]
+#     │
+#  97 │     (DcsEntry | DcsParam, 0x20..=0x2f) => ({ ..p, state: DcsIntermediate }, Nothing)
+#     │                               ─┬  
+#     │                                ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:97:31 ]
+#     │
+#  97 │     (DcsEntry | DcsParam, 0x20..=0x2f) => ({ ..p, state: DcsIntermediate }, Nothing)
+#     │                               ─┬  
+#     │                                ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:97:33 ]
+#     │
+#  97 │     (DcsEntry | DcsParam, 0x20..=0x2f) => ({ ..p, state: DcsIntermediate }, Nothing)
+#     │                                 ┬  
+#     │                                 ╰── 
+# ────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#     ╭─[ src/vt/parser.emel:98:22 ]
+#     │
+#  98 │     (CsiIntermediate | EscapeIntermediate, 0x20..=0x2f) =>
+#     │                      ┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:98:22 ]
+#     │
+#  98 │     (CsiIntermediate | EscapeIntermediate, 0x20..=0x2f) =>
+#     │                      ┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:98:22 ]
+#     │
+#  98 │     (CsiIntermediate | EscapeIntermediate, 0x20..=0x2f) =>
+#     │                      ┬  
+#     │                      ╰── 
+# ────╯
+#
+# error[E0110]: expected `|`
+#     ╭─[ src/vt/parser.emel:98:48 ]
+#     │
+#  98 │     (CsiIntermediate | EscapeIntermediate, 0x20..=0x2f) =>
+#     │                                                ─┬  
+#     │                                                 ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:98:48 ]
+#     │
+#  98 │     (CsiIntermediate | EscapeIntermediate, 0x20..=0x2f) =>
+#     │                                                ─┬  
+#     │                                                 ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:98:50 ]
+#     │
+#  98 │     (CsiIntermediate | EscapeIntermediate, 0x20..=0x2f) =>
+#     │                                                  ┬  
+#     │                                                  ╰── 
+# ────╯
+#
+# error[E0113]: expected pattern
+#     ╭─[ src/vt/parser.emel:99:8 ]
+#     │
+#  99 │       ({ ..p, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#     ╭─[ src/vt/parser.emel:99:8 ]
+#     │
+#  99 │       ({ ..p, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/vt/parser.emel:99:8 ]
+#     │
+#  99 │       ({ ..p, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/vt/parser.emel:99:8 ]
+#     │
+#  99 │       ({ ..p, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/parser.emel:99:10 ]
+#     │
+#  99 │       ({ ..p, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │          ─┬  
+#     │           ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vt/parser.emel:99:12 ]
+#     │
+#  99 │       ({ ..p, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │            ┬  
+#     │            ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/vt/parser.emel:99:59 ]
+#     │
+#  99 │       ({ ..p, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │                                                           ┬  
+#     │                                                           ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/parser.emel:100:27 ]
+#      │
+#  100 │     (DcsIntermediate, 0x20..=0x2f) => (p, Nothing)
+#      │                           ─┬  
+#      │                            ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/parser.emel:100:27 ]
+#      │
+#  100 │     (DcsIntermediate, 0x20..=0x2f) => (p, Nothing)
+#      │                           ─┬  
+#      │                            ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/parser.emel:100:27 ]
+#      │
+#  100 │     (DcsIntermediate, 0x20..=0x2f) => (p, Nothing)
+#      │                           ─┬  
+#      │                            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/parser.emel:100:29 ]
+#      │
+#  100 │     (DcsIntermediate, 0x20..=0x2f) => (p, Nothing)
+#      │                             ┬  
+#      │                             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/parser.emel:101:22 ]
+#      │
+#  101 │     (DcsEntry, 0x3a) | (DcsIntermediate, 0x30..=0x3f) | (DcsParam, 0x3a | 0x3c..=0x3f) =>
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/parser.emel:101:46 ]
+#      │
+#  101 │     (DcsEntry, 0x3a) | (DcsIntermediate, 0x30..=0x3f) | (DcsParam, 0x3a | 0x3c..=0x3f) =>
+#      │                                              ─┬  
+#      │                                               ╰── 
+# ─────╯
+#
+# error[E0110]: expected `|`
+#      ╭─[ src/vt/parser.emel:101:46 ]
+#      │
+#  101 │     (DcsEntry, 0x3a) | (DcsIntermediate, 0x30..=0x3f) | (DcsParam, 0x3a | 0x3c..=0x3f) =>
+#      │                                              ─┬  
+#      │                                               ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/parser.emel:101:46 ]
+#      │
+#  101 │     (DcsEntry, 0x3a) | (DcsIntermediate, 0x30..=0x3f) | (DcsParam, 0x3a | 0x3c..=0x3f) =>
+#      │                                              ─┬  
+#      │                                               ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/parser.emel:101:48 ]
+#      │
+#  101 │     (DcsEntry, 0x3a) | (DcsIntermediate, 0x30..=0x3f) | (DcsParam, 0x3a | 0x3c..=0x3f) =>
+#      │                                                ┬  
+#      │                                                ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/vt/parser.emel:102:13 ]
+#      │
+#  102 │       (fresh(DcsIgnore), Nothing)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/parser.emel:102:13 ]
+#      │
+#  102 │       (fresh(DcsIgnore), Nothing)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/parser.emel:102:13 ]
+#      │
+#  102 │       (fresh(DcsIgnore), Nothing)
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/parser.emel:102:24 ]
+#      │
+#  102 │       (fresh(DcsIgnore), Nothing)
+#      │                        ┬  
+#      │                        ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/parser.emel:103:20 ]
+#      │
+#  103 │     (DcsEntry, 0x30..=0x39 | 0x3b) => ({ ..p, state: DcsParam }, Nothing)
+#      │                    ─┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/parser.emel:103:20 ]
+#      │
+#  103 │     (DcsEntry, 0x30..=0x39 | 0x3b) => ({ ..p, state: DcsParam }, Nothing)
+#      │                    ─┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/parser.emel:103:20 ]
+#      │
+#  103 │     (DcsEntry, 0x30..=0x39 | 0x3b) => ({ ..p, state: DcsParam }, Nothing)
+#      │                    ─┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/parser.emel:103:22 ]
+#      │
+#  103 │     (DcsEntry, 0x30..=0x39 | 0x3b) => ({ ..p, state: DcsParam }, Nothing)
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/vt/parser.emel:104:13 ]
+#      │
+#  104 │     (Escape | EscapeIntermediate | CsiEntry | CsiParam | CsiIntermediate | CsiIgnore,
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/parser.emel:104:13 ]
+#      │
+#  104 │     (Escape | EscapeIntermediate | CsiEntry | CsiParam | CsiIntermediate | CsiIgnore,
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/parser.emel:104:13 ]
+#      │
+#  104 │     (Escape | EscapeIntermediate | CsiEntry | CsiParam | CsiIntermediate | CsiIgnore,
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/parser.emel:104:45 ]
+#      │
+#  104 │     (Escape | EscapeIntermediate | CsiEntry | CsiParam | CsiIntermediate | CsiIgnore,
+#      │                                             ┬  
+#      │                                             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/parser.emel:106:19 ]
+#      │
+#  106 │     (Escape, 0x58 | 0x5e | 0x5f) => (fresh(SosPmApcString), Nothing)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/parser.emel:106:19 ]
+#      │
+#  106 │     (Escape, 0x58 | 0x5e | 0x5f) => (fresh(SosPmApcString), Nothing)
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/parser.emel:106:32 ]
+#      │
+#  106 │     (Escape, 0x58 | 0x5e | 0x5f) => (fresh(SosPmApcString), Nothing)
+#      │                                ┬  
+#      │                                ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/vt/parser.emel:107:14 ]
+#      │
+#  107 │     (_, 0x98 | 0x9e | 0x9f) => (fresh(SosPmApcString), Nothing)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/parser.emel:107:14 ]
+#      │
+#  107 │     (_, 0x98 | 0x9e | 0x9f) => (fresh(SosPmApcString), Nothing)
+#      │              ┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/parser.emel:107:27 ]
+#      │
+#  107 │     (_, 0x98 | 0x9e | 0x9f) => (fresh(SosPmApcString), Nothing)
+#      │                           ┬  
+#      │                           ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/parser.emel:108:15 ]
+#      │
+#  108 │     (_, 0x9c) => (fresh(Ground), Nothing)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/parser.emel:108:15 ]
+#      │
+#  108 │     (_, 0x9c) => (fresh(Ground), Nothing)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/parser.emel:108:15 ]
+#      │
+#  108 │     (_, 0x9c) => (fresh(Ground), Nothing)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/parser.emel:109:15 ]
+#      │
+#  109 │     (_, 0x9d) => (fresh(OscString), Nothing)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/parser.emel:109:15 ]
+#      │
+#  109 │     (_, 0x9d) => (fresh(OscString), Nothing)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/parser.emel:109:15 ]
+#      │
+#  109 │     (_, 0x9d) => (fresh(OscString), Nothing)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/parser.emel:110:15 ]
+#      │
+#  110 │     (_, 0x90) => (fresh(DcsEntry), Nothing)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/parser.emel:110:15 ]
+#      │
+#  110 │     (_, 0x90) => (fresh(DcsEntry), Nothing)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/parser.emel:110:15 ]
+#      │
+#  110 │     (_, 0x90) => (fresh(DcsEntry), Nothing)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/parser.emel:111:15 ]
+#      │
+#  111 │     (_, 0x9b) => (fresh(CsiEntry), Nothing)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/parser.emel:111:15 ]
+#      │
+#  111 │     (_, 0x9b) => (fresh(CsiEntry), Nothing)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/parser.emel:111:15 ]
+#      │
+#  111 │     (_, 0x9b) => (fresh(CsiEntry), Nothing)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/parser.emel:113:7 ]
+#      │
+#  113 │     _ => (p, Nothing)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/parser.emel:113:7 ]
+#      │
+#  113 │     _ => (p, Nothing)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/parser.emel:113:7 ]
+#      │
+#  113 │     _ => (p, Nothing)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#      ╭─[ src/vt/parser.emel:118:4 ]
+#      │
+#  118 │ fn param(ps: List[List[Int]], c: Int) -> List[List[Int]] =
+#      │    ──┬──  
+#      │      ╰──── 
+# ─────╯
+#
+# error[E0122]: expected newline after declaration
+#      ╭─[ src/vt/parser.emel:118:58 ]
+#      │
+#  118 │ fn param(ps: List[List[Int]], c: Int) -> List[List[Int]] =
+#      │                                                          ┬  
+#      │                                                          ╰── 
+# ─────╯
+#
+# error[E0211]: cannot find value `last` in this scope
+#     ╭─[ src/vt/parser.emel:60:4 ]
+#     │
+#  60 │   (last, flush(text, acts).reverse())
+#     │    ──┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `text` in this scope
+#     ╭─[ src/vt/parser.emel:60:16 ]
+#     │
+#  60 │   (last, flush(text, acts).reverse())
+#     │                ──┬─  
+#     │                  ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `acts` in this scope
+#     ╭─[ src/vt/parser.emel:60:22 ]
+#     │
+#  60 │   (last, flush(text, acts).reverse())
+#     │                      ──┬─  
+#     │                        ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `k` in this scope
+#     ╭─[ src/vt/parser.emel:69:19 ]
+#     │
+#  69 │   match (p.state, k) {
+#     │                   ┬  
+#     │                   ╰── 
+# ────╯
+#    = help: did you mean `p`?
+#
+# error[E0313]: type `Parser` has no field or function `state`
+#     ╭─[ src/vt/parser.emel:69:12 ]
+#     │
+#  69 │   match (p.state, k) {
+#     │            ──┬──  
+#     │              ╰──── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `({unknown}, {unknown})`, found `(?12)`
+#     ╭─[ src/vt/parser.emel:74:5 ]
+#     │
+#  74 │     (CsiParam | CsiEntry | CsiIntermediate, 0x40..=0x7e) =>
+#     │     ────┬────  
+#     │         ╰────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Parser, Step)`, found `fn(State) -> State`
+#     ╭─[ src/vt/parser.emel:74:15 ]
+#     │
+#  74 │     (CsiParam | CsiEntry | CsiIntermediate, 0x40..=0x7e) =>
+#     │               ──────────────┬─────────────  
+#     │                             ╰─────────────── 
+# ────╯
+#
+# error[E0317]: refutable pattern in binding: patterns `Ground`, `Escape`, `EscapeIntermediate` and 10 more not covered
+#     ╭─[ src/vt/parser.emel:74:17 ]
+#     │
+#  74 │     (CsiParam | CsiEntry | CsiIntermediate, 0x40..=0x7e) =>
+#     │                 ────┬───  
+#     │                     ╰───── 
+# ────╯
+#    = help: use `match` to handle the other cases
+#
+# error[E0301]: type mismatch: expected `({unknown}, {unknown})`, found `(?14)`
+#     ╭─[ src/vt/parser.emel:75:7 ]
+#     │
+#  75 │       (fresh(Ground), Emit(Csi(p.params.map(|ps| ps.reverse()).reverse(), p.inter, c)))
+#     │       ───┬──  
+#     │          ╰──── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:75:7 ]
+#     │
+#  75 │       (fresh(Ground), Emit(Csi(p.params.map(|ps| ps.reverse()).reverse(), p.inter, c)))
+#     │       ───┬──  
+#     │          ╰──── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Parser, Step)`, found `State`
+#     ╭─[ src/vt/parser.emel:75:14 ]
+#     │
+#  75 │       (fresh(Ground), Emit(Csi(p.params.map(|ps| ps.reverse()).reverse(), p.inter, c)))
+#     │              ───┬──  
+#     │                 ╰──── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:76:5 ]
+#     │
+#  76 │     (CsiEntry, 0x30..=0x39 | 0x3b) => ({ ..p, state: CsiParam, params: param(p.params, c) }, Nothing)
+#     │     ───────┬───────  
+#     │            ╰───────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:77:5 ]
+#     │
+#  77 │     (Ground, 0x00..=0x17 | 0x19 | 0x1c..=0x1f) => (p, Emit(Execute(c)))
+#     │     ──────┬──────  
+#     │           ╰──────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:78:5 ]
+#     │
+#  78 │     (OscString, 0x20..=0x7f) => (p, Nothing)
+#     │     ────────┬───────  
+#     │             ╰───────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:79:5 ]
+#     │
+#  79 │     (Escape, 0x20..=0x2f) => ({ ..p, state: EscapeIntermediate, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │     ──────┬──────  
+#     │           ╰──────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:80:5 ]
+#     │
+#  80 │     (EscapeIntermediate, 0x30..=0x7e)
+#     │     ────────────┬────────────  
+#     │                 ╰────────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:81:5 ]
+#     │
+#  81 │     | (Escape, 0x30..=0x4f | 0x51..=0x57 | 0x59 | 0x5a | 0x5c | 0x60..=0x7e) =>
+#     │     ───────┬───────  
+#     │            ╰───────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Parser, Step)`, found `(State, Int)`
+#     ╭─[ src/vt/parser.emel:81:7 ]
+#     │
+#  81 │     | (Escape, 0x30..=0x4f | 0x51..=0x57 | 0x59 | 0x5a | 0x5c | 0x60..=0x7e) =>
+#     │       ──────┬──────  
+#     │             ╰──────── 
+# ────╯
+#    = note: the mismatch is between `Parser` and `State`
+#
+# error[E0301]: type mismatch: expected `({unknown}, {unknown})`, found `(?31)`
+#     ╭─[ src/vt/parser.emel:82:7 ]
+#     │
+#  82 │       (fresh(Ground), Emit(Esc(p.inter, c)))
+#     │       ───┬──  
+#     │          ╰──── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:82:7 ]
+#     │
+#  82 │       (fresh(Ground), Emit(Esc(p.inter, c)))
+#     │       ───┬──  
+#     │          ╰──── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Parser, Step)`, found `State`
+#     ╭─[ src/vt/parser.emel:82:14 ]
+#     │
+#  82 │       (fresh(Ground), Emit(Esc(p.inter, c)))
+#     │              ───┬──  
+#     │                 ╰──── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:83:5 ]
+#     │
+#  83 │     (CsiEntry, 0x3c..=0x3f) => ({ ..p, state: CsiParam, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │     ───────┬───────  
+#     │            ╰───────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:84:5 ]
+#     │
+#  84 │     (DcsPassthrough, 0x00..=0x17 | 0x19 | 0x1c..=0x7e) => (p, Nothing)
+#     │     ──────────┬──────────  
+#     │               ╰──────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:85:5 ]
+#     │
+#  85 │     (CsiIgnore, 0x40..=0x7e) => (fresh(Ground), Nothing)
+#     │     ────────┬───────  
+#     │             ╰───────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:86:5 ]
+#     │
+#  86 │     (CsiParam, 0x3c..=0x3f) | (CsiIntermediate, 0x30..=0x3f) | (CsiEntry, 0x3a) =>
+#     │     ───────┬───────  
+#     │            ╰───────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `({unknown}, {unknown})`, found `()`
+#     ╭─[ src/vt/parser.emel:87:7 ]
+#     │
+#  87 │       ({ ..p, state: CsiIgnore }, Nothing)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:87:7 ]
+#     │
+#  87 │       ({ ..p, state: CsiIgnore }, Nothing)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Parser, Step)`, found `()`
+#     ╭─[ src/vt/parser.emel:87:8 ]
+#     │
+#  87 │       ({ ..p, state: CsiIgnore }, Nothing)
+#     │        ────────────┬────────────  
+#     │                    ╰────────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:88:5 ]
+#     │
+#  88 │     (Escape, 0x5d) => (fresh(OscString), Nothing)
+#     │     ───────┬──────  
+#     │            ╰──────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:89:5 ]
+#     │
+#  89 │     (OscString, 0x07) => (fresh(Ground), Nothing)
+#     │     ────────┬────────  
+#     │             ╰────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:90:5 ]
+#     │
+#  90 │     (_, 0x18 | 0x1a | 0x80..=0x8f | 0x91..=0x97 | 0x99 | 0x9a) => (fresh(Ground), Emit(Execute(c)))
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Parser, Step)`, found `fn(Int) -> Int`
+#     ╭─[ src/vt/parser.emel:90:14 ]
+#     │
+#  90 │     (_, 0x18 | 0x1a | 0x80..=0x8f | 0x91..=0x97 | 0x99 | 0x9a) => (fresh(Ground), Emit(Execute(c)))
+#     │              ──────┬──────  
+#     │                    ╰──────── 
+# ────╯
+#
+# error[E0317]: refutable pattern in binding: pattern `_` not covered
+#     ╭─[ src/vt/parser.emel:90:16 ]
+#     │
+#  90 │     (_, 0x18 | 0x1a | 0x80..=0x8f | 0x91..=0x97 | 0x99 | 0x9a) => (fresh(Ground), Emit(Execute(c)))
+#     │                ──┬─  
+#     │                  ╰─── 
+# ────╯
+#    = help: use `match` to handle the other cases
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:91:5 ]
+#     │
+#  91 │     (Escape, 0x50) => (fresh(DcsEntry), Nothing)
+#     │     ───────┬──────  
+#     │            ╰──────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `({unknown}, {unknown})`, found `(?59)`
+#     ╭─[ src/vt/parser.emel:92:5 ]
+#     │
+#  92 │     (CsiParam | CsiEntry, 0x20..=0x2f) =>
+#     │     ────┬────  
+#     │         ╰────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:92:5 ]
+#     │
+#  92 │     (CsiParam | CsiEntry, 0x20..=0x2f) =>
+#     │     ────┬────  
+#     │         ╰────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Parser, Step)`, found `fn(State, Int) -> {unknown}`
+#     ╭─[ src/vt/parser.emel:92:15 ]
+#     │
+#  92 │     (CsiParam | CsiEntry, 0x20..=0x2f) =>
+#     │               ─────────┬────────  
+#     │                        ╰────────── 
+# ────╯
+#
+# error[E0317]: refutable pattern in binding: patterns `Ground`, `Escape`, `EscapeIntermediate` and 10 more not covered
+#     ╭─[ src/vt/parser.emel:92:17 ]
+#     │
+#  92 │     (CsiParam | CsiEntry, 0x20..=0x2f) =>
+#     │                 ────┬───  
+#     │                     ╰───── 
+# ────╯
+#    = help: use `match` to handle the other cases
+#
+# error[E0317]: refutable pattern in binding: pattern `_` not covered
+#     ╭─[ src/vt/parser.emel:92:27 ]
+#     │
+#  92 │     (CsiParam | CsiEntry, 0x20..=0x2f) =>
+#     │                           ──┬─  
+#     │                             ╰─── 
+# ────╯
+#    = help: use `match` to handle the other cases
+#
+# error[E0301]: type mismatch: expected `({unknown}, {unknown})`, found `()`
+#     ╭─[ src/vt/parser.emel:93:7 ]
+#     │
+#  93 │       ({ ..p, state: CsiIntermediate, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:93:7 ]
+#     │
+#  93 │       ({ ..p, state: CsiIntermediate, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Parser, Step)`, found `()`
+#     ╭─[ src/vt/parser.emel:93:8 ]
+#     │
+#  93 │       ({ ..p, state: CsiIntermediate, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │        ─────────────────────────────────────┬─────────────────────────────────────  
+#     │                                             ╰─────────────────────────────────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:94:5 ]
+#     │
+#  94 │     (DcsParam, 0x30..=0x39 | 0x3b) => (p, Nothing)
+#     │     ───────┬───────  
+#     │            ╰───────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:95:5 ]
+#     │
+#  95 │     (DcsEntry, 0x3c..=0x3f) => ({ ..p, state: DcsParam }, Nothing)
+#     │     ───────┬───────  
+#     │            ╰───────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `({unknown}, {unknown})`, found `(?69)`
+#     ╭─[ src/vt/parser.emel:96:5 ]
+#     │
+#  96 │     (DcsEntry | DcsParam | DcsIntermediate, 0x40..=0x7e) => (fresh(DcsPassthrough), Nothing)
+#     │     ────┬────  
+#     │         ╰────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:96:5 ]
+#     │
+#  96 │     (DcsEntry | DcsParam | DcsIntermediate, 0x40..=0x7e) => (fresh(DcsPassthrough), Nothing)
+#     │     ────┬────  
+#     │         ╰────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Parser, Step)`, found `fn(State) -> State`
+#     ╭─[ src/vt/parser.emel:96:15 ]
+#     │
+#  96 │     (DcsEntry | DcsParam | DcsIntermediate, 0x40..=0x7e) => (fresh(DcsPassthrough), Nothing)
+#     │               ──────────────┬─────────────  
+#     │                             ╰─────────────── 
+# ────╯
+#
+# error[E0317]: refutable pattern in binding: patterns `Ground`, `Escape`, `EscapeIntermediate` and 10 more not covered
+#     ╭─[ src/vt/parser.emel:96:17 ]
+#     │
+#  96 │     (DcsEntry | DcsParam | DcsIntermediate, 0x40..=0x7e) => (fresh(DcsPassthrough), Nothing)
+#     │                 ────┬───  
+#     │                     ╰───── 
+# ────╯
+#    = help: use `match` to handle the other cases
+#
+# error[E0301]: type mismatch: expected `({unknown}, {unknown})`, found `(?71)`
+#     ╭─[ src/vt/parser.emel:97:5 ]
+#     │
+#  97 │     (DcsEntry | DcsParam, 0x20..=0x2f) => ({ ..p, state: DcsIntermediate }, Nothing)
+#     │     ────┬────  
+#     │         ╰────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:97:5 ]
+#     │
+#  97 │     (DcsEntry | DcsParam, 0x20..=0x2f) => ({ ..p, state: DcsIntermediate }, Nothing)
+#     │     ────┬────  
+#     │         ╰────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Parser, Step)`, found `fn(State, Int) -> {unknown}`
+#     ╭─[ src/vt/parser.emel:97:15 ]
+#     │
+#  97 │     (DcsEntry | DcsParam, 0x20..=0x2f) => ({ ..p, state: DcsIntermediate }, Nothing)
+#     │               ─────────┬────────  
+#     │                        ╰────────── 
+# ────╯
+#
+# error[E0317]: refutable pattern in binding: patterns `Ground`, `Escape`, `EscapeIntermediate` and 10 more not covered
+#     ╭─[ src/vt/parser.emel:97:17 ]
+#     │
+#  97 │     (DcsEntry | DcsParam, 0x20..=0x2f) => ({ ..p, state: DcsIntermediate }, Nothing)
+#     │                 ────┬───  
+#     │                     ╰───── 
+# ────╯
+#    = help: use `match` to handle the other cases
+#
+# error[E0317]: refutable pattern in binding: pattern `_` not covered
+#     ╭─[ src/vt/parser.emel:97:27 ]
+#     │
+#  97 │     (DcsEntry | DcsParam, 0x20..=0x2f) => ({ ..p, state: DcsIntermediate }, Nothing)
+#     │                           ──┬─  
+#     │                             ╰─── 
+# ────╯
+#    = help: use `match` to handle the other cases
+#
+# error[E0301]: type mismatch: expected `({unknown}, {unknown})`, found `(?75)`
+#     ╭─[ src/vt/parser.emel:98:5 ]
+#     │
+#  98 │     (CsiIntermediate | EscapeIntermediate, 0x20..=0x2f) =>
+#     │     ────────┬───────  
+#     │             ╰───────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:98:5 ]
+#     │
+#  98 │     (CsiIntermediate | EscapeIntermediate, 0x20..=0x2f) =>
+#     │     ────────┬───────  
+#     │             ╰───────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Parser, Step)`, found `fn(State, Int) -> {unknown}`
+#     ╭─[ src/vt/parser.emel:98:22 ]
+#     │
+#  98 │     (CsiIntermediate | EscapeIntermediate, 0x20..=0x2f) =>
+#     │                      ──────────────┬─────────────  
+#     │                                    ╰─────────────── 
+# ────╯
+#
+# error[E0317]: refutable pattern in binding: patterns `Ground`, `Escape`, `CsiEntry` and 10 more not covered
+#     ╭─[ src/vt/parser.emel:98:24 ]
+#     │
+#  98 │     (CsiIntermediate | EscapeIntermediate, 0x20..=0x2f) =>
+#     │                        ─────────┬────────  
+#     │                                 ╰────────── 
+# ────╯
+#    = help: use `match` to handle the other cases
+#
+# error[E0317]: refutable pattern in binding: pattern `_` not covered
+#     ╭─[ src/vt/parser.emel:98:44 ]
+#     │
+#  98 │     (CsiIntermediate | EscapeIntermediate, 0x20..=0x2f) =>
+#     │                                            ──┬─  
+#     │                                              ╰─── 
+# ────╯
+#    = help: use `match` to handle the other cases
+#
+# error[E0301]: type mismatch: expected `({unknown}, {unknown})`, found `()`
+#     ╭─[ src/vt/parser.emel:99:7 ]
+#     │
+#  99 │       ({ ..p, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/vt/parser.emel:99:7 ]
+#     │
+#  99 │       ({ ..p, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `(Parser, Step)`, found `()`
+#     ╭─[ src/vt/parser.emel:99:8 ]
+#     │
+#  99 │       ({ ..p, inter: p.inter + String.from_code_point(c) }, Nothing)
+#     │        ─────────────────────────┬─────────────────────────  
+#     │                                 ╰─────────────────────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/parser.emel:100:5 ]
+#      │
+#  100 │     (DcsIntermediate, 0x20..=0x2f) => (p, Nothing)
+#      │     ───────────┬──────────  
+#      │                ╰──────────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/parser.emel:101:5 ]
+#      │
+#  101 │     (DcsEntry, 0x3a) | (DcsIntermediate, 0x30..=0x3f) | (DcsParam, 0x3a | 0x3c..=0x3f) =>
+#      │     ────────┬───────  
+#      │             ╰───────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Parser, Step)`, found `fn((State, Int)) -> {unknown}`
+#      ╭─[ src/vt/parser.emel:101:22 ]
+#      │
+#  101 │     (DcsEntry, 0x3a) | (DcsIntermediate, 0x30..=0x3f) | (DcsParam, 0x3a | 0x3c..=0x3f) =>
+#      │                      ─────────────┬────────────  
+#      │                                   ╰────────────── 
+# ─────╯
+#
+# error[E0317]: refutable pattern in binding: patterns `(DcsIntermediate, _)`, `(Ground, _)`, `(Escape, _)` and 11 more not covered
+#      ╭─[ src/vt/parser.emel:101:24 ]
+#      │
+#  101 │     (DcsEntry, 0x3a) | (DcsIntermediate, 0x30..=0x3f) | (DcsParam, 0x3a | 0x3c..=0x3f) =>
+#      │                        ───────────┬──────────  
+#      │                                   ╰──────────── 
+# ─────╯
+#    = help: use `match` to handle the other cases
+#
+# error[E0301]: type mismatch: expected `({unknown}, {unknown})`, found `(?89)`
+#      ╭─[ src/vt/parser.emel:102:7 ]
+#      │
+#  102 │       (fresh(DcsIgnore), Nothing)
+#      │       ───┬──  
+#      │          ╰──── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/parser.emel:102:7 ]
+#      │
+#  102 │       (fresh(DcsIgnore), Nothing)
+#      │       ───┬──  
+#      │          ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Parser, Step)`, found `State`
+#      ╭─[ src/vt/parser.emel:102:14 ]
+#      │
+#  102 │       (fresh(DcsIgnore), Nothing)
+#      │              ────┬────  
+#      │                  ╰────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/parser.emel:103:5 ]
+#      │
+#  103 │     (DcsEntry, 0x30..=0x39 | 0x3b) => ({ ..p, state: DcsParam }, Nothing)
+#      │     ───────┬───────  
+#      │            ╰───────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `({unknown}, {unknown})`, found `(?93)`
+#      ╭─[ src/vt/parser.emel:104:5 ]
+#      │
+#  104 │     (Escape | EscapeIntermediate | CsiEntry | CsiParam | CsiIntermediate | CsiIgnore,
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/parser.emel:104:5 ]
+#      │
+#  104 │     (Escape | EscapeIntermediate | CsiEntry | CsiParam | CsiIntermediate | CsiIgnore,
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Parser, Step)`, found `fn(State) -> State`
+#      ╭─[ src/vt/parser.emel:104:13 ]
+#      │
+#  104 │     (Escape | EscapeIntermediate | CsiEntry | CsiParam | CsiIntermediate | CsiIgnore,
+#      │             ───────────────┬───────────────  
+#      │                            ╰───────────────── 
+# ─────╯
+#
+# error[E0317]: refutable pattern in binding: patterns `Ground`, `Escape`, `CsiEntry` and 10 more not covered
+#      ╭─[ src/vt/parser.emel:104:15 ]
+#      │
+#  104 │     (Escape | EscapeIntermediate | CsiEntry | CsiParam | CsiIntermediate | CsiIgnore,
+#      │               ─────────┬────────  
+#      │                        ╰────────── 
+# ─────╯
+#    = help: use `match` to handle the other cases
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/parser.emel:106:5 ]
+#      │
+#  106 │     (Escape, 0x58 | 0x5e | 0x5f) => (fresh(SosPmApcString), Nothing)
+#      │     ──────┬──────  
+#      │           ╰──────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Parser, Step)`, found `fn(Int) -> Int`
+#      ╭─[ src/vt/parser.emel:106:19 ]
+#      │
+#  106 │     (Escape, 0x58 | 0x5e | 0x5f) => (fresh(SosPmApcString), Nothing)
+#      │                   ──────┬──────  
+#      │                         ╰──────── 
+# ─────╯
+#
+# error[E0317]: refutable pattern in binding: pattern `_` not covered
+#      ╭─[ src/vt/parser.emel:106:21 ]
+#      │
+#  106 │     (Escape, 0x58 | 0x5e | 0x5f) => (fresh(SosPmApcString), Nothing)
+#      │                     ──┬─  
+#      │                       ╰─── 
+# ─────╯
+#    = help: use `match` to handle the other cases
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/parser.emel:107:5 ]
+#      │
+#  107 │     (_, 0x98 | 0x9e | 0x9f) => (fresh(SosPmApcString), Nothing)
+#      │     ────┬───  
+#      │         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Parser, Step)`, found `fn(Int) -> Int`
+#      ╭─[ src/vt/parser.emel:107:14 ]
+#      │
+#  107 │     (_, 0x98 | 0x9e | 0x9f) => (fresh(SosPmApcString), Nothing)
+#      │              ──────┬──────  
+#      │                    ╰──────── 
+# ─────╯
+#
+# error[E0317]: refutable pattern in binding: pattern `_` not covered
+#      ╭─[ src/vt/parser.emel:107:16 ]
+#      │
+#  107 │     (_, 0x98 | 0x9e | 0x9f) => (fresh(SosPmApcString), Nothing)
+#      │                ──┬─  
+#      │                  ╰─── 
+# ─────╯
+#    = help: use `match` to handle the other cases
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/parser.emel:108:5 ]
+#      │
+#  108 │     (_, 0x9c) => (fresh(Ground), Nothing)
+#      │     ────┬────  
+#      │         ╰────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/parser.emel:109:5 ]
+#      │
+#  109 │     (_, 0x9d) => (fresh(OscString), Nothing)
+#      │     ────┬────  
+#      │         ╰────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/parser.emel:110:5 ]
+#      │
+#  110 │     (_, 0x90) => (fresh(DcsEntry), Nothing)
+#      │     ────┬────  
+#      │         ╰────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/parser.emel:111:5 ]
+#      │
+#  111 │     (_, 0x9b) => (fresh(CsiEntry), Nothing)
+#      │     ────┬────  
+#      │         ╰────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/vt/parser.emel:113:5 ]
+#      │
+#  113 │     _ => (p, Nothing)
+#      │     ┬  
+#      │     ╰── 
+# ─────╯
+#
+# 234 errors, 38 warnings
+# --- end wish check ---

@@ -1,0 +1,1085 @@
+# wish-target: src/vt/screen.emel
+# VT の画面: セル、pen、色と、固定の大きさの画面の行とセルの操作。
+# The behavior follows avt 0.18.0 (Apache-2.0, https://github.com/asciinema/avt)
+# (line.rs の Line と buffer.rs の Buffer。scrollback、resize、wrapped は持たない。)
+
+import Vt.Width
+
+pub enum Color derive Eq, Show {
+  Indexed(Int)
+  Rgb(Int, Int, Int)
+}
+
+pub enum Intensity derive Eq, Show {
+  Normal
+  Bold
+  Faint
+}
+
+pub type Pen(
+  foreground: Option[Color],
+  background: Option[Color],
+  intensity: Intensity,
+  italic: Bool,
+  underline: Bool,
+  strikethrough: Bool,
+  blink: Bool,
+  inverse: Bool,
+) derive Eq, Show
+
+pub const DEFAULT_PEN: Pen = Pen(
+  foreground: None,
+  background: None,
+  intensity: Normal,
+  italic: false,
+  underline: false,
+  strikethrough: false,
+  blink: false,
+  inverse: false,
+)
+
+pub enum Occupancy derive Eq, Show {
+  Single
+  WideHead
+  WideTail
+}
+
+pub type Cell(char: Int, occupancy: Occupancy, pen: Pen) derive Eq, Show
+
+pub enum Erase derive Eq, Show {
+  NextChars(Int)
+  ToEndOfScreen
+  ToStartOfScreen
+  WholeScreen
+  ToEndOfLine
+  ToStartOfLine
+  WholeLine
+}
+
+# 行の Array。各行はセルの Array。
+pub opaque type Screen(cols: Int, rows: Int, grid: Array[Array[Cell]])
+
+fn space(pen: Pen) -> Cell = Cell(0x20, Single, pen)
+
+fn blank_line(cols: Int, pen: Pen) -> Array[Cell] = Array.fill(cols, space(pen))
+
+pub fn blank(cols: Int, rows: Int, pen: Pen) -> Screen =
+  Screen(cols: cols, rows: rows, grid: Array.fill(rows, blank_line(cols, pen)))
+
+pub fn cols(s: Screen) -> Int = s.cols
+
+pub fn rows(s: Screen) -> Int = s.rows
+
+pub fn lines(s: Screen) -> List[List[Cell]] = s.grid.to_list().map(fn(l) { l.to_list() })
+
+# 行の中の書き換えは、行を取り出して書き換え、画面に戻す。
+fn with_line(s: Screen, row: Int, f: fn(Array[Cell]) -> Array[Cell]) -> Screen =
+  { s with grid: s.grid.set(row, f(s.grid[row])) }
+
+# avt の Line::print。書けたら幅、書けなければ None。
+pub fn print(s: Screen, col: Int, row: Int, c: Int, pen: Pen) -> (Screen, Option[Int]) {
+  let line = s.grid[row]
+  let wide = c > 0x7e && Width.is_wide(c)
+  let right = s.cols - 1 - col
+  let head = Cell(c, WideHead, pen)
+  let tail = Cell(0x20, WideTail, pen)
+  # 右隣が全角の頭なら、その尾を空白にする。
+  let cut_next = fn(l: Array[Cell]) {
+    if l[col + 1].occupancy == WideHead { l.set(col + 2, space(pen)) } else { l }
+  }
+  let written = match (line[col].occupancy, wide, right) {
+    (Single, false, _) => Some(line.set(col, Cell(c, Single, pen)))
+    (Single, true, 0) => None
+    (Single, true, 1) => Some(line.set(col, head).set(col + 1, tail))
+    (Single, true, _) => Some(cut_next(line).set(col, head).set(col + 1, tail))
+    (WideHead, false, _) => Some(line.set(col, Cell(c, Single, pen)).set(col + 1, space(pen)))
+    (WideHead, true, _) => Some(line.set(col, head).set(col + 1, tail))
+    (WideTail, false, _) => Some(line.set(col - 1, space(pen)).set(col, Cell(c, Single, pen)))
+    (WideTail, true, 0) => None
+    (WideTail, true, 1) => Some(line.set(col - 1, space(pen)).set(col, head).set(col + 1, tail))
+    (WideTail, true, _) => Some(cut_next(line.set(col - 1, space(pen))).set(col, head).set(col + 1, tail))
+  }
+  match written {
+    Some(l) => ({ s with grid: s.grid.set(row, l) }, Some(if wide { 2 } else { 1 }))
+    None => (s, None)
+  }
+}
+
+# avt の Line::clear。from 以上 to 未満を空白にし、両端で切れた全角の片割れも空白にする。
+fn clear(line: Array[Cell], from: Int, to: Int, pen: Pen) -> Array[Cell] {
+  if from == line.len() {
+    line
+  } else {
+    let l1 = if line[from].occupancy == WideTail { line.set(from - 1, space(pen)) } else { line }
+    let l2 = l1.fill_range(from, to, space(pen))
+    match l2.get(to) {
+      Some(next) if next.occupancy == WideTail => l2.set(to, space(pen))
+      _ => l2
+    }
+  }
+}
+
+pub fn shift_right(s: Screen, col: Int, row: Int, n: Int, pen: Pen) -> Screen {
+  let n = min(n, s.cols - col)
+  let col = min(col, s.cols - 1)
+  with_line(s, row, fn(line) {
+    let l1 = if line[col].occupancy == WideTail {
+      line.set(col, space(pen)).set(col - 1, space(pen))
+    } else {
+      line
+    }
+    let l2 = l1[..col] ++ l1[col..].rotate_right(n)
+    if l2[col].occupancy == WideTail {
+      l2.set(col, space(pen)).set(s.cols - 1, space(pen))
+    } else {
+      l2
+    }
+  })
+}
+
+pub fn delete(s: Screen, col: Int, row: Int, n: Int, pen: Pen) -> Screen {
+  let n = min(n, s.cols - col)
+  with_line(s, row, fn(line) {
+    let l1 = if line[col].occupancy == WideTail { line.set(col - 1, space(pen)) } else { line }
+    let l2 = l1[..col] ++ l1[col..].rotate_left(n)
+    let l3 = if l2[col].occupancy == WideTail { l2.set(col, space(pen)) } else { l2 }
+    l3.fill_range(s.cols - n, s.cols, space(pen))
+  })
+}
+
+fn clear_rows(s: Screen, from: Int, to: Int, pen: Pen) -> Screen =
+  { s with grid: s.grid.fill_range(from, to, blank_line(s.cols, pen)) }
+
+pub fn erase(s: Screen, col: Int, row: Int, mode: Erase, pen: Pen) -> Screen =
+  match mode {
+    NextChars(n) => with_line(s, row, fn(l) { clear(l, col, col + min(n, s.cols - col), pen) })
+    ToEndOfScreen =>
+      with_line(s, row, fn(l) { clear(l, col, s.cols, pen) }) |> clear_rows(row + 1, s.rows, pen)
+    ToStartOfScreen =>
+      with_line(s, row, fn(l) { clear(l, 0, min(col + 1, s.cols), pen) }) |> clear_rows(0, row, pen)
+    WholeScreen => clear_rows(s, 0, s.rows, pen)
+    ToEndOfLine => with_line(s, row, fn(l) { clear(l, col, s.cols, pen) })
+    ToStartOfLine => with_line(s, row, fn(l) { clear(l, 0, min(col + 1, s.cols), pen) })
+    WholeLine => with_line(s, row, fn(l) { clear(l, 0, s.cols, pen) })
+  }
+
+# 行 top 以上 bottom 未満を n 行上げ、下に pen の空白の行を入れる。
+pub fn scroll_up(s: Screen, top: Int, bottom: Int, n: Int, pen: Pen) -> Screen {
+  let n = min(n, bottom - top)
+  let g = s.grid
+  { s with grid: g[..top] ++ g[top + n..bottom] ++ Array.fill(n, blank_line(s.cols, pen)) ++ g[bottom..] }
+}
+
+# 行 top 以上 bottom 未満を n 行下げ、上に pen の空白の行を入れる。
+pub fn scroll_down(s: Screen, top: Int, bottom: Int, n: Int, pen: Pen) -> Screen {
+  let n = min(n, bottom - top)
+  let g = s.grid
+  { s with grid: g[..top] ++ Array.fill(n, blank_line(s.cols, pen)) ++ g[top..bottom - n] ++ g[bottom..] }
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0110]: expected `{`
+#    ╭─[ src/vt/screen.emel:8:16 ]
+#    │
+#  8 │ pub enum Color derive Eq, Show {
+#    │                ───┬──  
+#    │                   ╰──── 
+# ───╯
+#
+# error[E0122]: expected newline after declaration
+#    ╭─[ src/vt/screen.emel:8:32 ]
+#    │
+#  8 │ pub enum Color derive Eq, Show {
+#    │                                ┬  
+#    │                                ╰── 
+# ───╯
+#
+# error[E0110]: expected `{`
+#     ╭─[ src/vt/screen.emel:13:20 ]
+#     │
+#  13 │ pub enum Intensity derive Eq, Show {
+#     │                    ───┬──  
+#     │                       ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/screen.emel:13:36 ]
+#     │
+#  13 │ pub enum Intensity derive Eq, Show {
+#     │                                    ┬  
+#     │                                    ╰── 
+# ────╯
+#
+# error[E0110]: expected `{`
+#     ╭─[ src/vt/screen.emel:41:20 ]
+#     │
+#  41 │ pub enum Occupancy derive Eq, Show {
+#     │                    ───┬──  
+#     │                       ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/screen.emel:41:36 ]
+#     │
+#  41 │ pub enum Occupancy derive Eq, Show {
+#     │                                    ┬  
+#     │                                    ╰── 
+# ────╯
+#
+# error[E0110]: expected `{`
+#     ╭─[ src/vt/screen.emel:49:16 ]
+#     │
+#  49 │ pub enum Erase derive Eq, Show {
+#     │                ───┬──  
+#     │                   ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/screen.emel:49:32 ]
+#     │
+#  49 │ pub enum Erase derive Eq, Show {
+#     │                                ┬  
+#     │                                ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/vt/screen.emel:62:4 ]
+#     │
+#  62 │ fn space(pen: Pen) -> Cell = Cell(0x20, Single, pen)
+#     │    ──┬──  
+#     │      ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/screen.emel:62:28 ]
+#     │
+#  62 │ fn space(pen: Pen) -> Cell = Cell(0x20, Single, pen)
+#     │                            ┬  
+#     │                            ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/vt/screen.emel:64:4 ]
+#     │
+#  64 │ fn blank_line(cols: Int, pen: Pen) -> Array[Cell] = Array.fill(cols, space(pen))
+#     │    ─────┬────  
+#     │         ╰────── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/screen.emel:64:51 ]
+#     │
+#  64 │ fn blank_line(cols: Int, pen: Pen) -> Array[Cell] = Array.fill(cols, space(pen))
+#     │                                                   ┬  
+#     │                                                   ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/vt/screen.emel:66:8 ]
+#     │
+#  66 │ pub fn blank(cols: Int, rows: Int, pen: Pen) -> Screen =
+#     │        ──┬──  
+#     │          ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/screen.emel:66:56 ]
+#     │
+#  66 │ pub fn blank(cols: Int, rows: Int, pen: Pen) -> Screen =
+#     │                                                        ┬  
+#     │                                                        ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/vt/screen.emel:69:8 ]
+#     │
+#  69 │ pub fn cols(s: Screen) -> Int = s.cols
+#     │        ──┬─  
+#     │          ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/screen.emel:69:31 ]
+#     │
+#  69 │ pub fn cols(s: Screen) -> Int = s.cols
+#     │                               ┬  
+#     │                               ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/vt/screen.emel:71:8 ]
+#     │
+#  71 │ pub fn rows(s: Screen) -> Int = s.rows
+#     │        ──┬─  
+#     │          ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/screen.emel:71:31 ]
+#     │
+#  71 │ pub fn rows(s: Screen) -> Int = s.rows
+#     │                               ┬  
+#     │                               ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/vt/screen.emel:73:8 ]
+#     │
+#  73 │ pub fn lines(s: Screen) -> List[List[Cell]] = s.grid.to_list().map(fn(l) { l.to_list() })
+#     │        ──┬──  
+#     │          ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/screen.emel:73:45 ]
+#     │
+#  73 │ pub fn lines(s: Screen) -> List[List[Cell]] = s.grid.to_list().map(fn(l) { l.to_list() })
+#     │                                             ┬  
+#     │                                             ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/vt/screen.emel:76:4 ]
+#     │
+#  76 │ fn with_line(s: Screen, row: Int, f: fn(Array[Cell]) -> Array[Cell]) -> Screen =
+#     │    ────┬────  
+#     │        ╰────── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/vt/screen.emel:76:80 ]
+#     │
+#  76 │ fn with_line(s: Screen, row: Int, f: fn(Array[Cell]) -> Array[Cell]) -> Screen =
+#     │                                                                                ┬  
+#     │                                                                                ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/screen.emel:81:3 ]
+#     │
+#  81 │   let line = s.grid[row]
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vt/screen.emel:81:7 ]
+#     │
+#  81 │   let line = s.grid[row]
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/screen.emel:82:3 ]
+#     │
+#  82 │   let wide = c > 0x7e && Width.is_wide(c)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vt/screen.emel:82:7 ]
+#     │
+#  82 │   let wide = c > 0x7e && Width.is_wide(c)
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/screen.emel:83:3 ]
+#     │
+#  83 │   let right = s.cols - 1 - col
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vt/screen.emel:83:7 ]
+#     │
+#  83 │   let right = s.cols - 1 - col
+#     │       ──┬──  
+#     │         ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/screen.emel:84:3 ]
+#     │
+#  84 │   let head = Cell(c, WideHead, pen)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vt/screen.emel:84:7 ]
+#     │
+#  84 │   let head = Cell(c, WideHead, pen)
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/screen.emel:85:3 ]
+#     │
+#  85 │   let tail = Cell(0x20, WideTail, pen)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vt/screen.emel:85:7 ]
+#     │
+#  85 │   let tail = Cell(0x20, WideTail, pen)
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/screen.emel:87:3 ]
+#     │
+#  87 │   let cut_next = fn(l: Array[Cell]) {
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vt/screen.emel:87:7 ]
+#     │
+#  87 │   let cut_next = fn(l: Array[Cell]) {
+#     │       ────┬───  
+#     │           ╰───── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/screen.emel:90:3 ]
+#     │
+#  90 │   let written = match (line[col].occupancy, wide, right) {
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vt/screen.emel:90:7 ]
+#     │
+#  90 │   let written = match (line[col].occupancy, wide, right) {
+#     │       ───┬───  
+#     │          ╰───── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/vt/screen.emel:102:3 ]
+#      │
+#  102 │   match written {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/screen.emel:103:13 ]
+#      │
+#  103 │     Some(l) => ({ s with grid: s.grid.set(row, l) }, Some(if wide { 2 } else { 1 }))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/screen.emel:103:13 ]
+#      │
+#  103 │     Some(l) => ({ s with grid: s.grid.set(row, l) }, Some(if wide { 2 } else { 1 }))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/screen.emel:103:13 ]
+#      │
+#  103 │     Some(l) => ({ s with grid: s.grid.set(row, l) }, Some(if wide { 2 } else { 1 }))
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/screen.emel:104:10 ]
+#      │
+#  104 │     None => (s, None)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/screen.emel:104:10 ]
+#      │
+#  104 │     None => (s, None)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/screen.emel:104:10 ]
+#      │
+#  104 │     None => (s, None)
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/screen.emel:113:5 ]
+#      │
+#  113 │     let l1 = if line[from].occupancy == WideTail { line.set(from - 1, space(pen)) } else { line }
+#      │     ─┬─  
+#      │      ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/screen.emel:113:9 ]
+#      │
+#  113 │     let l1 = if line[from].occupancy == WideTail { line.set(from - 1, space(pen)) } else { line }
+#      │         ─┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/screen.emel:114:5 ]
+#      │
+#  114 │     let l2 = l1.fill_range(from, to, space(pen))
+#      │     ─┬─  
+#      │      ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/screen.emel:114:9 ]
+#      │
+#  114 │     let l2 = l1.fill_range(from, to, space(pen))
+#      │         ─┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/vt/screen.emel:115:5 ]
+#      │
+#  115 │     match l2.get(to) {
+#      │     ──┬──  
+#      │       ╰──── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/screen.emel:116:48 ]
+#      │
+#  116 │       Some(next) if next.occupancy == WideTail => l2.set(to, space(pen))
+#      │                                                ┬  
+#      │                                                ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/screen.emel:116:48 ]
+#      │
+#  116 │       Some(next) if next.occupancy == WideTail => l2.set(to, space(pen))
+#      │                                                ┬  
+#      │                                                ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/screen.emel:116:48 ]
+#      │
+#  116 │       Some(next) if next.occupancy == WideTail => l2.set(to, space(pen))
+#      │                                                ┬  
+#      │                                                ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/vt/screen.emel:117:9 ]
+#      │
+#  117 │       _ => l2
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/screen.emel:117:9 ]
+#      │
+#  117 │       _ => l2
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/vt/screen.emel:117:9 ]
+#      │
+#  117 │       _ => l2
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/screen.emel:123:3 ]
+#      │
+#  123 │   let n = min(n, s.cols - col)
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/screen.emel:123:7 ]
+#      │
+#  123 │   let n = min(n, s.cols - col)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/screen.emel:124:3 ]
+#      │
+#  124 │   let col = min(col, s.cols - 1)
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/screen.emel:124:7 ]
+#      │
+#  124 │   let col = min(col, s.cols - 1)
+#      │       ─┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#      ╭─[ src/vt/screen.emel:125:21 ]
+#      │
+#  125 │   with_line(s, row, fn(line) {
+#      │                     ────┬───  
+#      │                         ╰───── 
+# ─────╯
+#    = help: write `|line| ...`
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/screen.emel:126:5 ]
+#      │
+#  126 │     let l1 = if line[col].occupancy == WideTail {
+#      │     ─┬─  
+#      │      ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/screen.emel:126:9 ]
+#      │
+#  126 │     let l1 = if line[col].occupancy == WideTail {
+#      │         ─┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/screen.emel:131:5 ]
+#      │
+#  131 │     let l2 = l1[..col] ++ l1[col..].rotate_right(n)
+#      │     ─┬─  
+#      │      ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/screen.emel:131:9 ]
+#      │
+#  131 │     let l2 = l1[..col] ++ l1[col..].rotate_right(n)
+#      │         ─┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `{`
+#      ╭─[ src/vt/screen.emel:132:10 ]
+#      │
+#  132 │     if l2[col].occupancy == WideTail {
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/screen.emel:132:38 ]
+#      │
+#  132 │     if l2[col].occupancy == WideTail {
+#      │                                      ┬  
+#      │                                      ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/screen.emel:141:3 ]
+#      │
+#  141 │   let n = min(n, s.cols - col)
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/screen.emel:141:7 ]
+#      │
+#  141 │   let n = min(n, s.cols - col)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#      ╭─[ src/vt/screen.emel:142:21 ]
+#      │
+#  142 │   with_line(s, row, fn(line) {
+#      │                     ────┬───  
+#      │                         ╰───── 
+# ─────╯
+#    = help: write `|line| ...`
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/screen.emel:143:5 ]
+#      │
+#  143 │     let l1 = if line[col].occupancy == WideTail { line.set(col - 1, space(pen)) } else { line }
+#      │     ─┬─  
+#      │      ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/screen.emel:143:9 ]
+#      │
+#  143 │     let l1 = if line[col].occupancy == WideTail { line.set(col - 1, space(pen)) } else { line }
+#      │         ─┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/screen.emel:144:5 ]
+#      │
+#  144 │     let l2 = l1[..col] ++ l1[col..].rotate_left(n)
+#      │     ─┬─  
+#      │      ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/screen.emel:144:9 ]
+#      │
+#  144 │     let l2 = l1[..col] ++ l1[col..].rotate_left(n)
+#      │         ─┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/screen.emel:145:5 ]
+#      │
+#  145 │     let l3 = if l2[col].occupancy == WideTail { l2.set(col, space(pen)) } else { l2 }
+#      │     ─┬─  
+#      │      ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/screen.emel:145:9 ]
+#      │
+#  145 │     let l3 = if l2[col].occupancy == WideTail { l2.set(col, space(pen)) } else { l2 }
+#      │         ─┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#      ╭─[ src/vt/screen.emel:150:4 ]
+#      │
+#  150 │ fn clear_rows(s: Screen, from: Int, to: Int, pen: Pen) -> Screen =
+#      │    ─────┬────  
+#      │         ╰────── 
+# ─────╯
+#
+# error[E0122]: expected newline after declaration
+#      ╭─[ src/vt/screen.emel:150:66 ]
+#      │
+#  150 │ fn clear_rows(s: Screen, from: Int, to: Int, pen: Pen) -> Screen =
+#      │                                                                  ┬  
+#      │                                                                  ╰── 
+# ─────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#      ╭─[ src/vt/screen.emel:153:8 ]
+#      │
+#  153 │ pub fn erase(s: Screen, col: Int, row: Int, mode: Erase, pen: Pen) -> Screen =
+#      │        ──┬──  
+#      │          ╰──── 
+# ─────╯
+#
+# error[E0122]: expected newline after declaration
+#      ╭─[ src/vt/screen.emel:153:78 ]
+#      │
+#  153 │ pub fn erase(s: Screen, col: Int, row: Int, mode: Erase, pen: Pen) -> Screen =
+#      │                                                                              ┬  
+#      │                                                                              ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/screen.emel:168:3 ]
+#      │
+#  168 │   let n = min(n, bottom - top)
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/screen.emel:168:7 ]
+#      │
+#  168 │   let n = min(n, bottom - top)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/screen.emel:169:3 ]
+#      │
+#  169 │   let g = s.grid
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/screen.emel:169:7 ]
+#      │
+#  169 │   let g = s.grid
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/screen.emel:170:7 ]
+#      │
+#  170 │   { s with grid: g[..top] ++ g[top + n..bottom] ++ Array.fill(n, blank_line(s.cols, pen)) ++ g[bottom..] }
+#      │       ──┬─  
+#      │         ╰─── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/screen.emel:175:3 ]
+#      │
+#  175 │   let n = min(n, bottom - top)
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/screen.emel:175:7 ]
+#      │
+#  175 │   let n = min(n, bottom - top)
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/vt/screen.emel:176:3 ]
+#      │
+#  176 │   let g = s.grid
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/screen.emel:176:7 ]
+#      │
+#  176 │   let g = s.grid
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/vt/screen.emel:177:7 ]
+#      │
+#  177 │   { s with grid: g[..top] ++ Array.fill(n, blank_line(s.cols, pen)) ++ g[top..bottom - n] ++ g[bottom..] }
+#      │       ──┬─  
+#      │         ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Normal` in this scope
+#     ╭─[ src/vt/screen.emel:33:14 ]
+#     │
+#  33 │   intensity: Normal,
+#     │              ───┬──  
+#     │                 ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `false` in this scope
+#     ╭─[ src/vt/screen.emel:34:11 ]
+#     │
+#  34 │   italic: false,
+#     │           ──┬──  
+#     │             ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `false` in this scope
+#     ╭─[ src/vt/screen.emel:35:14 ]
+#     │
+#  35 │   underline: false,
+#     │              ──┬──  
+#     │                ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `false` in this scope
+#     ╭─[ src/vt/screen.emel:36:18 ]
+#     │
+#  36 │   strikethrough: false,
+#     │                  ──┬──  
+#     │                    ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `false` in this scope
+#     ╭─[ src/vt/screen.emel:37:10 ]
+#     │
+#  37 │   blink: false,
+#     │          ──┬──  
+#     │            ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `false` in this scope
+#     ╭─[ src/vt/screen.emel:38:12 ]
+#     │
+#  38 │   inverse: false,
+#     │            ──┬──  
+#     │              ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#     ╭─[ src/vt/screen.emel:60:52 ]
+#     │
+#  60 │ pub opaque type Screen(cols: Int, rows: Int, grid: Array[Array[Cell]])
+#     │                                                    ──┬──  
+#     │                                                      ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#     ╭─[ src/vt/screen.emel:60:58 ]
+#     │
+#  60 │ pub opaque type Screen(cols: Int, rows: Int, grid: Array[Array[Cell]])
+#     │                                                          ──┬──  
+#     │                                                            ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#     ╭─[ src/vt/screen.emel:64:39 ]
+#     │
+#  64 │ fn blank_line(cols: Int, pen: Pen) -> Array[Cell] = Array.fill(cols, space(pen))
+#     │                                       ──┬──  
+#     │                                         ╰──── 
+# ────╯
+#
+# error[E0334]: function `cols` has the same name as a field of `Screen`
+#     ╭─[ src/vt/screen.emel:69:8 ]
+#     │
+#  69 │ pub fn cols(s: Screen) -> Int = s.cols
+#     │        ──┬─  
+#     │          ╰─── 
+# ────╯
+#
+# error[E0334]: function `rows` has the same name as a field of `Screen`
+#     ╭─[ src/vt/screen.emel:71:8 ]
+#     │
+#  71 │ pub fn rows(s: Screen) -> Int = s.rows
+#     │        ──┬─  
+#     │          ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#     ╭─[ src/vt/screen.emel:76:41 ]
+#     │
+#  76 │ fn with_line(s: Screen, row: Int, f: fn(Array[Cell]) -> Array[Cell]) -> Screen =
+#     │                                         ──┬──  
+#     │                                           ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#     ╭─[ src/vt/screen.emel:76:57 ]
+#     │
+#  76 │ fn with_line(s: Screen, row: Int, f: fn(Array[Cell]) -> Array[Cell]) -> Screen =
+#     │                                                         ──┬──  
+#     │                                                           ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `written` in this scope
+#      ╭─[ src/vt/screen.emel:102:9 ]
+#      │
+#  102 │   match written {
+#      │         ───┬───  
+#      │            ╰───── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#      ╭─[ src/vt/screen.emel:109:16 ]
+#      │
+#  109 │ fn clear(line: Array[Cell], from: Int, to: Int, pen: Pen) -> Array[Cell] {
+#      │                ──┬──  
+#      │                  ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Array` in this scope
+#      ╭─[ src/vt/screen.emel:109:62 ]
+#      │
+#  109 │ fn clear(line: Array[Cell], from: Int, to: Int, pen: Pen) -> Array[Cell] {
+#      │                                                              ──┬──  
+#      │                                                                ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find value `l2` in this scope
+#      ╭─[ src/vt/screen.emel:115:11 ]
+#      │
+#  115 │     match l2.get(to) {
+#      │           ─┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `WideTail` in this scope
+#      ╭─[ src/vt/screen.emel:116:39 ]
+#      │
+#  116 │       Some(next) if next.occupancy == WideTail => l2.set(to, space(pen))
+#      │                                       ────┬───  
+#      │                                           ╰───── 
+# ─────╯
+#
+# error[E0211]: cannot find value `l2` in this scope
+#      ╭─[ src/vt/screen.emel:132:8 ]
+#      │
+#  132 │     if l2[col].occupancy == WideTail {
+#      │        ─┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `WideTail` in this scope
+#      ╭─[ src/vt/screen.emel:132:29 ]
+#      │
+#  132 │     if l2[col].occupancy == WideTail {
+#      │                             ────┬───  
+#      │                                 ╰───── 
+# ─────╯
+#
+# error[E0211]: cannot find value `l3` in this scope
+#      ╭─[ src/vt/screen.emel:146:5 ]
+#      │
+#  146 │     l3.fill_range(s.cols - n, s.cols, space(pen))
+#      │     ─┬  
+#      │      ╰── 
+# ─────╯
+#
+# error[E0314]: the type of this value must be known to access field `occupancy`
+#      ╭─[ src/vt/screen.emel:116:26 ]
+#      │
+#  116 │       Some(next) if next.occupancy == WideTail => l2.set(to, space(pen))
+#      │                          ────┬────  
+#      │                              ╰────── 
+# ─────╯
+#    = help: add a type annotation
+#
+# error[E0301]: type mismatch: expected `()`, found `Bool`
+#      ╭─[ src/vt/screen.emel:132:10 ]
+#      │
+#  132 │     if l2[col].occupancy == WideTail {
+#      │          ─────────────┬─────────────  
+#      │                       ╰─────────────── 
+# ─────╯
+#
+# error[E0313]: type `List[Int]` has no field or function `occupancy`
+#      ╭─[ src/vt/screen.emel:132:16 ]
+#      │
+#  132 │     if l2[col].occupancy == WideTail {
+#      │                ────┬────  
+#      │                    ╰────── 
+# ─────╯
+#
+# 112 errors, 1 warning
+# --- end wish check ---

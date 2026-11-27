@@ -1,0 +1,771 @@
+# The terminal of the VT: what the actions of Vt.Parser do to the screens, the cursor, the pen, the
+# scroll region, the tab stops, the charsets, the saved cursor and the modes, and the replies to the
+# queries that kbdcast answers. Positions count from 0.
+# The behavior follows avt 0.18.0 (Apache-2.0, https://github.com/asciinema/avt)
+# (`Terminal` in terminal.rs, the dispatch in parser.rs, charset.rs and tabs.rs, without the
+# scrollback, the resizing, xtwinops, which avt leaves off, and the dirty lines.) The replies (DA1,
+# DSR and CPR) and modifyOtherKeys are kbdcast's (spec §7).
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
+
+import Std.Array.{Array}
+import Vt.Parser.{Action, Print, Execute, Csi, Esc}
+import Vt.Screen.{
+  Screen,
+  Pen,
+  Color,
+  Indexed,
+  Rgb,
+  Normal,
+  Bold,
+  Faint,
+  WideTail,
+  Erase,
+  NextChars,
+  ToEndOfScreen,
+  ToStartOfScreen,
+  WholeScreen,
+  ToEndOfLine,
+  ToStartOfLine,
+  WholeLine,
+  DEFAULT_PEN,
+}
+import Key.Encode.{InputModes, Application, Cr, CrLf, Off, On, One, Two, DEFAULT_MODES}
+
+## What the terminal answers to a query of the application.
+pub enum Reply {
+  ## To DA1 (`CSI c` and `CSI 0 c`): a VT220 with ANSI colors, `CSI ? 62 ; 22 c`.
+  DeviceAttributes
+  ## To DSR 5 (`CSI 5 n`): no malfunction, `CSI 0 n`.
+  Status
+  ## To CPR (`CSI 6 n`): the row and the column of the cursor, counted from 1, `CSI row ; col R`.
+  ## The column after writing in the last column is the last column, and in origin mode the row
+  ## counts from the top of the scroll region.
+  CursorPosition(Int, Int)
+} derive Eq, Show
+
+# The character sets that G0 and G1 can hold (avt's `Charset`).
+enum Charset {
+  Ascii
+  Drawing
+}
+
+# What DECSC, SCOSC and mode 1048 save (avt's `SavedCtx`).
+type Saved(col: Int, row: Int, pen: Pen, origin: Bool, auto_wrap: Bool)
+
+const DEFAULT_SAVED: Saved = Saved(col: 0, row: 0, pen: DEFAULT_PEN, origin: False, auto_wrap: True)
+
+## A terminal of a fixed size: its primary and alternate screens, the cursor, the pen, the scroll
+## region, the tab stops, the charsets, the saved cursors and the modes.
+pub opaque type Terminal(
+  col_count: Int,
+  row_count: Int,
+  # The screen in view, and the other one: the primary one while the alternate one is in view.
+  # FRICTION(035): a function cannot have the name of a field, so the screen that `screen` reads is
+  # `active`.
+  active: Screen,
+  inactive: Screen,
+  alternate: Bool,
+  # The cursor: its column is `col_count` right after writing in the last column.
+  col: Int,
+  row: Int,
+  visible: Bool,
+  pen: Pen,
+  g0: Charset,
+  g1: Charset,
+  # Whether G1 is in use (SO), not G0 (SI).
+  shifted: Bool,
+  # In ascending order.
+  tab_stops: List[Int],
+  insert: Bool,
+  origin: Bool,
+  auto_wrap: Bool,
+  # DECCKM, LNM and modifyOtherKeys.
+  modes: InputModes,
+  # The scroll region, from `top` to `bottom` inclusive.
+  top: Int,
+  bottom: Int,
+  # What is saved for the screen in view, and for the other one.
+  saved: Saved,
+  other_saved: Saved,
+)
+
+## A terminal of `cols` columns and `rows` rows as an application finds it: blank screens, the
+## cursor at the top left, and every mode as avt starts it. Fewer than one column or row is a
+## defect.
+pub fn terminal(cols: Int, rows: Int) -> Terminal {
+  if cols < 1 || rows < 1 {
+    panic("a terminal needs at least one column and one row, not #{cols} by #{rows}")
+  }
+  Terminal(
+    col_count: cols,
+    row_count: rows,
+    active: Screen.blank(cols, rows, DEFAULT_PEN),
+    inactive: Screen.blank(cols, rows, DEFAULT_PEN),
+    alternate: False,
+    col: 0,
+    row: 0,
+    visible: True,
+    pen: DEFAULT_PEN,
+    g0: Ascii,
+    g1: Ascii,
+    shifted: False,
+    # avt's `Tabs::new`: every 8 columns.
+    # FRICTION(058): `List.range` has no step, so the range counts the stops and `map` places them.
+    tab_stops: List.range(1, (cols - 1) / 8 + 1).map(|i| 8 * i),
+    insert: False,
+    origin: False,
+    auto_wrap: True,
+    modes: DEFAULT_MODES,
+    top: 0,
+    bottom: rows - 1,
+    saved: DEFAULT_SAVED,
+    other_saved: DEFAULT_SAVED,
+  )
+}
+
+## The screen in view.
+pub fn screen(t: Terminal) -> Screen {
+  t.active
+}
+
+## The column and the row of the cursor, and whether it is visible. The column is `cols` right after
+## writing in the last column, as in avt.
+pub fn cursor(t: Terminal) -> (Int, Int, Bool) {
+  (t.col, t.row, t.visible)
+}
+
+## The modes that change what the keys send: DECCKM, LNM and modifyOtherKeys.
+pub fn input_modes(t: Terminal) -> InputModes {
+  t.modes
+}
+
+## The terminal after the action `a`, and the replies that it makes.
+pub fn apply(t: Terminal, a: Action) -> (Terminal, List[Reply]) {
+  a match {
+    Print(s)          -> (s.code_points().fold(t, print), [])
+    Execute(c)        -> (execute(t, c), [])
+    Csi(ps, inter, f) -> csi(t, ps, inter.code_points().last(), f)
+    Esc(inter, f)     -> (esc(t, inter.code_points().last(), f), [])
+  }
+}
+
+# What a C0 or C1 control does (avt's `execute` in parser.rs). The rest do nothing.
+# FRICTION(015): there is no or-pattern, so the controls that move down a line have an arm each.
+fn execute(t: Terminal, c: Int) -> Terminal {
+  c match {
+    0x08 -> to_rel_col(t, if t.col == t.col_count { -2 } else { -1 }) # BS
+    0x09 -> next_tab(t, 1) # HT
+    0x0A -> linefeed(t) # LF
+    0x0B -> linefeed(t) # VT
+    0x0C -> linefeed(t) # FF
+    0x0D -> Terminal(col: 0, ..t) # CR
+    0x0E -> Terminal(shifted: True, ..t) # SO
+    0x0F -> Terminal(shifted: False, ..t) # SI
+    0x84 -> linefeed(t) # IND
+    0x85 -> Terminal(col: 0, ..down_with_scroll(t)) # NEL
+    0x88 -> set_tab(t) # HTS
+    0x8D -> reverse_index(t) # RI
+    _    -> t
+  }
+}
+
+# What an ESC sequence does, by the last of its intermediate characters and its final character
+# (avt's `esc_dispatch`).
+# FRICTION(013): there is no code point literal, so the characters are in hexadecimal, with the
+# character in a comment.
+fn esc(t: Terminal, inter: Option[Int], f: Int) -> Terminal {
+  (inter, f) match {
+    # From `@` to `_`: the C1 control 0x40 above (`ESC D` is IND, `ESC E` NEL, `ESC H` HTS, `ESC M`
+    # RI).
+    (None, _) if f >= 0x40 && f <= 0x5F -> execute(t, f + 0x40)
+    (None, 0x37)                        -> save_cursor(t) # 7 DECSC
+    (None, 0x38)                        -> restore_cursor(t) # 8 DECRC
+    (None, 0x63)                        -> terminal(t.col_count, t.row_count) # c RIS
+    (Some(0x23), 0x38)                  -> decaln(t) # # 8 DECALN
+    (Some(0x28), 0x30)                  -> Terminal(g0: Drawing, ..t) # ( 0
+    (Some(0x28), _)                     -> Terminal(g0: Ascii, ..t) # ( and any other
+    (Some(0x29), 0x30)                  -> Terminal(g1: Drawing, ..t) # ) 0
+    (Some(0x29), _)                     -> Terminal(g1: Ascii, ..t) # ) and any other
+    _                                   -> t
+  }
+}
+
+# What a CSI sequence does, by its parameters `ps`, the last of its private marker and intermediate
+# characters, and its final character (avt's `csi_dispatch`), and the replies to the queries that
+# kbdcast answers. The rest, `CSI t` (xtwinops, which avt leaves off) among them, do nothing.
+# FRICTION(013): there is no code point literal, so the characters are in hexadecimal, with the
+# character in a comment, and FRICTION(015): there is no or-pattern, so the final characters that
+# do the same (`B` and `e`, `C` and `a`, `G` and `` ` ``, `H` and `f`) have an arm each.
+fn csi(t: Terminal, ps: List[List[Int]], inter: Option[Int], f: Int) -> (Terminal, List[Reply]) {
+  n = count(ps, 0, 1)
+  (inter, f) match {
+    (None, 0x40) -> (ich(t, n), []) # @ ICH
+    (None, 0x41) -> (cursor_up(t, n), []) # A CUU
+    (None, 0x42) -> (cursor_down(t, n), []) # B CUD
+    (None, 0x43) -> (to_rel_col(t, n), []) # C CUF
+    (None, 0x44) -> (to_rel_col(t, if t.col == t.col_count { -n - 1 } else { -n }), []) # D CUB
+    (None, 0x45) -> (Terminal(col: 0, ..cursor_down(t, n)), []) # E CNL
+    (None, 0x46) -> (Terminal(col: 0, ..cursor_up(t, n)), []) # F CPL
+    (None, 0x47) -> (to_col(t, n - 1), []) # G CHA
+    (None, 0x48) -> (to_row(to_col(t, count(ps, 1, 1) - 1), n - 1), []) # H CUP
+    (None, 0x49) -> (next_tab(t, n), []) # I CHT
+    (None, 0x4A) -> (erase_display(t, arg(ps, 0)), []) # J ED
+    (None, 0x4B) -> (erase_line(t, arg(ps, 0)), []) # K EL
+    (None, 0x4C) -> (insert_lines(t, n), []) # L IL
+    (None, 0x4D) -> (delete_lines(t, n), []) # M DL
+    (None, 0x50) -> (delete_chars(t, n), []) # P DCH
+    (None, 0x53) -> (scroll_up(t, n), []) # S SU
+    (None, 0x54) -> (scroll_down(t, n), []) # T SD
+    (None, 0x57) -> (tab_control(t, arg(ps, 0)), []) # W CTC
+    (None, 0x58) -> (erase(t, NextChars(n)), []) # X ECH
+    (None, 0x5A) -> (prev_tab(t, n), []) # Z CBT
+    (None, 0x60) -> (to_col(t, n - 1), []) # ` HPA
+    (None, 0x61) -> (to_rel_col(t, n), []) # a HPR
+    (None, 0x62) -> (repeat(t, n), []) # b REP
+    (None, 0x63) -> (t, if arg(ps, 0) == 0 { [DeviceAttributes] } else { [] }) # c DA1
+    (None, 0x64) -> (to_row(t, n - 1), []) # d VPA
+    (None, 0x65) -> (cursor_down(t, n), []) # e VPR
+    (None, 0x66) -> (to_row(to_col(t, count(ps, 1, 1) - 1), n - 1), []) # f HVP
+    (None, 0x67) -> (tab_clear(t, arg(ps, 0)), []) # g TBC
+    (None, 0x68) -> (ps.fold(t, |t, p| ansi_mode(t, value(p), True)), []) # h SM
+    (None, 0x6C) -> (ps.fold(t, |t, p| ansi_mode(t, value(p), False)), []) # l RM
+    # m SGR: `CSI m` is `CSI 0 m`.
+    (None, 0x6D) -> (Terminal(pen: sgr(t.pen, if ps == [] { [[0]] } else { ps }), ..t), [])
+    (None, 0x6E) -> (t, status(t, arg(ps, 0))) # n DSR
+    # r DECSTBM
+    (None, 0x72) -> (set_margins(t, n - 1, count(ps, 1, t.row_count) - 1), [])
+    (None, 0x73) -> (save_cursor(t), []) # s SCOSC
+    (None, 0x75) -> (restore_cursor(t), []) # u SCORC
+    (Some(0x21), 0x70) -> (soft_reset(t), []) # ! p DECSTR
+    (Some(0x3F), 0x68) -> (ps.fold(t, |t, p| dec_mode(t, value(p), True)), []) # ? h DECSET
+    (Some(0x3F), 0x6C) -> (ps.fold(t, |t, p| dec_mode(t, value(p), False)), []) # ? l DECRST
+    # > m: with no parameter, xterm's XTMODKEYS resets every resource, modifyOtherKeys among them.
+    (Some(0x3E), 0x6D) if ps == [] -> (other_keys(t, 0), [])
+    (Some(0x3E), 0x6D) if arg(ps, 0) == 4 -> (other_keys(t, arg(ps, 1)), []) # > 4 ; n m
+    _            -> (t, [])
+  }
+}
+
+# avt's `Param::as_u16`: the first part of a parameter.
+# FRICTION(040): the parser never gives a parameter with no part, so the `None` of `p.head()`
+# cannot happen, and Option has no `expect`; the match on the parts makes `[]` the panic.
+fn value(p: List[Int]) -> Int {
+  p match {
+    [n, ..] -> n
+    []      -> panic("a CSI parameter with no part, which Vt.Parser never gives")
+  }
+}
+
+# The parameter `i` of a CSI sequence. avt reads a parameter that the sequence does not have as 0.
+fn arg(ps: List[List[Int]], i: Int) -> Int {
+  ps.get(i) match {
+    Some(p) -> value(p)
+    None    -> 0
+  }
+}
+
+# The parameter `i` as a count (avt's `as_usize`): 0 is `default`.
+fn count(ps: List[List[Int]], i: Int, default: Int) -> Int {
+  n = arg(ps, i)
+  if n == 0 { default } else { n }
+}
+
+# The replies to DSR: the status for 5 and the position of the cursor for 6. In origin mode DECRC
+# can leave the cursor above the top margin, where the row of the reply stays 1.
+fn status(t: Terminal, n: Int) -> List[Reply] {
+  n match {
+    5 -> [Status]
+    6 -> [
+      CursorPosition(
+        Int.max(t.row - (if t.origin { t.top } else { 0 }) + 1, 1),
+        Int.min(t.col, t.col_count - 1) + 1,
+      ),
+    ]
+    _ -> []
+  }
+}
+
+# `CSI > 4 ; n m`: modifyOtherKeys off for 0 (and when `n` is left out, and for `CSI > m`), at a
+# level for 1 and 2. A level that xterm does not have changes nothing.
+fn other_keys(t: Terminal, n: Int) -> Terminal {
+  level = n match {
+    0 -> Some(Off)
+    1 -> Some(On(One))
+    2 -> Some(On(Two))
+    _ -> None
+  }
+  level match {
+    Some(k) -> Terminal(modes: InputModes(other_keys: k, ..t.modes), ..t)
+    None    -> t
+  }
+}
+
+# An ANSI mode set (`CSI n h`) or reset (`CSI n l`): IRM (4) and LNM (20). avt has no other.
+fn ansi_mode(t: Terminal, mode: Int, on: Bool) -> Terminal {
+  mode match {
+    4  -> Terminal(insert: on, ..t)
+    20 -> Terminal(modes: InputModes(newline: if on { CrLf } else { Cr }, ..t.modes), ..t)
+    _  -> t
+  }
+}
+
+# A DEC private mode set (`CSI ? n h`) or reset (`CSI ? n l`): those of avt's `dec_mode`.
+# FRICTION(015): there is no or-pattern, so 47 and 1047 have an arm each.
+fn dec_mode(t: Terminal, mode: Int, on: Bool) -> Terminal {
+  (mode, on) match {
+    (1, True)     -> Terminal(modes: InputModes(cursor_keys: Application, ..t.modes), ..t)
+    (1, False)    -> Terminal(modes: InputModes(cursor_keys: Encode.Normal, ..t.modes), ..t)
+    (6, _)        -> home(Terminal(origin: on, ..t))
+    (7, _)        -> Terminal(auto_wrap: on, ..t)
+    (25, _)       -> Terminal(visible: on, ..t)
+    (47, True)    -> to_alternate(t)
+    (47, False)   -> to_primary(t)
+    (1047, True)  -> to_alternate(t)
+    (1047, False) -> to_primary(t)
+    (1048, True)  -> save_cursor(t)
+    (1048, False) -> restore_cursor(t)
+    (1049, True)  -> to_alternate(save_cursor(t))
+    (1049, False) -> restore_cursor(to_primary(t))
+    _             -> t
+  }
+}
+
+# The pen after the SGR parameters `ps`, from the first (avt's `SgrOpsDecoder` and `sgr`).
+# FRICTION(015): there is no or-pattern, so 21 and 22 have an arm each.
+fn sgr(pen: Pen, ps: List[List[Int]]) -> Pen {
+  ps match {
+    []                                  -> pen
+    [[0], ..rest]                       -> sgr(DEFAULT_PEN, rest)
+    [[1], ..rest]                       -> sgr(Pen(intensity: Bold, ..pen), rest)
+    [[2], ..rest]                       -> sgr(Pen(intensity: Faint, ..pen), rest)
+    [[3], ..rest]                       -> sgr(Pen(italic: True, ..pen), rest)
+    [[4], ..rest]                       -> sgr(Pen(underline: True, ..pen), rest)
+    [[5], ..rest]                       -> sgr(Pen(blink: True, ..pen), rest)
+    [[7], ..rest]                       -> sgr(Pen(inverse: True, ..pen), rest)
+    [[9], ..rest]                       -> sgr(Pen(strikethrough: True, ..pen), rest)
+    [[21], ..rest]                      -> sgr(Pen(intensity: Normal, ..pen), rest)
+    [[22], ..rest]                      -> sgr(Pen(intensity: Normal, ..pen), rest)
+    [[23], ..rest]                      -> sgr(Pen(italic: False, ..pen), rest)
+    [[24], ..rest]                      -> sgr(Pen(underline: False, ..pen), rest)
+    [[25], ..rest]                      -> sgr(Pen(blink: False, ..pen), rest)
+    [[27], ..rest]                      -> sgr(Pen(inverse: False, ..pen), rest)
+    [[29], ..rest]                      -> sgr(Pen(strikethrough: False, ..pen), rest)
+    [[n], ..rest] if n >= 30 && n <= 37 -> sgr(Pen(foreground: Some(Indexed(n - 30)), ..pen), rest)
+    [[38, ..parts], ..rest] -> extended(parts, rest) match {
+      (Some(c), after) -> sgr(Pen(foreground: Some(c), ..pen), after)
+      (None, after)    -> sgr(pen, after)
+    }
+    [[39], ..rest]                      -> sgr(Pen(foreground: None, ..pen), rest)
+    [[n], ..rest] if n >= 40 && n <= 47 -> sgr(Pen(background: Some(Indexed(n - 40)), ..pen), rest)
+    [[48, ..parts], ..rest] -> extended(parts, rest) match {
+      (Some(c), after) -> sgr(Pen(background: Some(c), ..pen), after)
+      (None, after)    -> sgr(pen, after)
+    }
+    [[49], ..rest]                      -> sgr(Pen(background: None, ..pen), rest)
+    [[n], ..rest] if n >= 90 && n <= 97 -> sgr(Pen(foreground: Some(Indexed(n - 82)), ..pen), rest)
+    [[n], ..rest] if n >= 100 && n <= 107 -> sgr(
+      Pen(background: Some(Indexed(n - 92)), ..pen),
+      rest,
+    )
+    [_, ..rest]                         -> sgr(pen, rest)
+  }
+}
+
+# The color of 38 or 48 with the parts after it in its parameter (`38:5:i`, `38:2:r:g:b`,
+# `38:2::r:g:b`) or with the parameters after it (`38;5;i`, `38;2;r;g;b`), and the parameters that
+# are left. avt skips what it cannot read as a color: 38 or 48 with parts it does not know, 38 or
+# 48 with a parameter after it that is neither 2 nor 5, and `2` or `5` with too few parameters after
+# them.
+# FRICTION(015): there is no or-pattern, so the two ways to write RGB in one parameter have an arm
+# each.
+fn extended(parts: List[Int], rest: List[List[Int]]) -> (Option[Color], List[List[Int]]) {
+  (parts, rest) match {
+    ([2, r, g, b], _)                               -> (Some(rgb(r, g, b)), rest)
+    ([2, _, r, g, b], _)                            -> (Some(rgb(r, g, b)), rest)
+    ([5, i], _)                                     -> (Some(Indexed(byte(i))), rest)
+    ([], [[2], [r, ..], [g, ..], [b, ..], ..after]) -> (Some(rgb(r, g, b)), after)
+    ([], [[2], ..after])                            -> (None, after)
+    ([], [[5], [i, ..], ..after])                   -> (Some(Indexed(byte(i))), after)
+    ([], [[5], ..after])                            -> (None, after)
+    _                                               -> (None, rest)
+  }
+}
+
+fn rgb(r: Int, g: Int, b: Int) -> Color {
+  Rgb(byte(r), byte(g), byte(b))
+}
+
+# A parameter (a u16) as avt makes it a u8.
+fn byte(n: Int) -> Int {
+  n.bit_and(0xFF)
+}
+
+# Writes the character `c` at the cursor (avt's `print`): through the charset in use, in insert mode
+# after moving the cells from the cursor one column right, and when it does not fit, on the next
+# line with auto-wrap and at the end of the line without.
+fn print(t: Terminal, c: Int) -> Terminal {
+  ch = translate(if t.shifted { t.g1 } else { t.g0 }, c)
+  if t.col >= t.col_count {
+    relocate(t, ch)
+  } else {
+    shifted = if t.insert { Screen.shift_right(t.active, t.col, t.row, 1, t.pen) } else { t.active }
+    Screen.print(shifted, t.col, t.row, ch, t.pen) match {
+      (s, Some(width)) -> {
+        col = t.col + width
+        Terminal(
+          active: s,
+          col: if col == t.col_count && !t.auto_wrap { col - 1 } else { col },
+          ..t,
+        )
+      }
+      (s, None) -> relocate(Terminal(active: s, ..t), ch)
+    }
+  }
+}
+
+# Writes `c`, which does not fit at the cursor.
+fn relocate(t: Terminal, c: Int) -> Terminal {
+  if t.auto_wrap { wrap_and_print(t, c) } else { print_at_line_end(t, c) }
+}
+
+# avt's `wrap_and_print_at_line_start`: writes `c` at the start of the next line, scrolling at the
+# bottom of the scroll region and staying on the last line below it. A wide character in a terminal
+# of one column is not written, and leaves the cursor at column 0.
+fn wrap_and_print(t: Terminal, c: Int) -> Terminal {
+  moved = if t.row == t.bottom {
+    scroll_up(t, 1)
+  } else if t.row < t.row_count - 1 {
+    Terminal(row: t.row + 1, ..t)
+  } else {
+    t
+  }
+  (s, width) = Screen.print(moved.active, 0, moved.row, c, moved.pen)
+  Terminal(active: s, col: width.or(0), ..moved)
+}
+
+# avt's `print_at_line_end`: writes `c` in the last column it fits in before the cursor, and leaves
+# the cursor in the last column.
+fn print_at_line_end(t: Terminal, c: Int) -> Terminal {
+  col = t.col - 1
+  s = if t.col == 0 {
+    t.active
+  } else {
+    Screen.print(t.active, col, t.row, c, t.pen) match {
+      (printed, Some(_)) -> printed
+      # A wide character in the last column goes one column left, where it fits.
+      (unprinted, None) if col > 0 -> {
+        (printed, _) = Screen.print(unprinted, col - 1, t.row, c, t.pen)
+        printed
+      }
+      (unprinted, None)  -> unprinted
+    }
+  }
+  Terminal(active: s, col: t.col_count - 1, ..t)
+}
+
+# What `c` stands for in `charset` (avt's `Charset::translate`).
+fn translate(charset: Charset, c: Int) -> Int {
+  charset match {
+    Drawing if c >= 0x60 && c <= 0x7E -> at(DRAWING, c - 0x60)
+    _                                 -> c
+  }
+}
+
+# The DEC Special Graphics characters of 0x60 to 0x7E (avt's `SPECIAL_GFX_CHARS`).
+const DRAWING: Array[Int] = Array.from_list("♦▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£⋅".code_points())
+
+# The element at `index`, which the caller knows to be in range.
+# FRICTION(009): Array has no read that makes a position out of range a defect, and
+# FRICTION(040): Option has no `expect`, so the `None` that cannot happen is a match with a panic.
+fn at[A](a: Array[A], index: Int) -> A {
+  a.get(index) match {
+    Some(x) -> x
+    None    -> panic("position #{index} is out of an array of size #{a.size()}")
+  }
+}
+
+# avt's `rep`: writes the character before the cursor (the whole of a wide one) `n` more times. The
+# cell is read from `Screen.lines`, which is the only read of a cell that Vt.Screen has.
+# FRICTION(040): the row of the cursor is on the screen and the cell in the first column is never
+# the right half of a wide character, so the `None` cannot happen, and Option has no `expect`.
+fn repeat(t: Terminal, n: Int) -> Terminal {
+  if t.col == 0 {
+    t
+  } else {
+    before = Screen.lines(t.active).get(t.row).and_then(|line| {
+      line.take(t.col).reverse().find(|cell| cell.occupancy != WideTail)
+    })
+    before match {
+      Some(cell) -> List.range(0, n).fold(t, |t, _| print(t, cell.char))
+      None       -> panic("no character before column #{t.col} of row #{t.row}")
+    }
+  }
+}
+
+# avt's `ich`: moves the cells from the cursor `n` columns right and blanks the `n` cells it leaves.
+fn ich(t: Terminal, n: Int) -> Terminal {
+  col = Int.min(t.col, t.col_count - 1)
+  k = Int.min(n, t.col_count - col)
+  shifted = Screen.shift_right(t.active, col, t.row, k, t.pen)
+  s = List.range(col, col + k).fold(shifted, |s, c| {
+    (written, _) = Screen.print(s, c, t.row, 0x20, t.pen)
+    written
+  })
+  Terminal(active: s, col:, ..t)
+}
+
+# avt's `dch`: deletes `n` cells from the cursor, moved into the last column if it is past it.
+fn delete_chars(t: Terminal, n: Int) -> Terminal {
+  col = Int.min(t.col, t.col_count - 1)
+  Terminal(active: Screen.delete(t.active, col, t.row, n, t.pen), col:, ..t)
+}
+
+# avt's `ed`: 0 below the cursor, 1 above it, 2 all of the screen. The rest (3 among them) do
+# nothing.
+fn erase_display(t: Terminal, n: Int) -> Terminal {
+  n match {
+    0 -> erase(t, ToEndOfScreen)
+    1 -> erase(t, ToStartOfScreen)
+    2 -> erase(t, WholeScreen)
+    _ -> t
+  }
+}
+
+# avt's `el`: 0 right of the cursor, 1 left of it, 2 all of the line.
+fn erase_line(t: Terminal, n: Int) -> Terminal {
+  n match {
+    0 -> erase(t, ToEndOfLine)
+    1 -> erase(t, ToStartOfLine)
+    2 -> erase(t, WholeLine)
+    _ -> t
+  }
+}
+
+fn erase(t: Terminal, mode: Erase) -> Terminal {
+  Terminal(active: Screen.erase(t.active, t.col, t.row, mode, t.pen), ..t)
+}
+
+# avt's `il` and `dl`: the rows from the cursor to the bottom of the scroll region, or to the bottom
+# of the screen below the region, move `n` down or up.
+fn insert_lines(t: Terminal, n: Int) -> Terminal {
+  Terminal(active: Screen.scroll_down(t.active, t.row, lines_end(t), n, t.pen), ..t)
+}
+
+fn delete_lines(t: Terminal, n: Int) -> Terminal {
+  Terminal(active: Screen.scroll_up(t.active, t.row, lines_end(t), n, t.pen), ..t)
+}
+
+fn lines_end(t: Terminal) -> Int {
+  if t.row <= t.bottom { t.bottom + 1 } else { t.row_count }
+}
+
+# The scroll region moves `n` rows up or down.
+fn scroll_up(t: Terminal, n: Int) -> Terminal {
+  Terminal(active: Screen.scroll_up(t.active, t.top, t.bottom + 1, n, t.pen), ..t)
+}
+
+fn scroll_down(t: Terminal, n: Int) -> Terminal {
+  Terminal(active: Screen.scroll_down(t.active, t.top, t.bottom + 1, n, t.pen), ..t)
+}
+
+# avt's `decaln`: every cell `E` with the default pen. The cursor stays.
+fn decaln(t: Terminal) -> Terminal {
+  s = List.range(0, t.row_count).fold(t.active, |s, row| {
+    List.range(0, t.col_count).fold(s, |s, col| {
+      (written, _) = Screen.print(s, col, row, 0x45, DEFAULT_PEN)
+      written
+    })
+  })
+  Terminal(active: s, ..t)
+}
+
+# avt's `lf`: down a line, and to the first column in newline mode.
+fn linefeed(t: Terminal) -> Terminal {
+  moved = down_with_scroll(t)
+  if t.modes.newline == CrLf { Terminal(col: 0, ..moved) } else { moved }
+}
+
+# avt's `move_cursor_down_with_scroll`: the scroll region scrolls up at its bottom, and the cursor
+# does not move on the last row.
+fn down_with_scroll(t: Terminal) -> Terminal {
+  if t.row == t.bottom {
+    scroll_up(t, 1)
+  } else if t.row < t.row_count - 1 {
+    to_row_of_screen(t, t.row + 1)
+  } else {
+    t
+  }
+}
+
+# avt's `ri`: up a line, and the scroll region scrolls down at its top. As in avt, the row it moves
+# to counts from the top of the scroll region in origin mode.
+fn reverse_index(t: Terminal) -> Terminal {
+  if t.row == t.top {
+    scroll_down(t, 1)
+  } else if t.row > 0 {
+    to_row(t, t.row - 1)
+  } else {
+    t
+  }
+}
+
+# avt's `move_cursor_to_col`: to `col`, or to the last column past it.
+fn to_col(t: Terminal, col: Int) -> Terminal {
+  Terminal(col: Int.min(col, t.col_count - 1), ..t)
+}
+
+# avt's `move_cursor_to_rel_col`: `n` columns right (left if negative), within the screen.
+fn to_rel_col(t: Terminal, n: Int) -> Terminal {
+  Terminal(col: Int.max(0, Int.min(t.col + n, t.col_count - 1)), ..t)
+}
+
+# avt's `move_cursor_to_row`: to row `row` from the top of the scroll region in origin mode, or of
+# the screen without, and no further than the bottom of the same.
+fn to_row(t: Terminal, row: Int) -> Terminal {
+  top = if t.origin { t.top } else { 0 }
+  bottom = if t.origin { t.bottom } else { t.row_count - 1 }
+  to_row_of_screen(t, Int.min(Int.max(top + row, top), bottom))
+}
+
+# avt's `do_move_cursor_to_row`: to row `row` of the screen, moving into the last column if past it.
+fn to_row_of_screen(t: Terminal, row: Int) -> Terminal {
+  Terminal(col: Int.min(t.col, t.col_count - 1), row:, ..t)
+}
+
+# avt's `move_cursor_home`.
+fn home(t: Terminal) -> Terminal {
+  to_row_of_screen(Terminal(col: 0, ..t), if t.origin { t.top } else { 0 })
+}
+
+# avt's `cursor_up` and `cursor_down`: `n` rows, stopping at the edge of the scroll region, or of the
+# screen when the cursor is outside the region on that side.
+fn cursor_up(t: Terminal, n: Int) -> Terminal {
+  limit = if t.row < t.top { 0 } else { t.top }
+  to_row_of_screen(t, Int.max(t.row - n, limit))
+}
+
+fn cursor_down(t: Terminal, n: Int) -> Terminal {
+  limit = if t.row > t.bottom { t.row_count - 1 } else { t.bottom }
+  to_row_of_screen(t, Int.min(t.row + n, limit))
+}
+
+# avt's `move_cursor_to_next_tab` and `Tabs::after`: to the `n`th tab stop right of the cursor, or
+# to the last column when there are fewer.
+fn next_tab(t: Terminal, n: Int) -> Terminal {
+  to_col(t, t.tab_stops.filter(|stop| stop > t.col).get(n - 1).or(t.col_count - 1))
+}
+
+# avt's `move_cursor_to_prev_tab` and `Tabs::before`: to the `n`th tab stop left of the cursor, or
+# to the first column when there are fewer.
+fn prev_tab(t: Terminal, n: Int) -> Terminal {
+  to_col(t, t.tab_stops.filter(|stop| stop < t.col).reverse().get(n - 1).or(0))
+}
+
+# avt's `set_tab`: a tab stop at the cursor, unless it is in the first column or past the last.
+# FRICTION(018): List has no `contains`.
+fn set_tab(t: Terminal) -> Terminal {
+  if t.col > 0 && t.col < t.col_count && !t.tab_stops.any(|stop| stop == t.col) {
+    Terminal(tab_stops: [t.col, ..t.tab_stops].sort(), ..t)
+  } else {
+    t
+  }
+}
+
+fn clear_tab(t: Terminal) -> Terminal {
+  Terminal(tab_stops: t.tab_stops.filter(|stop| stop != t.col), ..t)
+}
+
+# avt's `ctc` (`CSI n W`): 0 sets a tab stop at the cursor, 2 clears it, 5 clears all.
+fn tab_control(t: Terminal, n: Int) -> Terminal {
+  n match {
+    0 -> set_tab(t)
+    2 -> clear_tab(t)
+    5 -> Terminal(tab_stops: [], ..t)
+    _ -> t
+  }
+}
+
+# avt's `tbc` (`CSI n g`): 0 clears the tab stop at the cursor, 3 clears all.
+fn tab_clear(t: Terminal, n: Int) -> Terminal {
+  n match {
+    0 -> clear_tab(t)
+    3 -> Terminal(tab_stops: [], ..t)
+    _ -> t
+  }
+}
+
+# avt's `decstbm`: the scroll region from row `top` to row `bottom` if it is at least two rows on
+# the screen, and the cursor home in any case.
+fn set_margins(t: Terminal, top: Int, bottom: Int) -> Terminal {
+  if top < bottom && bottom < t.row_count { home(Terminal(top:, bottom:, ..t)) } else { home(t) }
+}
+
+# avt's `save_cursor`: the column saved is in the screen.
+fn save_cursor(t: Terminal) -> Terminal {
+  saved = Saved(
+    col: Int.min(t.col, t.col_count - 1),
+    row: t.row,
+    pen: t.pen,
+    origin: t.origin,
+    auto_wrap: t.auto_wrap,
+  )
+  Terminal(saved:, ..t)
+}
+
+fn restore_cursor(t: Terminal) -> Terminal {
+  s = t.saved
+  Terminal(col: s.col, row: s.row, pen: s.pen, origin: s.origin, auto_wrap: s.auto_wrap, ..t)
+}
+
+# avt's `switch_to_alternate_buffer`: a new alternate screen of blank cells with the pen, and the
+# saved cursor of the alternate screen.
+fn to_alternate(t: Terminal) -> Terminal {
+  if t.alternate {
+    t
+  } else {
+    Terminal(
+      active: Screen.blank(t.col_count, t.row_count, t.pen),
+      inactive: t.active,
+      alternate: True,
+      saved: t.other_saved,
+      other_saved: t.saved,
+      ..t,
+    )
+  }
+}
+
+# avt's `switch_to_primary_buffer`.
+fn to_primary(t: Terminal) -> Terminal {
+  if t.alternate {
+    Terminal(
+      active: t.inactive,
+      inactive: t.active,
+      alternate: False,
+      saved: t.other_saved,
+      other_saved: t.saved,
+      ..t,
+    )
+  } else {
+    t
+  }
+}
+
+# avt's `soft_reset` (DECSTR). The modes of the keys, auto-wrap, the tab stops, the cursor and the
+# screens stay.
+fn soft_reset(t: Terminal) -> Terminal {
+  Terminal(
+    visible: True,
+    top: 0,
+    bottom: t.row_count - 1,
+    insert: False,
+    origin: False,
+    pen: DEFAULT_PEN,
+    g0: Ascii,
+    g1: Ascii,
+    shifted: False,
+    saved: DEFAULT_SAVED,
+    ..t,
+  )
+}

@@ -20,6 +20,7 @@
   - `Array[Bool]` と `Array.set`（上の本来の形）: 4926 ms。JS は `set` のたびに 2m の配列を写すので、位置ごとに O(m²)
   - 重複を除かない形（この入力ではスレッドが同じ状態に来ないので結果は同じ。比較のためだけ）: 219 ms。採った形の時間の 3 分の 2 近くが `Set` に使われている
   `(a*)*b`、`(a|a)*b` を 2000 と 4000 の `a` に当てたときの比は、どの形でも 2 倍（`regex/test/linear_test.emel`）
+  VT の画面（`src/vt/screen.emel`、サブプロジェクト 3 の計画の Task 4）の 1 つのデータ: 1 文字書くたびに行の Array と画面の行の Array を `Array.set` で書き換える形を、回避せずに素直に書いた（印は無い）。Task 6 で、80 列 × 24 行の画面に計画の再描画の入力（1,049,688 bytes、約 4 KB ずつ）を流して測ると、1 MB あたり 0.62〜0.89 秒、REP の多い入力（1,051,200 bytes）で 3.7〜4.2 秒（v0.28.2、JS。`emela test` の中で `Std.Clock` で測った）。VT の spec（`docs/superpowers/specs/2026-11-27-kbdcast-3-vt-design.md` §9）の閾値の 10 秒/MB より下なので、JS で `set` が写すことは、ここでは回避の要る所にならなかった（全体設計 §13 の `Array.set` の行が、VT の画面で測った数を添えるとしていたもの）
 - コスト: 照合が O(m·n) でなく O(m log m · n) になる。JS では本来の形の 8 分の 1 の時間で済むが、重複を除かない形の約 3 倍かかる（`a{1000}` で 0.6 秒）。WASM と native の本来の形（O(1) の `set`）より遅いと見積もる（測っていない）。行数のコストは無い。普段のコードに基盤レベルは漏れていない（`Std.State` は effect で、`uses` が普段のコードに出る。それに、State に入れた Array も JS では `set` で写る）
 - spec:
   `[api.std.array]`（「The JS target always copies.」。WASM と native は、引数が後で使われない変数で、他から参照されていなければ O(1) でなければならない）、`[api.std.set]`（中身は `Map[A, ()]`）、`[api.std.map]`（重みで釣り合わせた木）、`[target.js]`、`spec/open-questions.md` の 21（Ref は無い。可変の状態は State）と 36（Map と Set は Emela で書いた木）

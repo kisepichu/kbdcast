@@ -1,0 +1,107 @@
+import Brix.Pbt.Property.{Config}
+import Std.Bytes
+import Vt
+import Vt.Terminal.{Reply, DeviceAttributes, Status, CursorPosition}
+import Vt.Screen.{Cell}
+import Key.Encode.{InputModes, Application}
+import VtGolden.{CASES}
+import VtSnapshot
+import Cut
+
+# The terminal of `cols` columns and `rows` rows after `input`.
+fn fed(cols: Int, rows: Int, input: String) -> Vt.Terminal {
+  (t, _) = Vt.feed(Vt.new(cols, rows), input)
+  t
+}
+
+@test
+fn reply_bytes_are_the_sequences_that_answer_the_queries() {
+  assert Vt.reply_bytes(DeviceAttributes) == Bytes.hex("1b5b3f36323b323263")
+  assert Vt.reply_bytes(Status) == Bytes.hex("1b5b306e")
+  assert Vt.reply_bytes(CursorPosition(2, 3)) == Bytes.hex("1b5b323b3352")
+}
+
+@test
+fn text_joins_the_rows_without_the_blanks_at_their_ends() {
+  assert Vt.text(fed(5, 2, "ab")) == "ab\n"
+  assert Vt.text(fed(6, 1, "あい")) == "あい"
+  assert Vt.text(fed(8, 1, "a  b   ")) == "a  b"
+  assert Vt.text(Vt.new(3, 2)) == "\n"
+  # A row that wraps is not joined to the next.
+  assert Vt.text(fed(4, 2, "abcdef")) == "abcd\nef"
+  # As avt's `trim_end`, the end of a row loses any White_Space, not only spaces.
+  assert Vt.text(fed(4, 1, " a\u{a0}")) == " a"
+  # It reads the screen in view, the alternate one while it is active, where avt's `Vt::text` reads
+  # the primary one. `main` leaves the cursor at column 4, so `alt` wraps to the second row.
+  assert Vt.text(fed(4, 2, "main\u{1b}[?1049halt")) == "\nalt"
+}
+
+@test
+fn size_is_the_columns_and_the_rows() {
+  assert Vt.size(Vt.new(7, 3)) == (7, 3)
+}
+
+@test
+fn cursor_is_the_column_and_the_row_or_none_while_hidden() {
+  assert Vt.cursor(fed(3, 1, "\u{1b}[?25l")) == None
+  assert Vt.cursor(fed(3, 1, "ab")) == Some((2, 0))
+}
+
+@test
+fn input_modes_follow_what_the_output_sets() {
+  assert Vt.input_modes(fed(3, 1, "\u{1b}[?1h")).cursor_keys == Application
+}
+
+@test
+fn a_sequence_cut_between_two_feeds_takes_effect_in_the_second() {
+  (t, first) = Vt.feed(Vt.new(5, 2), "a\u{1b}[2;")
+  assert first == []
+  (t, second) = Vt.feed(t, "3Hb\u{1b}[6")
+  assert second == []
+  (t, third) = Vt.feed(t, "n")
+  assert third == [CursorPosition(2, 4)]
+  assert Vt.text(t) == "a\n  b"
+}
+
+# What can be seen of a terminal: the screen, the cursor and the input modes.
+fn seen(t: Vt.Terminal) -> (List[List[Cell]], Option[(Int, Int)], InputModes) {
+  (Vt.lines(t), Vt.cursor(t), Vt.input_modes(t))
+}
+
+# Each golden input, cut into 2 to 4 pieces at random places (inside an escape sequence too) and fed
+# piece by piece, leaves the terminal as feeding it at once does, and gets the same replies in the
+# same order. Each case draws its cuts from a seed of its own.
+@test
+fn where_a_golden_input_is_cut_does_not_change_the_terminal_or_the_replies() {
+  CASES.enumerate().each(|(i, (_, cols, rows, input, _))| {
+    (whole, replies) = Vt.feed(Vt.new(cols, rows), input)
+    config = Config(seed: 20261127 + i, cases: 4, ..Property.config())
+    Property.check_with(Cut.cuts(), config, |at| {
+      (pieces, more) = cut_and_fed(Vt.new(cols, rows), input, at)
+      # FRICTION(053): assert takes no label, and the input is not a drawn value that the property
+      # would show, so the input is on both sides.
+      assert (input, seen(pieces), more) == (input, seen(whole), replies)
+    })
+  })
+}
+
+# After each golden input, the cursor is on a row of the screen, and at most at column `cols`
+# (where writing in the last column leaves it). `Vt.cursor` hides the position of a hidden cursor,
+# so this reads `Vt.Terminal.cursor`.
+@test
+fn the_cursor_stays_on_the_screen_after_every_golden_input() {
+  outside = CASES.filter_map(|(name, cols, rows, input, _)| {
+    (t, _) = VtSnapshot.run(cols, rows, input)
+    (col, row, _) = Terminal.cursor(t)
+    if row >= 0 && row < rows && col >= 0 && col <= cols { None } else { Some((name, col, row)) }
+  })
+  assert outside == []
+}
+
+# `t` after `input`, cut at `at` into pieces that are fed in turn, and the replies, in order.
+fn cut_and_fed(t: Vt.Terminal, input: String, at: List[Int]) -> (Vt.Terminal, List[Reply]) {
+  Cut.pieces(input, at).fold((t, []), |(t, replies), piece| {
+    (next, more) = Vt.feed(t, piece)
+    (next, List.append(replies, more))
+  })
+}

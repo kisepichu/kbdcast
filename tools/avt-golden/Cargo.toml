@@ -1,0 +1,11 @@
+[package]
+name = "avt-golden"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# avt 0.18.0 is the terminal emulator of agg 1.9.0, and unicode-width 0.1.14 is the version that agg 1.9.0's
+# Cargo.lock gives it (avt asks for ^0.1.13). Cargo.lock pins both.
+[dependencies]
+avt = "=0.18.0"
+unicode-width = "=0.1.14"

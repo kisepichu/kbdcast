@@ -1,0 +1,89 @@
+# The terminal after an input, and its snapshot in the form of the golden table that
+# tools/avt-golden writes (the head comment of tools/avt-golden/src/main.rs).
+
+import Std.Bytes
+import Vt.Parser
+import Vt.Terminal.{Terminal, Reply}
+import Vt.Screen.{Cell, Pen, Color, Indexed, Rgb, Normal, Bold, Faint, WideTail, DEFAULT_PEN}
+import Key.Encode.{Application}
+
+## The terminal of `cols` columns and `rows` rows after the actions that the parser reads from
+## `input`, and the replies it made, in order.
+pub fn run(cols: Int, rows: Int, input: String) -> (Terminal, List[Reply]) {
+  (_, actions) = Parser.advance(Parser.parser(), input)
+  actions.fold((Terminal.terminal(cols, rows), []), |(t, replies), action| {
+    (next, made) = Terminal.apply(t, action)
+    (next, List.append(replies, made))
+  })
+}
+
+## The lines of the snapshot of `t`, joined by `\n`: `cursor <col> <row>` or `cursor hidden`,
+## `keys normal` or `keys application`, and a line for each row of the screen in view.
+pub fn snapshot(t: Terminal) -> String {
+  (col, row, visible) = Terminal.cursor(t)
+  cursor = if visible { "cursor #{col} #{row}" } else { "cursor hidden" }
+  keys = if Terminal.input_modes(t).cursor_keys == Application {
+    "keys application"
+  } else {
+    "keys normal"
+  }
+  List.join([cursor, keys, ..Screen.lines(Terminal.screen(t)).map(line)], "\n")
+}
+
+# The cells of a row: each one after `\u{1}<pen>\u{2}` when its pen differs from that of the cell
+# before it (the first one is compared with the default pen), and `\u{3}` for the right half of a
+# wide character.
+fn line(cells: List[Cell]) -> String {
+  (_, parts) = cells.fold((DEFAULT_PEN, []), |(previous, parts), cell| {
+    marked = if cell.pen == previous { parts } else { ["\u{2}", pen(cell.pen), "\u{1}", ..parts] }
+    glyph = if cell.occupancy == WideTail { "\u{3}" } else { character(cell.char) }
+    (cell.pen, [glyph, ..marked])
+  })
+  String.concat(parts.reverse())
+}
+
+# `<fg>,<bg>,<intensity>,<attrs>`.
+fn pen(p: Pen) -> String {
+  intensity = p.intensity match {
+    Normal -> "n"
+    Bold   -> "b"
+    Faint  -> "f"
+  }
+  attrs = [
+    (p.italic, "i"),
+    (p.underline, "u"),
+    (p.strikethrough, "s"),
+    (p.blink, "k"),
+    (p.inverse, "r"),
+  ].filter_map(|(on, letter)| if on { Some(letter) } else { None })
+  "#{color(p.foreground)},#{color(p.background)},#{intensity},#{String.concat(attrs)}"
+}
+
+# `-`, `i<index>` or `#rrggbb` in lower-case hexadecimal.
+fn color(c: Option[Color]) -> String {
+  c match {
+    None               -> "-"
+    Some(Indexed(n))   -> "i#{n}"
+    Some(Rgb(r, g, b)) -> "\##{hex([r, g, b])}"
+  }
+}
+
+# FRICTION(060): Int has no function that writes it in hexadecimal with a width, so the channels
+# go through Bytes to use `Bytes.to_hex`.
+# FRICTION(040): the channels of a color are 0 to 255, so `Bytes.from_list` cannot return `None`,
+# and Option has no `expect`.
+fn hex(channels: List[Int]) -> String {
+  Bytes.from_list(channels) match {
+    Some(b) -> Bytes.to_hex(b)
+    None    -> panic("a color channel out of 0 to 255 in #{channels}")
+  }
+}
+
+# FRICTION(003): the code point of a cell is a scalar value, but `String.from_code_point` returns an
+# Option, and FRICTION(040): Option has no `expect`.
+fn character(c: Int) -> String {
+  String.from_code_point(c) match {
+    Some(s) -> s
+    None    -> panic("a cell holds #{c}, which is not a scalar value")
+  }
+}

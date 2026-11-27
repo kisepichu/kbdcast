@@ -6,6 +6,7 @@
   regex の find のテスト（`regex/test/find_test.emel`、計画の Task 6）で、`a{1000}` と `\w{1000}` に当てる入力（`"a"` の 1000 個、`"x"` の 1001 個）と、期待する一致の text を作る
   regex の program（`regex/src/program.emel` の `repeat`、計画の Task 6）で、回数付きの繰り返し（`e{n}`、`e{n,m}`、`e{n,}`）の本体の命令（`List[Inst]`）を n 個並べる
   regex の時間のテスト（`regex/test/linear_test.emel` の `replace_builds_its_result_in_time_proportional_to_the_matches`、最終レビューの修正）で、`replace` と `find_all` に当てる入力（`"a"` の 4000 個）を作る
+  VT の parser のテスト（`test/parser_test.emel` の `advance_keeps_the_limits_of_avt_on_parameters`、サブプロジェクト 3 の計画の Task 3）で、avt の引数の数の上限（32）を越える CSI（`"1;"` の 32 個）と、期待する引数の List（`[1]` の 31 個）を作る
 - こう書きたかった:
   テスト: `String.repeat("a", 1000)`（Python の `"a" * 1000`、JavaScript の `"a".repeat(1000)`、Rust の `"a".repeat(1000)`、Kotlin の `"a".repeat(1000)`）。時間のテストでは `String.repeat("a", 4000)`。wish には書いていない（テストのコード）
   ```emela
@@ -18,6 +19,7 @@
     List.flatten(List.repeat(iteration, min)).append([choice(greedy, into: -last, past: 1)])
   }
   ```
+  VT の parser のテスト: `String.repeat("1;", 32)` と `List.repeat([1], 31)`。wish には書いていない（テストのコード）
 - 診断:
   `emela check`（v0.28.2）の ``error[E0212]: module `String` has no `repeat` ``（4 か所に 1 つずつ）。help は付かない
 - 回避策:
@@ -37,11 +39,17 @@
   ```emela
   input = String.concat(List.range(0, 4000).map(|_| "a"))
   ```
+  VT の parser のテストでも、補助の関数を足さずにその場で並べた（`test/parser_test.emel`、`FRICTION(022)` の印）
+  ```emela
+  semicolons = String.concat(List.range(0, 32).map(|_| "1;"))
+  ones = List.range(0, 31).map(|_| [1])
+  ```
   `Std.Array.repeat(value, count)` はあるが、String と List には無い
 - コスト:
   テストでは補助の関数 1 つ（印とコメントを含めて 5 行）。テストの中だけで、性能は問題にならない
   program でも補助の関数 1 つ（印とコメントを含めて 5 行）。`List.range` が n 個の Int の List を作って捨てる分だけ余計に割り当てる。並ぶ命令は n × 本体の長さなので、それより小さい
   時間のテストでは 1 行（印を含めて 2 行）。入力を作るのは時間を測る範囲の外なので、測る値には効かない
+  VT の parser のテストでは 2 行（印とコメントを含めて 3 行）
   どれも、普段のコードに基盤レベルは漏れていない
 - spec: `[api.string]`（`repeat` が無い）、`[api.list]`（`repeat` も無い）、`[api.std.array]`（`repeat` はある）
 - 既存: emela の issue と PR に無い（2026-11-25、`gh api search/issues` で `is:issue` と `is:pull-request` のそれぞれを「repeat」で検索。当たったのは局所関数、method call、Array、性能の PR など別の話題）。`proposals/` と `spec/open-questions.md` で「repeat」を引くと、`proposals/array.md:140` の `Array.repeat` だけが当たる

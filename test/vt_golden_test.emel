@@ -1,0 +1,17 @@
+import VtGolden.{CASES}
+import VtSnapshot
+
+# The golden cases whose snapshot differs from avt's: the name of the case, avt's snapshot and the
+# snapshot of the terminal.
+fn differences() -> List[(String, String, String)] {
+  CASES.filter_map(|(name, cols, rows, input, expected)| {
+    (t, _) = VtSnapshot.run(cols, rows, input)
+    actual = VtSnapshot.snapshot(t)
+    if actual == expected { None } else { Some((name, expected, actual)) }
+  })
+}
+
+@test
+fn terminal_makes_the_screen_that_avt_makes_for_every_golden_case() {
+  assert differences() == []
+}

@@ -1,0 +1,285 @@
+# The DEC state machine (Paul Williams' parser, https://www.vt100.net/emu/dec_ansi_parser) that
+# turns the output of a terminal into actions: text to write, controls to execute, and CSI and ESC
+# sequences. What each action does (which avt's parser also decides) is up to Vt.Terminal.
+# The behavior follows avt 0.18.0 (Apache-2.0, https://github.com/asciinema/avt)
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
+
+## What the output of a terminal asks for.
+pub enum Action {
+  ## Characters written in Ground, one after another with no other action between them (never
+  ## empty).
+  Print(String)
+  ## A C0 or C1 control character, by its code point: every one that avt's parser executes,
+  ## including those that its `execute` then ignores.
+  Execute(Int)
+  ## A CSI sequence: the parameters in the order written, each the list of its parts split by `:`
+  ## (an empty part is 0), the private marker and the intermediate characters in the order they
+  ## came, and the code point of the final character. With no parameter character the parameters
+  ## are `[]`, and an empty parameter next to `;` is `[0]`. avt's dispatch sees only the last of the
+  ## private marker and the intermediate characters. From U+00A0 up, a character ends a sequence
+  ## as `A` does, and is the final character.
+  Csi(List[List[Int]], String, Int)
+  ## An ESC sequence: the intermediate characters (of which avt's dispatch sees only the last) and
+  ## the code point of the final character.
+  Esc(String, Int)
+} derive Eq, Show
+
+# The states of avt's parser.
+enum State {
+  Ground
+  Escape
+  EscapeIntermediate
+  CsiEntry
+  CsiParam
+  CsiIntermediate
+  CsiIgnore
+  DcsEntry
+  DcsParam
+  DcsIntermediate
+  DcsPassthrough
+  DcsIgnore
+  OscString
+  SosPmApcString
+}
+
+## Where the parser is in the output: its state, and what it has read of the sequence it is in.
+pub opaque type Parser(
+  state: State,
+  # The parameters before the current one, the last one first, each with its parts in order.
+  params: List[List[Int]],
+  # The parts of the current parameter before the current part, the last one first.
+  parts: List[Int],
+  # The current part.
+  part: Int,
+  # Whether a parameter character has come in the sequence (if not, it has no parameters).
+  has_params: Bool,
+  # The private marker and the intermediate characters.
+  intermediates: String,
+)
+
+# avt's PARAMS_LEN and MAX_PARAM_LEN.
+const MAX_PARAMS: Int = 32
+const MAX_PARTS: Int = 6
+
+const BEL: Int = 0x07
+const CAN: Int = 0x18
+const SUB: Int = 0x1A
+const ESC: Int = 0x1B
+const COLON: Int = 0x3A
+const SEMICOLON: Int = 0x3B
+const DEL: Int = 0x7F
+const DCS: Int = 0x90
+const SOS: Int = 0x98
+const CSI: Int = 0x9B
+const ST: Int = 0x9C
+const OSC: Int = 0x9D
+const PM: Int = 0x9E
+const APC: Int = 0x9F
+
+## A parser in Ground, which has read nothing.
+pub fn parser() -> Parser {
+  fresh(Ground)
+}
+
+## The actions that `s` gives after what `p` has read, and the parser after `s`. A sequence cut at
+## the end of `s` goes on in the next call. The characters written at the end of `s` are in the last
+## Print, and are not carried over.
+pub fn advance(p: Parser, s: String) -> (Parser, List[Action]) {
+  (last, written, done) = s.code_points().fold((p, [], []), |(at, written, done), c| {
+    (next, step) = feed(at, c)
+    step match {
+      Put          -> (next, [c, ..written], done)
+      Emit(action) -> (next, [], [action, ..flush(written, done)])
+      Nothing      -> (next, written, done)
+    }
+  })
+  (last, flush(written, done).reverse())
+}
+
+# `done` (the last action first) with the characters `written` (the last one first) as a Print, if
+# there are any.
+fn flush(written: List[Int], done: List[Action]) -> List[Action] {
+  written match {
+    [] -> done
+    _  -> [Print(string_of(written.reverse())), ..done]
+  }
+}
+
+# What a character gives besides the next parser.
+enum Step {
+  # The character is written.
+  Put
+  # An action other than writing.
+  Emit(Action)
+  Nothing
+}
+
+# A parser in `state` with nothing read of a sequence (what avt's `clear` leaves). avt clears only on
+# entering Escape, CsiEntry and DcsEntry, but what the other states keep is never read before one of
+# those, so every transition that does not go on with a CSI or ESC sequence starts from this.
+fn fresh(state: State) -> Parser {
+  Parser(state:, params: [], parts: [], part: 0, has_params: False, intermediates: "")
+}
+
+# What avt's parser does with the character `c` after `p` (`Parser::feed`).
+# FRICTION(015): there is no or-pattern, and FRICTION(038): there are no range patterns, so avt's
+# single match on the state and the character is split by state, and the ranges of characters are
+# guards in order (the anywhere transitions first).
+fn feed(p: Parser, c: Int) -> (Parser, Step) {
+  # From U+00A0 up, a character goes the way of `A` in every state. The action keeps it.
+  k = if c >= 0xA0 { 0x41 } else { c }
+  k match {
+    ESC                                    -> (fresh(Escape), Nothing)
+    DCS                                    -> (fresh(DcsEntry), Nothing)
+    CSI                                    -> (fresh(CsiEntry), Nothing)
+    ST                                     -> (fresh(Ground), Nothing)
+    OSC                                    -> (fresh(OscString), Nothing)
+    SOS                                    -> (fresh(SosPmApcString), Nothing)
+    PM                                     -> (fresh(SosPmApcString), Nothing)
+    APC                                    -> (fresh(SosPmApcString), Nothing)
+    _ if k == CAN || k == SUB || k >= 0x80 -> (fresh(Ground), Emit(Execute(c)))
+    # The rest: the C0 controls but CAN, SUB and ESC (below 0x20), and 0x20 to DEL.
+    _ -> p.state match {
+      Ground         -> if k < 0x20 { (p, Emit(Execute(c))) } else { (p, Put) }
+      Escape -> k match {
+        _ if k < 0x20  -> (p, Emit(Execute(c)))
+        _ if k <= 0x2F -> (collect(p, EscapeIntermediate, c), Nothing)
+        0x50           -> (fresh(DcsEntry), Nothing) # P
+        0x58           -> (fresh(SosPmApcString), Nothing) # X
+        0x5B           -> (fresh(CsiEntry), Nothing) # [
+        0x5D           -> (fresh(OscString), Nothing) # ]
+        0x5E           -> (fresh(SosPmApcString), Nothing) # ^
+        0x5F           -> (fresh(SosPmApcString), Nothing) # _
+        DEL            -> (p, Nothing)
+        _              -> (fresh(Ground), Emit(Esc(p.intermediates, c)))
+      }
+      EscapeIntermediate -> k match {
+        _ if k < 0x20  -> (p, Emit(Execute(c)))
+        _ if k <= 0x2F -> (collect(p, EscapeIntermediate, c), Nothing)
+        DEL            -> (p, Nothing)
+        _              -> (fresh(Ground), Emit(Esc(p.intermediates, c)))
+      }
+      CsiEntry -> k match {
+        _ if k < 0x20  -> (p, Emit(Execute(c)))
+        _ if k <= 0x2F -> (collect(p, CsiIntermediate, c), Nothing)
+        COLON          -> (fresh(CsiIgnore), Nothing)
+        _ if k <= 0x3B -> (param(p, k), Nothing)
+        _ if k <= 0x3F -> (collect(p, CsiParam, c), Nothing)
+        DEL            -> (p, Nothing)
+        _              -> (fresh(Ground), Emit(csi(p, c)))
+      }
+      CsiParam -> k match {
+        _ if k < 0x20  -> (p, Emit(Execute(c)))
+        _ if k <= 0x2F -> (collect(p, CsiIntermediate, c), Nothing)
+        _ if k <= 0x3B -> (param(p, k), Nothing)
+        _ if k <= 0x3F -> (fresh(CsiIgnore), Nothing)
+        DEL            -> (p, Nothing)
+        _              -> (fresh(Ground), Emit(csi(p, c)))
+      }
+      CsiIntermediate -> k match {
+        _ if k < 0x20  -> (p, Emit(Execute(c)))
+        _ if k <= 0x2F -> (collect(p, CsiIntermediate, c), Nothing)
+        _ if k <= 0x3F -> (fresh(CsiIgnore), Nothing)
+        DEL            -> (p, Nothing)
+        _              -> (fresh(Ground), Emit(csi(p, c)))
+      }
+      CsiIgnore -> k match {
+        _ if k < 0x20               -> (p, Emit(Execute(c)))
+        _ if k >= 0x40 && k <= 0x7E -> (fresh(Ground), Nothing)
+        _                           -> (p, Nothing)
+      }
+      # Nothing in a DCS sequence is kept, so its parameters and intermediate characters are not.
+      DcsEntry -> k match {
+        _ if k < 0x20  -> (p, Nothing)
+        _ if k <= 0x2F -> (fresh(DcsIntermediate), Nothing)
+        COLON          -> (fresh(DcsIgnore), Nothing)
+        _ if k <= 0x3F -> (fresh(DcsParam), Nothing)
+        DEL            -> (p, Nothing)
+        _              -> (fresh(DcsPassthrough), Nothing)
+      }
+      DcsParam -> k match {
+        _ if k < 0x20  -> (p, Nothing)
+        _ if k <= 0x2F -> (fresh(DcsIntermediate), Nothing)
+        COLON          -> (fresh(DcsIgnore), Nothing)
+        _ if k <= 0x3B -> (p, Nothing)
+        _ if k <= 0x3F -> (fresh(DcsIgnore), Nothing)
+        DEL            -> (p, Nothing)
+        _              -> (fresh(DcsPassthrough), Nothing)
+      }
+      DcsIntermediate -> k match {
+        _ if k <= 0x2F -> (p, Nothing)
+        _ if k <= 0x3F -> (fresh(DcsIgnore), Nothing)
+        DEL            -> (p, Nothing)
+        _              -> (fresh(DcsPassthrough), Nothing)
+      }
+      DcsPassthrough -> (p, Nothing)
+      DcsIgnore      -> (p, Nothing)
+      OscString      -> if k == BEL { (fresh(Ground), Nothing) } else { (p, Nothing) }
+      SosPmApcString -> (p, Nothing)
+    }
+  }
+}
+
+# `p` in `state`, with `c` after its private marker and intermediate characters. avt keeps only the
+# last one; the action keeps them all.
+fn collect(p: Parser, state: State, c: Int) -> Parser {
+  Parser(state:, intermediates: "#{p.intermediates}#{character(c)}", ..p)
+}
+
+# `p` in CsiParam after the parameter character `c`: a digit goes on with the current part, `:`
+# starts the next part and `;` the next parameter. As in avt, `:` and `;` past the last part and
+# parameter stay on them, and a part is a u16, which wraps.
+fn param(p: Parser, c: Int) -> Parser {
+  c match {
+    SEMICOLON if p.params.length() == MAX_PARAMS - 1 -> Parser(
+      state: CsiParam,
+      has_params: True,
+      ..p,
+    )
+    SEMICOLON -> Parser(
+      state: CsiParam,
+      params: [current(p), ..p.params],
+      parts: [],
+      part: 0,
+      has_params: True,
+      ..p,
+    )
+    COLON if p.parts.length() == MAX_PARTS - 1 -> Parser(state: CsiParam, has_params: True, ..p)
+    COLON -> Parser(state: CsiParam, parts: [p.part, ..p.parts], part: 0, has_params: True, ..p)
+    _ -> Parser(
+      state: CsiParam,
+      part: (10 * p.part + c - 0x30).bit_and(0xFFFF),
+      has_params: True,
+      ..p,
+    )
+  }
+}
+
+# The parts of the current parameter of `p`, in order.
+fn current(p: Parser) -> List[Int] {
+  [p.part, ..p.parts].reverse()
+}
+
+# The CSI sequence that `p` has read, ended by the final character `c`.
+fn csi(p: Parser, c: Int) -> Action {
+  params = if p.has_params { [current(p), ..p.params].reverse() } else { [] }
+  Csi(params, p.intermediates, c)
+}
+
+# FRICTION(002): String has no `from_code_points` (nor `slice`, to take the characters out of the
+# input), so a Print is built back from its code points one by one.
+fn string_of(cps: List[Int]) -> String {
+  cps.map(character).join("")
+}
+
+# FRICTION(003): the code points come from a String, so they are scalar values, but
+# `String.from_code_point` returns an Option.
+# FRICTION(040): Option has no `expect`, so the None that cannot happen is a match with a panic.
+fn character(c: Int) -> String {
+  String.from_code_point(c) match {
+    Some(s) -> s
+    None    -> panic("None, but #{c} comes from a String")
+  }
+}

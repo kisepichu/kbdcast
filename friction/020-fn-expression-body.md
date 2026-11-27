@@ -10,11 +10,20 @@
   pub fn dot(dot_all: Bool) -> CharSet = if dot_all { ALL } else { LINE_TERMINATOR.complement() }
   ```
   key codec の型の wish（`wish/key.emel:20`、`:23`、`:25`、`:27`、`:30`、`:46`、`:59`、サブプロジェクト 2 の計画の Task 2）でも、7 つの関数を `=` の後に式を書く形にした
+  VT の parser の wish（`wish/parser.emel:40`、`:42`、`:63`、`:118`、サブプロジェクト 3 の計画の Task 3）でも、4 つの関数（`parser`、`fresh`、`flush`、`param`）を `=` の後に式を書く形にした
+  VT の画面の wish（`wish/screen.emel:62`、`:64`、`:66`、`:69`、`:71`、`:73`、`:76`、`:150`、`:153`、サブプロジェクト 3 の計画の Task 4）でも、9 つの関数（`space`、`blank_line`、`blank`、`cols`、`rows`、`lines`、`with_line`、`clear_rows`、`erase`）を `=` の後に式を書く形にした。`blank`、`with_line`、`clear_rows`、`erase` は `=` の次の行から本体を書いた
+  VT の解釈の wish（`wish/terminal.emel:62-64`、`:76-77`、`:222`、`:224`、`:242`、サブプロジェクト 3 の計画の Task 5）でも、8 つの関数（公開の `screen`、`cursor`、`input_modes` と、`arg`、`count`、`rgb`、`fg`、`drawing`）を `=` の後に式を書く形にした
 - 診断:
   wish check（v0.28.2）の 86 の診断のうち 24。関数ごとに、名前を指す ``error[E0130]: a function without a body must be `@external` `` と、`=` を指す ``error[E0122]: expected newline after declaration`` の 2 つ。`=` の後ろの本体は読まれず、その中の誤り（前置の match の E0142、`let` の 004、`spans[mid]` の 009 など）には診断が届かない
   repo の外の使い捨ての Pome での最小の形（`pub fn double(x: Int) -> Int = x * 2`、2026-11-25）も同じ 2 つ。help は付かない。E0130 は「`@external` を付けよ」と読め、本体を `{ ... }` で書くことを示さない
   key の wish check（v0.28.2）では、42 の診断のうち 14（E0130 と E0122 が 7 つずつ）。本体の中の `let`（004）、`CodePoint` の述語（039）、or-pattern（015）、範囲パターン（038）、`Mods { ..mods, ... }`（037）、前置の `match`（E0142）には、どれも診断が届かなかった
+  VT の parser の wish check（v0.28.2）では、272 の診断のうち 8（E0130 と E0122 が 4 つずつ）。本体の中の、構成子の名前を `{ }` の前に置いた値（`Parser { state, params: [], inter: "" }`、056）、前置の `match`（E0142）と `=>` の腕には届かなかった
+  VT の画面の wish check（v0.28.2）では、112 の診断のうち 18（E0130 と E0122 が 9 つずつ）。本体の中の `Array.fill`（016）、`{ s with ... }`（037）、`s.grid[row]`（009）、`fn(l) { ... }`（E0148）、`=>` の腕、`fill_range`（057）、`min`（016）には届かなかった
+  VT の解釈の wish check（v0.28.2）では、632 の診断のうち 16（E0130 と E0122 が 8 つずつ）。本体の中の `List.first` と `unwrap_or`（016、`:76`）、`Terminal(..t, ...)`（037、`:224`）、`DRAWING[c - 0x60]`（009、`:242`）には届かなかった。`:62` の `screen` には、本体が読まれなくても、同じ名前の欄との ``E0334: function `screen` has the same name as a field of `Terminal` ``（035）は出た
 - 回避策: 本体を block にした（`pub fn single(c: Int) -> CharSet { range(c, c) }`。`regex/src/class.emel`。key の `src/key.emel` も同じ）。正しい構文に直しただけなので、コードに印は付けない
+  VT の parser（`src/vt/parser.emel`、Task 3）も、本体を block にした。印は付けない
+  VT の画面（`src/vt/screen.emel`、Task 4）も、本体を block にした。印は付けない
+  VT の解釈（`src/vt/terminal.emel`、Task 5）も、本体を block にした。`fg` と `drawing` は、`sgr` が Pen を受ける形と `translate` に入れたので無くなった。印は付けない
 - コスト:
   コードのコストは無い（fmt は 1 行の block を 1 行のまま残す）。直すには spec を引く必要があった（`[fn.decl]` の「The body is a block」と `[grammar.decl]` の `fn_decl` の `[ block ]`）。wish の診断の 4 分の 1 がこの 1 つの誤りから出て、本体の中の別の誤りを隠した。004（`let`）、016（他の言語の名前）と同じく、wish-first（spec を読む前に wish を書く）では、そのときの手がかりは診断だけ
 - spec:

@@ -39,6 +39,9 @@
   )
     |> Gen.map(|((choice, listed), ((below, above), (private_use, supplementary)))| { choice match { ... } })
   ```
+  UTF-8 デコーダのテストの生成器（`test/utf8_test.emel` の `part`、サブプロジェクト 3 の計画の Task 1。テストの補助なので wish は書いていない。印は `part` の直前のコメントの行の `FRICTION(028)`）: 10 種の部品（1〜4 byte の正しい文字、途中で切れた文字、過長、surrogate、U+10FFFF より上、単独の継続 byte、F5〜FF）から 1 つを選ぶ `one_of` が無いので、キーの文字を広げた所と同じく、種の番号（`Gen.int_between(0, 9)`）と、code point の材料（`Gen.int_between(0, 0x10FFFF)`）と 3 つの 6 bit（`Gen.int_between(0, 0x3F)`）を毎回引き、番号の match で部品を作った。種ごとに範囲の違う生成器を選べないので、範囲は引いた値から `%` で作る（`0x80 + n % (0x800 - 0x80)`、`0xA0 + b % 0x20` など）
+  VT の parser のテストの生成器（`test/parser_test.emel` の `piece` と `test/cut.emel` の `cuts`、サブプロジェクト 3 の計画の Task 3。`cuts` は Task 3 では `test/parser_test.emel` にあり、Task 6 の review の後で移した。テストの補助なので wish は書いていない。印はそれぞれの直前のコメントの行の `FRICTION(028)`）: `piece` は、43 種の部品（列の始まりと終わり、引数、private の印、中間と終わりの文字、文字、改行）と「U+00A0 までの任意の code point」から 1 つを選ぶ `one_of` が無いので、種の番号（`Gen.int_between(0, 63)`）と code point（`Gen.int_between(0, 0xA0)`）を毎回引き、番号の match で部品にした（42 より上は code point）。`cuts` は、入力を切る位置を入力の長さから決める `and_then` が無いので、0〜1000 を引いて、使う所（`Cut.pieces`）で `% (code point の数 + 1)` にした。切る数（1〜3）も、位置を 3 つ引いてから `take(count)` で選ぶ
+  VT の公開 API のテスト（`test/vt_test.emel` の `where_a_golden_input_is_cut_does_not_change_the_terminal_or_the_replies`、サブプロジェクト 3 の計画の Task 6。テストの補助なので wish は書いていない）: golden の入力を切る位置を、parser のテストと同じ `Cut.cuts` で引き、`Cut.pieces` で切る（印は `test/cut.emel` の `cuts` の直前のコメントの行の `FRICTION(028)`）。Task 6 では `cuts` の写しを印ごと `test/vt_test.emel` に置いたが、review の後で `test/cut.emel` にまとめた
 - コスト:
   - 行数: 生成器のモジュール 288 行のうち 74 行（コメントを含む。`and_then` と、その木を作る `bound`、`frequency` と `pick`、`one_of`、`element`、`option`、`list_between` と `copies`）
   - テストの側が brix の内部の表し方（`Tree` の子を遅延で作る closure、seed を返して次へ渡す形、`Gen.sample` の size の範囲）に依存する。brix がそれを変えると壊れる
@@ -48,6 +51,9 @@
   - キーの生成器（Task 3）: 補助関数 2 つ（`element` と `bool`、コメントを含めて 10 行）と `expect`（040）。偏りは同じで、157 個の候補のうち最初の空白と最後の F12 が多く出る（`int_between` が min と max を 8 回に 1 回ずつ出す）。`bool` は `False`（min と 0）が約 9/16 で出る。縮みは位置を 0 へ縮めるので、反例は空白の方へ縮む
   - input modes の生成器（Task 6）: 補助関数は増えない。偏りは同じで、modifyOtherKeys は Off が約 11/24、level 2 が約 8/24、level 1 が約 5/24 で出る（3 つの段階のどれも、2000 の例のうちに数百ずつ出る）
   - キーの文字を広げた所（fix）: 補助関数は増えない（`code` は生成器そのもの）。選ばれない 4 つの値も毎回引き、捨てる。重みは `choice` の値の割り当てで決めるしかなく、`int_between(0, 7)` の偏り（0 が 21/64、7 が 13/64、ほかは 5/64 ずつ）を見込んで、0 と 5〜7 を `codes()`（44/64、約 11/16）、1〜4 を 4 つの範囲（5/64 ずつ）にした。範囲の端は、同じ偏りで min が約 1/4、max が約 1/8 で出る（私用領域なら 0xE000 と 0xF8FF。decode の境と同じ）。性質テストの 2000 例で数えると、`codes()` の外の文字は notation の性質で 617（31%）、encode の性質で 635（32%）。`frequency([(44, listed), (5, below), ...])` があれば、重みを数で書け、捨てる値も無い
+  - UTF-8 デコーダのテストの生成器（Task 1）: 補助関数は増えない（`part` は生成器そのもの）。選ばれない値も毎回引き、捨てる。`int_between(0, 9)` の偏りで、ASCII（0）が約 5/16、F5〜FF（9）が約 3/16、ほかの 8 種が約 1/16 ずつ出る。範囲を `%` で作るので、`int_between` の min と max の偏りは範囲の端に届かないことがある（2 byte の文字の `n % 0x780` は、n が 0x10FFFF のとき端にならない）。縮みも `%` の後の値でなく、引いた値の方を 0 へ縮める
+  - VT の parser のテストの生成器（Task 3）: 補助関数は増えない（`piece` と `cuts` は生成器そのもの）。選ばれない値も毎回引き、捨てる。`int_between(0, 63)` の偏りで、ESC の部品（0）が約 1/4、任意の code point（43〜63）が約 1/3 で出る。切る位置は `%` の後の値でなく、引いた値の方を 0 へ縮める（縮めた反例は入力の先頭で切る形になる）。位置の偏り（min の 0 と max の 1000）は、`%` の後では 0 と入力の長さで決まる位置になり、入力の端で切るとは限らない
+  - VT の公開 API のテスト（Task 6）: 補助関数は増えない（`test/cut.emel` の `cuts` を parser のテストと共有する）。偏りと縮みは parser のテストの `cuts` と同じ。入力ごとに seed を変える（`20261127 + i`）ので、2012 の入力を同じ位置の列で切るわけではない
 - spec:
   `[test]`（「Helpers for comparing values, generators and property testing are not in std. They are distributed as the Pome `github.com/emela-lang/brix`」）、brix v0.4.0 の README の Modules の表（`Brix.Pbt.Gen` は `int`、`int_between`、`constant`、`map`、`pair`、`list`、`sample`）と `src/pbt/gen.emel`
 - 既存:

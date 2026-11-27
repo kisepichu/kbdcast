@@ -1,0 +1,294 @@
+# The screen of the VT: cells, pens and colors, and the operations on the rows and cells of a screen
+# of a fixed size (writing a character, inserting and deleting cells, erasing, scrolling). Positions
+# count from 0. Vt.Terminal moves the cursor and decides what to call.
+# The behavior follows avt 0.18.0 (Apache-2.0, https://github.com/asciinema/avt)
+# (`Line` in line.rs and `Buffer` in buffer.rs, without the scrollback, the resizing and avt's
+# `wrapped` mark, which kbdcast does not compare.)
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
+
+import Std.Array.{Array}
+import Vt.Width
+
+## A color set by SGR: one of the 256 indexed colors, or red, green and blue (each 0 to 255).
+pub enum Color {
+  Indexed(Int)
+  Rgb(Int, Int, Int)
+} derive Eq, Show
+
+## How strongly a character is drawn.
+pub enum Intensity {
+  Normal
+  Bold
+  Faint
+} derive Eq, Show
+
+## How a cell is drawn: the colors (`None` is the color of the terminal) and the attributes.
+pub type Pen(
+  foreground: Option[Color],
+  background: Option[Color],
+  intensity: Intensity,
+  italic: Bool,
+  underline: Bool,
+  strikethrough: Bool,
+  blink: Bool,
+  inverse: Bool,
+) derive Eq, Show
+
+## The pen that nothing has changed (avt's `Pen::default`).
+pub const DEFAULT_PEN: Pen = Pen(
+  foreground: None,
+  background: None,
+  intensity: Normal,
+  italic: False,
+  underline: False,
+  strikethrough: False,
+  blink: False,
+  inverse: False,
+)
+
+## What a cell holds of its character: all of a narrow one, or the left or the right half of a wide
+## one.
+pub enum Occupancy {
+  Single
+  WideHead
+  WideTail
+} derive Eq, Show
+
+## A cell of the screen: the code point of its character, what it holds of it, and its pen. As in
+## avt, the right half of a wide character holds a space (U+0020), and a blank cell is
+## `Cell(0x20, Single, pen)`.
+pub type Cell(char: Int, occupancy: Occupancy, pen: Pen) derive Eq, Show
+
+## What `erase` makes blank around a position (avt's `EraseMode`).
+pub enum Erase {
+  ## The position and the cells after it on its row, this many in all.
+  NextChars(Int)
+  ## From the position to the end of the screen.
+  ToEndOfScreen
+  ## From the start of the screen to the position, inclusive.
+  ToStartOfScreen
+  WholeScreen
+  ## From the position to the end of its row.
+  ToEndOfLine
+  ## From the start of its row to the position, inclusive.
+  ToStartOfLine
+  WholeLine
+} derive Eq, Show
+
+## A screen of `cols` columns and `rows` rows of cells.
+# FRICTION(035): a function cannot have the name of a field, so the fields that `cols` and `rows`
+# read are `col_count` and `row_count`.
+pub opaque type Screen(col_count: Int, row_count: Int, grid: Array[Array[Cell]])
+
+## A screen of `cols` columns and `rows` rows of blank cells with `pen`.
+pub fn blank(cols: Int, rows: Int, pen: Pen) -> Screen {
+  Screen(col_count: cols, row_count: rows, grid: Array.repeat(blank_line(cols, pen), rows))
+}
+
+## The number of columns.
+pub fn cols(s: Screen) -> Int {
+  s.col_count
+}
+
+## The number of rows.
+pub fn rows(s: Screen) -> Int {
+  s.row_count
+}
+
+## The cells of each row from the top, each row from the left.
+pub fn lines(s: Screen) -> List[List[Cell]] {
+  s.grid.to_list().map(|line| line.to_list())
+}
+
+## Writes the character `c` with `pen` at column `col` of row `row` (avt's `Line::print`), and gives
+## the number of columns it takes: 2 for a wide character (`Vt.Width.is_wide`), 1 for any other. A
+## wide character does not fit in the last column: then the screen does not change, and the result
+## is `None`. What is left of a wide character that the write cuts in half becomes a blank cell with
+## `pen`. `col` is less than `cols(s)` and `row` less than `rows(s)`.
+pub fn print(s: Screen, col: Int, row: Int, c: Int, pen: Pen) -> (Screen, Option[Int]) {
+  line = at(s.grid, row)
+  wide = Width.is_wide(c)
+  space = blank_cell(pen)
+  single = Cell(c, Single, pen)
+  head = Cell(c, WideHead, pen)
+  tail = Cell(0x20, WideTail, pen)
+  # A wide character written at `col` takes `col + 1`: if a wide character starts there, its right
+  # half becomes blank.
+  fn cut_next(l: Array[Cell]) -> Array[Cell] {
+    if at(l, col + 1).occupancy == WideHead { l.set(col + 2, space) } else { l }
+  }
+  written = (at(line, col).occupancy, wide, s.col_count - 1 - col) match {
+    (Single, False, _)  -> Some(line.set(col, single))
+    (Single, True, 0)   -> None
+    (Single, True, 1)   -> Some(line.set(col, head).set(col + 1, tail))
+    (Single, True, _)   -> Some(cut_next(line).set(col, head).set(col + 1, tail))
+    (WideHead, False, _) -> Some(line.set(col, single).set(col + 1, space))
+    (WideHead, True, _) -> Some(line.set(col, head).set(col + 1, tail))
+    (WideTail, False, _) -> Some(line.set(col - 1, space).set(col, single))
+    (WideTail, True, 0) -> None
+    (WideTail, True, 1) -> Some(line.set(col - 1, space).set(col, head).set(col + 1, tail))
+    (WideTail, True, _) -> Some(
+      cut_next(line.set(col - 1, space)).set(col, head).set(col + 1, tail),
+    )
+  }
+  written match {
+    Some(l) -> (Screen(grid: s.grid.set(row, l), ..s), Some(if wide { 2 } else { 1 }))
+    None    -> (s, None)
+  }
+}
+
+## Moves the cells of row `row` from column `col` on `n` columns to the right (avt's
+## `Buffer::shift_right` and `Line::shift_right`). As avt rotates them, the cells moved past the
+## last column come back in at `col`, for the caller to write over. A wide character cut in half at
+## `col` or at the last column becomes blank cells with `pen`. As in avt, `n` stops at the end of the
+## row, and `col` may be `cols(s)` (where the cursor is after writing in the last column): then
+## nothing moves, and only a wide character in the last two columns becomes blank cells.
+pub fn shift_right(s: Screen, col: Int, row: Int, n: Int, pen: Pen) -> Screen {
+  n = Int.min(n, s.col_count - col)
+  col = Int.min(col, s.col_count - 1)
+  space = blank_cell(pen)
+  with_line(s, row, |line| {
+    split = if at(line, col).occupancy == WideTail {
+      line.set(col, space).set(col - 1, space)
+    } else {
+      line
+    }
+    rotated = rotate_right(split, col, s.col_count, n)
+    if at(rotated, col).occupancy == WideTail {
+      rotated.set(col, space).set(s.col_count - 1, space)
+    } else {
+      rotated
+    }
+  })
+}
+
+## Deletes `n` cells of row `row` from column `col` on, moves the cells after them to the left, and
+## fills the end of the row with blank cells with `pen` (avt's `Buffer::delete` and
+## `Line::delete`). A wide character cut in half becomes blank cells with `pen`. As in avt, `n` stops
+## at the end of the row. `col` is less than `cols(s)`.
+pub fn delete(s: Screen, col: Int, row: Int, n: Int, pen: Pen) -> Screen {
+  n = Int.min(n, s.col_count - col)
+  space = blank_cell(pen)
+  with_line(s, row, |line| {
+    split = if at(line, col).occupancy == WideTail { line.set(col - 1, space) } else { line }
+    rotated = rotate_left(split, col, s.col_count, n)
+    cut = if at(rotated, col).occupancy == WideTail { rotated.set(col, space) } else { rotated }
+    fill(cut, s.col_count - n, s.col_count, space)
+  })
+}
+
+## Makes the cells that `mode` names around column `col` of row `row` blank cells with `pen` (avt's
+## `Buffer::erase`). What is left of a wide character that the range cuts in half becomes blank too.
+## As in avt, a range stops at the end of the row, and `col` may be `cols(s)` (where the cursor is
+## after writing in the last column).
+pub fn erase(s: Screen, col: Int, row: Int, mode: Erase, pen: Pen) -> Screen {
+  mode match {
+    NextChars(n) -> with_line(s, row, |line| {
+      clear(line, col, col + Int.min(n, s.col_count - col), pen)
+    })
+    ToEndOfScreen -> with_line(s, row, |line| clear(line, col, s.col_count, pen))
+      |> clear_rows(row + 1, s.row_count, pen)
+    ToStartOfScreen -> with_line(s, row, |line| clear(line, 0, Int.min(col + 1, s.col_count), pen))
+      |> clear_rows(0, row, pen)
+    WholeScreen   -> clear_rows(s, 0, s.row_count, pen)
+    ToEndOfLine   -> with_line(s, row, |line| clear(line, col, s.col_count, pen))
+    ToStartOfLine -> with_line(s, row, |line| clear(line, 0, Int.min(col + 1, s.col_count), pen))
+    WholeLine     -> with_line(s, row, |line| clear(line, 0, s.col_count, pen))
+  }
+}
+
+## Moves the rows from `top` up to `bottom` (not included) `n` rows up, and fills the bottom of that
+## range with rows of blank cells with `pen` (avt's `Buffer::scroll_up`, with no scrollback). As in
+## avt, `n` stops at the size of the range. `top` is less than `bottom`, which is at most `rows(s)`.
+pub fn scroll_up(s: Screen, top: Int, bottom: Int, n: Int, pen: Pen) -> Screen {
+  n = Int.min(n, bottom - top)
+  grid = rotate_left(s.grid, top, bottom, n)
+    |> fill(bottom - n, bottom, blank_line(s.col_count, pen))
+  Screen(grid:, ..s)
+}
+
+## Moves the rows from `top` up to `bottom` (not included) `n` rows down, and fills the top of that
+## range with rows of blank cells with `pen` (avt's `Buffer::scroll_down`). As in avt, `n` stops at
+## the size of the range. `top` is less than `bottom`, which is at most `rows(s)`.
+pub fn scroll_down(s: Screen, top: Int, bottom: Int, n: Int, pen: Pen) -> Screen {
+  n = Int.min(n, bottom - top)
+  grid = rotate_right(s.grid, top, bottom, n) |> fill(top, top + n, blank_line(s.col_count, pen))
+  Screen(grid:, ..s)
+}
+
+fn blank_cell(pen: Pen) -> Cell {
+  Cell(0x20, Single, pen)
+}
+
+fn blank_line(cols: Int, pen: Pen) -> Array[Cell] {
+  Array.repeat(blank_cell(pen), cols)
+}
+
+# `s` with row `row` replaced by what `f` makes of it.
+fn with_line(s: Screen, row: Int, f: fn(Array[Cell]) -> Array[Cell]) -> Screen {
+  Screen(grid: s.grid.set(row, f(at(s.grid, row))), ..s)
+}
+
+# The rows from `from` up to `to` (not included) of `s` replaced by rows of blank cells with `pen`
+# (avt's `Buffer::clear`).
+fn clear_rows(s: Screen, from: Int, to: Int, pen: Pen) -> Screen {
+  Screen(grid: fill(s.grid, from, to, blank_line(s.col_count, pen)), ..s)
+}
+
+# avt's `Line::clear`: the cells of `line` from `from` up to `to` (not included) become blank cells
+# with `pen`, and so does what is left of a wide character that the range cuts in half. Nothing
+# changes when `from` is the end of the line.
+fn clear(line: Array[Cell], from: Int, to: Int, pen: Pen) -> Array[Cell] {
+  if from == line.size() {
+    line
+  } else {
+    space = blank_cell(pen)
+    split = if at(line, from).occupancy == WideTail { line.set(from - 1, space) } else { line }
+    filled = fill(split, from, to, space)
+    filled.get(to) match {
+      Some(next) if next.occupancy == WideTail -> filled.set(to, space)
+      _                                        -> filled
+    }
+  }
+}
+
+# The element at `index`, which the caller knows to be in range. Out of range is a defect, as it is
+# for `Array.set` and for indexing in avt.
+# FRICTION(009): Array has no read that makes a position out of range a defect, and
+# FRICTION(040): Option has no `expect`, so the `None` that cannot happen is a match with a panic.
+fn at[A](a: Array[A], index: Int) -> A {
+  a.get(index) match {
+    Some(x) -> x
+    None    -> panic("position #{index} is out of an array of size #{a.size()}")
+  }
+}
+
+# `a` with the elements from `from` up to `to` (not included) replaced by `value` (Rust's `fill` on
+# a range).
+# FRICTION(057): Array has no operation on a range (avt fills a range of cells or rows, and rotates
+# them), so this, `rotate_left` and `rotate_right` join slices.
+fn fill[A](a: Array[A], from: Int, to: Int, value: A) -> Array[A] {
+  Array.concat([a.slice(0, from), Array.repeat(value, to - from), a.slice(to, a.size())])
+}
+
+# `a` with the elements from `from` up to `to` (not included) moved `n` places to the left, the
+# first `n` of them moving to the end of the range (Rust's `rotate_left` on a range). `n` is at most
+# the size of the range.
+# FRICTION(057): as for `fill`.
+fn rotate_left[A](a: Array[A], from: Int, to: Int, n: Int) -> Array[A] {
+  Array.concat(
+    [a.slice(0, from), a.slice(from + n, to), a.slice(from, from + n), a.slice(to, a.size())],
+  )
+}
+
+# `a` with the elements from `from` up to `to` (not included) moved `n` places to the right, the
+# last `n` of them moving to the start of the range (Rust's `rotate_right` on a range). `n` is at
+# most the size of the range.
+# FRICTION(057): as for `fill`.
+fn rotate_right[A](a: Array[A], from: Int, to: Int, n: Int) -> Array[A] {
+  Array.concat(
+    [a.slice(0, from), a.slice(to - n, to), a.slice(from, to - n), a.slice(to, a.size())],
+  )
+}

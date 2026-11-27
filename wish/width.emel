@@ -1,0 +1,70 @@
+# wish-target: src/vt/width.emel
+## How many columns avt 0.18.0 draws a character in.
+## The behavior follows avt 0.18.0 (Apache-2.0, https://github.com/asciinema/avt)
+
+import Vt.WidthTable.{WIDE_FIRST, WIDE_LAST}
+
+## Whether avt draws the code point two columns wide (avt's `char_display_width`): it is in one of the ranges of
+## the table. O(log of the number of ranges).
+pub fn is_wide(c: Int) -> Bool {
+  # The number of ranges that start at or before c; the last of them is the only one that can hold c.
+  let n = WIDE_FIRST.partition_point(fn(first) { first <= c })
+  n > 0 && c <= WIDE_LAST[n - 1]
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0118]: expected expression
+#     ╭─[ src/vt/width.emel:11:3 ]
+#     │
+#  11 │   let n = WIDE_FIRST.partition_point(fn(first) { first <= c })
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vt/width.emel:11:7 ]
+#     │
+#  11 │   let n = WIDE_FIRST.partition_point(fn(first) { first <= c })
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/vt/width.emel:12:26 ]
+#     │
+#  12 │   n > 0 && c <= WIDE_LAST[n - 1]
+#     │                          ┬  
+#     │                          ╰── 
+# ────╯
+#
+# error[E0205]: undefined module `Vt.WidthTable`
+#    ╭─[ src/vt/width.emel:5:8 ]
+#    │
+#  5 │ import Vt.WidthTable.{WIDE_FIRST, WIDE_LAST}
+#    │        ──────┬──────  
+#    │              ╰──────── 
+# ───╯
+#
+# error[E0211]: cannot find value `n` in this scope
+#     ╭─[ src/vt/width.emel:12:3 ]
+#     │
+#  12 │   n > 0 && c <= WIDE_LAST[n - 1]
+#     │   ┬  
+#     │   ╰── 
+# ────╯
+#    = help: did you mean `c`?
+#
+# error[E0211]: cannot find value `WIDE_LAST` in this scope
+#     ╭─[ src/vt/width.emel:12:17 ]
+#     │
+#  12 │   n > 0 && c <= WIDE_LAST[n - 1]
+#     │                 ────┬────  
+#     │                     ╰────── 
+# ────╯
+#
+# 6 errors, 1 warning
+# --- end wish check ---

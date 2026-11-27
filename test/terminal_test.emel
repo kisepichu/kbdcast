@@ -1,0 +1,83 @@
+import Vt.Terminal.{Reply, DeviceAttributes, Status, CursorPosition}
+import Vt.Screen.{Cell, Single, DEFAULT_PEN}
+import Key.Encode.{InputModes, Normal, Application, Cr, CrLf, Off, On, One, Two}
+import VtSnapshot
+
+# What kbdcast adds to avt (spec §7), on a screen of 10 columns and 3 rows unless a test gives
+# another size.
+
+# The replies to `input`, in order.
+fn replies(input: String) -> List[Reply] {
+  (_, made) = VtSnapshot.run(10, 3, input)
+  made
+}
+
+# The input modes after `input`.
+fn modes(input: String) -> InputModes {
+  (t, _) = VtSnapshot.run(10, 3, input)
+  Terminal.input_modes(t)
+}
+
+@test
+fn da1_is_answered_for_csi_c_with_no_parameter_or_0() {
+  assert replies("\u{1b}[c") == [DeviceAttributes]
+  assert replies("\u{1b}[0c") == [DeviceAttributes]
+  assert replies("\u{1b}[1c") == []
+  # DA2.
+  assert replies("\u{1b}[>c") == []
+}
+
+@test
+fn dsr_answers_the_status_and_the_position_of_the_cursor() {
+  assert replies("\u{1b}[5n") == [Status]
+  assert replies("\u{1b}[6n") == [CursorPosition(1, 1)]
+  assert replies("abc\u{1b}[6n") == [CursorPosition(1, 4)]
+  assert replies("\u{1b}[2;3H\u{1b}[6n") == [CursorPosition(2, 3)]
+  # After the last column the cursor is at column `cols`, which the reply does not go past.
+  assert replies("abcdefghij\u{1b}[6n") == [CursorPosition(1, 10)]
+  # In origin mode the row counts from the top of the scroll region.
+  assert replies("\u{1b}[2;3r\u{1b}[?6h\u{1b}[6n") == [CursorPosition(1, 1)]
+  # DECRC can put the cursor above the top margin in origin mode, and the row does not go below 1.
+  (_, made) = VtSnapshot.run(10, 5, "\u{1b}[2;5r\u{1b}[?6h\u{1b}7\u{1b}[4;5r\u{1b}8\u{1b}[6n")
+  assert made == [CursorPosition(1, 1)]
+}
+
+@test
+fn other_queries_get_no_reply_and_the_replies_keep_their_order() {
+  # kitty's progressive enhancement query.
+  assert replies("\u{1b}[?u") == []
+  assert replies("\u{1b}[c\u{1b}[6n") == [DeviceAttributes, CursorPosition(1, 1)]
+}
+
+@test
+fn cursor_keys_and_newline_follow_decckm_and_lnm() {
+  assert modes("") == InputModes(cursor_keys: Normal, newline: Cr, other_keys: Off)
+  assert modes("\u{1b}[?1h").cursor_keys == Application
+  assert modes("\u{1b}[?1h\u{1b}[?1l").cursor_keys == Normal
+  assert modes("\u{1b}[?1h\u{1b}c").cursor_keys == Normal
+  assert modes("\u{1b}[20h").newline == CrLf
+}
+
+@test
+fn modify_other_keys_takes_the_level_of_csi_greater_4() {
+  assert modes("\u{1b}[>4;1m").other_keys == On(One)
+  assert modes("\u{1b}[>4;2m").other_keys == On(Two)
+  assert modes("\u{1b}[>4;2m\u{1b}[>4;0m").other_keys == Off
+  assert modes("\u{1b}[>4;2m\u{1b}[>4m").other_keys == Off
+  # A level that xterm does not have changes nothing.
+  assert modes("\u{1b}[>4;2m\u{1b}[>4;3m").other_keys == On(Two)
+  # `CSI > m` with no parameter turns it off, as xterm's XTMODKEYS does; `CSI > 0 m` is another
+  # resource and changes nothing.
+  assert modes("\u{1b}[>4;2m\u{1b}[>m").other_keys == Off
+  assert modes("\u{1b}[>4;2m\u{1b}[>0m").other_keys == On(Two)
+  # RIS turns it off, and DECSTR leaves it.
+  assert modes("\u{1b}[>4;2m\u{1b}c").other_keys == Off
+  assert modes("\u{1b}[>4;2m\u{1b}[!p").other_keys == On(Two)
+}
+
+@test
+fn modify_other_keys_is_not_read_as_sgr() {
+  (t, _) = VtSnapshot.run(10, 3, "\u{1b}[>4;2mx")
+  assert Screen.lines(Terminal.screen(t)).head().and_then(List.head)
+    == Some(Cell(0x78, Single, DEFAULT_PEN))
+}
