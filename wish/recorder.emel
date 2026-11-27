@@ -1,0 +1,267 @@
+# wish-target: src/recorder.emel
+import Key.Key
+import Key.Encode.Unencodable
+import Regex.Regex
+import Tape.{Tape, Step}
+
+# tape が何を意味するかを、端末をどう動かすかと切り離す。
+# 端末を動かすのは handler（本番は LiveDriver、test は TestDriver）。
+pub effect Driver {
+  # キーを 1 つ送る
+  suspend fn press(key: Key) -> () fails Unencodable | ProcessExited
+  # d の間、出力を読み続ける
+  suspend fn idle(d: Duration) -> () fails ProcessExited
+  # 画面が pattern に合うまで、最大 timeout 待つ。
+  # source は pattern の元の文字列。Regex から元の文字列が取れないので一緒に渡す
+  # （取れるなら wait_for(pattern: Regex, timeout: Duration) にして、pattern.source() で読む）
+  suspend fn wait_for(pattern: Regex, source: String, timeout: Duration) -> () fails WaitTimeout | ProcessExited
+}
+
+pub error ProcessExited(code: Int)
+pub error WaitTimeout(screen: String)
+
+pub enum Reason {
+  CannotSend(Unencodable)
+  | Exited(Int)
+  | TimedOut(String, Duration, String)   # pattern、timeout、画面
+}
+
+pub error RecordError(line: Int, reason: Reason)
+
+pub fn run_tape(tape: Tape) -> () fails RecordError uses { Driver } {
+  run_steps(tape.steps, tape.typing, tape.timeout)
+}
+
+fn run_steps(steps: List[Step], typing: Duration, timeout: Duration) -> () fails RecordError uses { Driver } {
+  match steps {
+    [] => ()
+    [step, ..rest] => {
+      let last = rest.is_empty()
+      match step {
+        Step.SetTyping(_, d) => run_steps(rest, d, timeout)
+        Step.SetTimeout(_, d) => run_steps(rest, typing, d)
+        Step.Keys(line, keys) => {
+          keys.each(|key| {
+            Driver.press(key)
+            Driver.idle(typing)
+          }) escape {
+            e: Unencodable => fail RecordError(line, CannotSend(e))
+            ProcessExited(code) => exited(line, code, last)
+          }
+          run_steps(rest, typing, timeout)
+        }
+        Step.Sleep(line, d) => {
+          Driver.idle(d) escape {
+            ProcessExited(code) => exited(line, code, last)
+          }
+          run_steps(rest, typing, timeout)
+        }
+        Step.Wait(line, pattern, source) => {
+          # 最後の step でも、wait の途中の終了は error
+          Driver.wait_for(pattern, source, timeout) escape {
+            WaitTimeout(screen) => fail RecordError(line, TimedOut(source, timeout, screen))
+            ProcessExited(code) => fail RecordError(line, Exited(code))
+          }
+          run_steps(rest, typing, timeout)
+        }
+      }
+    }
+  }
+}
+
+# 最後の step の途中の終了は、録画の終わり（`> :wq<CR>`）。最後でなければ error
+fn exited(line: Int, code: Int, last: Bool) -> () fails RecordError {
+  if last { () } else { fail RecordError(line, Exited(code)) }
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0110]: expected variant name
+#     ╭─[ src/recorder.emel:25:3 ]
+#     │
+#  25 │   | Exited(Int)
+#     │   ┬  
+#     │   ╰── 
+# ────╯
+#
+# error[E0110]: expected `,` or newline between variants
+#     ╭─[ src/recorder.emel:25:5 ]
+#     │
+#  25 │   | Exited(Int)
+#     │     ───┬──  
+#     │        ╰──── 
+# ────╯
+#
+# error[E0110]: expected variant name
+#     ╭─[ src/recorder.emel:26:3 ]
+#     │
+#  26 │   | TimedOut(String, Duration, String)   # pattern、timeout、画面
+#     │   ┬  
+#     │   ╰── 
+# ────╯
+#
+# error[E0110]: expected `,` or newline between variants
+#     ╭─[ src/recorder.emel:26:5 ]
+#     │
+#  26 │   | TimedOut(String, Duration, String)   # pattern、timeout、画面
+#     │     ────┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/recorder.emel:36:3 ]
+#     │
+#  36 │   match steps {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/recorder.emel:37:8 ]
+#     │
+#  37 │     [] => ()
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/recorder.emel:37:8 ]
+#     │
+#  37 │     [] => ()
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/recorder.emel:37:8 ]
+#     │
+#  37 │     [] => ()
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/recorder.emel:38:20 ]
+#     │
+#  38 │     [step, ..rest] => {
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/recorder.emel:38:20 ]
+#     │
+#  38 │     [step, ..rest] => {
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/recorder.emel:38:20 ]
+#     │
+#  38 │     [step, ..rest] => {
+#     │                    ┬  
+#     │                    ╰── 
+# ────╯
+#
+# error[E0205]: undefined module `Key.Key`
+#    ╭─[ src/recorder.emel:2:8 ]
+#    │
+#  2 │ import Key.Key
+#    │        ───┬───  
+#    │           ╰───── 
+# ───╯
+#
+# error[E0205]: undefined module `Key.Encode.Unencodable`
+#    ╭─[ src/recorder.emel:3:8 ]
+#    │
+#  3 │ import Key.Encode.Unencodable
+#    │        ───────────┬──────────  
+#    │                   ╰──────────── 
+# ───╯
+#
+# error[E0205]: undefined module `Regex.Regex`
+#    ╭─[ src/recorder.emel:4:8 ]
+#    │
+#  4 │ import Regex.Regex
+#    │        ─────┬─────  
+#    │             ╰─────── 
+# ───╯
+#
+# error[E0211]: cannot find type `Key` in this scope
+#     ╭─[ src/recorder.emel:11:25 ]
+#     │
+#  11 │   suspend fn press(key: Key) -> () fails Unencodable | ProcessExited
+#     │                         ─┬─  
+#     │                          ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find error `Unencodable` in this scope
+#     ╭─[ src/recorder.emel:11:42 ]
+#     │
+#  11 │   suspend fn press(key: Key) -> () fails Unencodable | ProcessExited
+#     │                                          ─────┬─────  
+#     │                                               ╰─────── 
+# ────╯
+#
+# error[E0211]: cannot find type `Duration` in this scope
+#     ╭─[ src/recorder.emel:13:22 ]
+#     │
+#  13 │   suspend fn idle(d: Duration) -> () fails ProcessExited
+#     │                      ────┬───  
+#     │                          ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find type `Regex` in this scope
+#     ╭─[ src/recorder.emel:17:32 ]
+#     │
+#  17 │   suspend fn wait_for(pattern: Regex, source: String, timeout: Duration) -> () fails WaitTimeout | ProcessExited
+#     │                                ──┬──  
+#     │                                  ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Duration` in this scope
+#     ╭─[ src/recorder.emel:17:64 ]
+#     │
+#  17 │   suspend fn wait_for(pattern: Regex, source: String, timeout: Duration) -> () fails WaitTimeout | ProcessExited
+#     │                                                                ────┬───  
+#     │                                                                    ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find type `Unencodable` in this scope
+#     ╭─[ src/recorder.emel:24:14 ]
+#     │
+#  24 │   CannotSend(Unencodable)
+#     │              ─────┬─────  
+#     │                   ╰─────── 
+# ────╯
+#
+# error[E0211]: cannot find type `Duration` in this scope
+#     ╭─[ src/recorder.emel:35:41 ]
+#     │
+#  35 │ fn run_steps(steps: List[Step], typing: Duration, timeout: Duration) -> () fails RecordError uses { Driver } {
+#     │                                         ────┬───  
+#     │                                             ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find type `Duration` in this scope
+#     ╭─[ src/recorder.emel:35:60 ]
+#     │
+#  35 │ fn run_steps(steps: List[Step], typing: Duration, timeout: Duration) -> () fails RecordError uses { Driver } {
+#     │                                                            ────┬───  
+#     │                                                                ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Exited` in this scope
+#     ╭─[ src/recorder.emel:74:48 ]
+#     │
+#  74 │   if last { () } else { fail RecordError(line, Exited(code)) }
+#     │                                                ───┬──  
+#     │                                                   ╰──── 
+# ────╯
+#
+# 23 errors, 1 warning
+# --- end wish check ---

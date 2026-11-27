@@ -10,6 +10,15 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-27-kbdcast-1-recorder-design.md`
 
+## 実装で変わったこと（PR #20。spec は実装に合わせて直した）
+
+- 固定した Emela 0.28.2 の時間切れは `Fiber.timeout`。下の `Task.timeout` は `Fiber.timeout` と読む。
+- Task 3: handler の init は fail できたので、`Exited(127)` の代わりの形は使っていない。`Bun.Terminal` の `exit` callback は呼ばれず、どのプロセスも 100 ms の drain で終わる。`pty/` には `test/` が無い（effect の宣言だけの Pome）。
+- Task 4: `Driver.wait_for` は `wait_for(pattern, source, timeout)`（`Regex` から元の文字列を取れない。friction 069）。「最後の step」は、後ろに `Keys`、`Sleep`、`Wait` が無い step。
+- Task 5、6: `LiveDriver` の状態は `State[Recording]` に置き（handler は操作の間で field を変えられない。friction 073）、公開するのは `Recorder.Live.record(tape)` だけ（`LiveDriver` と `Recording` は private）。cli は `with BunPty(…), SystemClock, SystemStdout { Live.record(tape) }`。
+- Task 6: `examples/vim.tape` の cast は `x` で終わらない（100 ms の drain が最後の窓の 30 ms より長い）。Step 5 の「cast の最後の行が `x` で `"0"`」は計画の誤り。`cli/Pome.toml` の import しない `[dependencies]`（pty、regex、text）は消し、`[replace]` だけを残した。
+- Task 1 の後の直し: tape の duration は 2147483647 ms まで（`duration too long`）。
+
 ## Emela のコードを計画に書かない理由
 
 この repo の規則（`AGENTS.md` の wish-first）では、実装する agent が spec を調べる前に自分で「こう書きたい」コードを書き、回り道を記録する。計画に Emela のコードを書くと、その発見が消える。そこで Emela のタスクには、ファイル、公開する名前と型、振る舞い、テストの入力と期待値、手順だけを書く。JS（pty-bun の host の側）は、完全なコードを書く。

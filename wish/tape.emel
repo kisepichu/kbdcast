@@ -1,0 +1,2204 @@
+# wish-target: src/tape.emel
+# tape の言語（全体設計 §6）を読んで、正しくない形を表せない Tape にする。
+
+import Std.Duration.{Duration}
+import Key.{Key}
+import Key.Notation.{NotationError}
+import Regex.{Regex, RegexSyntax, NO_FLAGS}
+
+pub type Tape(cols: Int, rows: Int, typing: Duration, timeout: Duration, command: Command, steps: List[Step])
+pub type Command(line: Int, argv: List[String], text: String)
+pub enum Step {
+  Keys(Int, List[Key]) | Sleep(Int, Duration) | Wait(Int, Regex, String)
+  | SetTyping(Int, Duration) | SetTimeout(Int, Duration)
+}
+pub error TapeError(line: Int, column: Int, message: String)
+
+# 行頭の空白と行末の \r を除いた行の一部。column は text の最初の文字の列（code point、1 から）。
+type Span(line: Int, column: Int, text: String)
+
+# run の前か後か。前は set で決まった値を、後は組み立て中の Tape を持つ。
+enum Phase {
+  Before(cols: Int, rows: Int, typing: Duration, timeout: Duration)
+  | After(tape: Tape)
+}
+
+pub fn parse(source: String) -> Tape fails TapeError {
+  let raw = source.split("\n")
+  let start = Before(80, 24, Duration.ms(50), Duration.s(10))
+  let phase = raw.enumerate().try_fold(start, fn(phase, (i, text)) {
+    match span_of(i + 1, text) {
+      None -> phase
+      Some(span) -> read_line(phase, span)
+    }
+  })
+  match phase {
+    Before(..) -> {
+      # 空の tape と最後が改行で終わる tape は、split の最後の要素が空。その要素の行を指す。
+      let line = if raw.last() == Some("") { raw.len() } else { raw.len() + 1 }
+      fail TapeError(line, 1, "no run line")
+    }
+    After(tape) -> tape
+  }
+}
+
+# 空の行とコメントの行は None。
+fn span_of(line: Int, raw: String) -> Option[Span] {
+  let text = raw.strip_suffix("\r") ?? raw
+  let body = text.trim_start()
+  let column = text.char_count() - body.char_count() + 1
+  if body == "" or body.starts_with("\"") { None } else { Some(Span(line, column, body)) }
+}
+
+# 行の最初の語と、その後ろ（間の空白を除く）。`>` は空白が無くても 1 語。
+fn command_of(span: Span) -> (String, Span) {
+  if span.text.starts_with(">") {
+    (">", span.drop(1))
+  } else {
+    let name = span.text.take_while(fn(c) { not c.is_whitespace() })
+    (name, span.drop(name.char_count()).trim_start())
+  }
+}
+
+fn read_line(phase: Phase, span: Span) -> Phase fails TapeError {
+  let (name, arg) = command_of(span)
+  let here = fn(message) { TapeError(span.line, span.column, message) }
+  match (name, phase) {
+    (">" | "wait" | "sleep", Before(..)) -> fail here("${name} must come after run")
+    ("run", Before(cols, rows, typing, timeout)) ->
+      After(Tape(cols, rows, typing, timeout, command(span.line, arg), []))
+    ("run", After(tape)) -> fail here("run appears more than once (first on line ${tape.command.line})")
+    ("set", _) -> set(phase, span, arg)
+    (">", After(tape)) -> After(tape with { steps: tape.steps ++ [Keys(span.line, keys(arg))] })
+    ("wait", After(tape)) -> After(tape with { steps: tape.steps ++ [wait(arg)] })
+    ("sleep", After(tape)) -> After(tape with { steps: tape.steps ++ [Sleep(span.line, duration(arg, "sleep"))] })
+    (other, _) -> fail here("unknown command: ${other}")
+  }
+}
+
+fn set(phase: Phase, span: Span, arg: Span) -> Phase fails TapeError {
+  let (setting, value) = command_of(arg)
+  match (setting, phase) {
+    ("size", Before(_, _, typing, timeout)) -> {
+      let (cols, rows) = size(value)
+      Before(cols, rows, typing, timeout)
+    }
+    ("size", After(_)) -> fail TapeError(span.line, span.column, "set size must come before run")
+    ("typing", Before(cols, rows, _, timeout)) -> Before(cols, rows, duration(value, "set typing"), timeout)
+    ("typing", After(tape)) ->
+      After(tape with { steps: tape.steps ++ [SetTyping(span.line, duration(value, "set typing"))] })
+    ("timeout", Before(cols, rows, typing, _)) -> Before(cols, rows, typing, duration(value, "set timeout"))
+    ("timeout", After(tape)) ->
+      After(tape with { steps: tape.steps ++ [SetTimeout(span.line, duration(value, "set timeout"))] })
+    (other, _) -> fail TapeError(arg.line, arg.column, "unknown setting: ${other}")
+  }
+}
+
+fn size(value: Span) -> (Int, Int) fails TapeError {
+  let text = value.text.trim_end()
+  let here = fn(message) { TapeError(value.line, value.column, message) }
+  match text.split_once("x") {
+    Some((c, r)) -> match (Int.parse(c), Int.parse(r)) {
+      (Some(cols), Some(rows)) if 1 <= cols <= 1000 and 1 <= rows <= 1000 -> (cols, rows)
+      (Some(_), Some(_)) -> fail here("size must be from 1x1 to 1000x1000: ${text}")
+      _ -> fail here("size must be <cols>x<rows>: ${text}")
+    }
+    None -> fail here("size must be <cols>x<rows>: ${text}")
+  }
+}
+
+fn duration(value: Span, what: String) -> Duration fails TapeError {
+  let text = value.text.trim_end()
+  let here = fn(message) { TapeError(value.line, value.column, message) }
+  match text {
+    "" -> fail here("${what} needs a duration")
+    "${n:digits}ms" -> Duration.ms(Int.parse(n)!)
+    "${n:digits}s" -> Duration.s(Int.parse(n)!)
+    "${n:digits}m" -> fail here("use ms for milliseconds: ${n}ms")
+    "${n:digits}" -> fail here("duration needs a unit: ${n}ms or ${n}s")
+    _ -> fail here("invalid duration: ${text}")
+  }
+}
+
+fn keys(arg: Span) -> List[Key] fails TapeError {
+  # arg は `>` のすぐ後ろ。区切りの空白 1 つを除いた残りがキー列。
+  match arg.text.strip_prefix(" ") {
+    None -> fail TapeError(arg.line, arg.column, "expected a space after >")
+    Some(body) -> {
+      let column = arg.column + 1
+      let keys = Key.Notation.parse(body)
+        escape NotationError(offset, message) -> TapeError(arg.line, column + offset, message)
+      if keys == [] { fail TapeError(arg.line, column, "no keys to send") } else { keys }
+    }
+  }
+}
+
+fn wait(arg: Span) -> Step fails TapeError {
+  match arg.text.strip_prefix("/") {
+    None -> fail TapeError(arg.line, arg.column, "wait needs /<pattern>")
+    Some(pattern) -> {
+      let regex = Regex.compile(pattern, NO_FLAGS)
+        escape RegexSyntax(offset, message) -> TapeError(arg.line, arg.column + 1 + offset, message)
+      Wait(arg.line, regex, pattern)
+    }
+  }
+}
+
+fn command(line: Int, arg: Span) -> Command fails TapeError {
+  let text = arg.text.trim_end()
+  if text == "" { fail TapeError(arg.line, arg.column, "run needs a command") }
+  Command(line, split_words(arg), text)
+}
+
+# 引用の中か外か。中なら、閉じないときの error のために始まりの列を持つ。
+enum Quote { Bare | Single(Int) | Double(Int) }
+
+# シェル風に分ける。word は作りかけの語（`''` のような空の語があるので Option）。
+fn split_words(arg: Span) -> List[String] fails TapeError {
+  fn go(chars: List[Char], column: Int, quote: Quote, word: Option[String], words: List[String]) -> List[String] fails TapeError {
+    let grow = fn(c) { Some((word ?? "") + c) }
+    match (quote, chars) {
+      (Bare, []) -> words ++ word.to_list()
+      (Single(start) | Double(start), []) -> fail TapeError(arg.line, start, "unterminated quote")
+      (Bare, [' ' | '\t', ..rest]) -> go(rest, column + 1, Bare, None, words ++ word.to_list())
+      (Bare, ['\'', ..rest]) -> go(rest, column + 1, Single(column), grow(""), words)
+      (Bare, ['"', ..rest]) -> go(rest, column + 1, Double(column), grow(""), words)
+      (Bare, ['\\', c, ..rest]) -> go(rest, column + 2, Bare, grow(c), words)
+      (Bare, [c, ..rest]) -> go(rest, column + 1, Bare, grow(c), words)
+      (Single(_), ['\'', ..rest]) -> go(rest, column + 1, Bare, word, words)
+      (Single(_), [c, ..rest]) -> go(rest, column + 1, quote, grow(c), words)
+      (Double(_), ['"', ..rest]) -> go(rest, column + 1, Bare, word, words)
+      (Double(_), ['\\', '"' | '\\' as c, ..rest]) -> go(rest, column + 2, quote, grow(c), words)
+      (Double(_), [c, ..rest]) -> go(rest, column + 1, quote, grow(c), words)
+    }
+  }
+  go(arg.text.chars(), arg.column, Bare, None, [])
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0105]: unrecognized character `?`
+#     ╭─[ src/tape.emel:47:37 ]
+#     │
+#  47 │   let text = raw.strip_suffix("\r") ?? raw
+#     │                                     ┬  
+#     │                                     ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `?`
+#     ╭─[ src/tape.emel:47:38 ]
+#     │
+#  47 │   let text = raw.strip_suffix("\r") ?? raw
+#     │                                      ┬  
+#     │                                      ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/tape.emel:159:35 ]
+#      │
+#  159 │     let grow = fn(c) { Some((word ?? "") + c) }
+#      │                                   ┬  
+#      │                                   ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `?`
+#      ╭─[ src/tape.emel:159:36 ]
+#      │
+#  159 │     let grow = fn(c) { Some((word ?? "") + c) }
+#      │                                    ┬  
+#      │                                    ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/tape.emel:163:15 ]
+#      │
+#  163 │       (Bare, [' ' | '\t', ..rest]) -> go(rest, column + 1, Bare, None, words ++ word.to_list())
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/tape.emel:163:17 ]
+#      │
+#  163 │       (Bare, [' ' | '\t', ..rest]) -> go(rest, column + 1, Bare, None, words ++ word.to_list())
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/tape.emel:163:21 ]
+#      │
+#  163 │       (Bare, [' ' | '\t', ..rest]) -> go(rest, column + 1, Bare, None, words ++ word.to_list())
+#      │                     ┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/tape.emel:163:22 ]
+#      │
+#  163 │       (Bare, [' ' | '\t', ..rest]) -> go(rest, column + 1, Bare, None, words ++ word.to_list())
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/tape.emel:163:24 ]
+#      │
+#  163 │       (Bare, [' ' | '\t', ..rest]) -> go(rest, column + 1, Bare, None, words ++ word.to_list())
+#      │                        ┬  
+#      │                        ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/tape.emel:164:15 ]
+#      │
+#  164 │       (Bare, ['\'', ..rest]) -> go(rest, column + 1, Single(column), grow(""), words)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/tape.emel:164:16 ]
+#      │
+#  164 │       (Bare, ['\'', ..rest]) -> go(rest, column + 1, Single(column), grow(""), words)
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/tape.emel:164:17 ]
+#      │
+#  164 │       (Bare, ['\'', ..rest]) -> go(rest, column + 1, Single(column), grow(""), words)
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/tape.emel:164:18 ]
+#      │
+#  164 │       (Bare, ['\'', ..rest]) -> go(rest, column + 1, Single(column), grow(""), words)
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/tape.emel:165:15 ]
+#      │
+#  165 │       (Bare, ['"', ..rest]) -> go(rest, column + 1, Double(column), grow(""), words)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0101]: unterminated string literal
+#      ╭─[ src/tape.emel:165:75 ]
+#      │
+#  165 │       (Bare, ['"', ..rest]) -> go(rest, column + 1, Double(column), grow(""), words)
+#      │                                                                           ─────┬────  
+#      │                                                                                ╰────── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/tape.emel:166:15 ]
+#      │
+#  166 │       (Bare, ['\\', c, ..rest]) -> go(rest, column + 2, Bare, grow(c), words)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/tape.emel:166:16 ]
+#      │
+#  166 │       (Bare, ['\\', c, ..rest]) -> go(rest, column + 2, Bare, grow(c), words)
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/tape.emel:166:17 ]
+#      │
+#  166 │       (Bare, ['\\', c, ..rest]) -> go(rest, column + 2, Bare, grow(c), words)
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/tape.emel:166:18 ]
+#      │
+#  166 │       (Bare, ['\\', c, ..rest]) -> go(rest, column + 2, Bare, grow(c), words)
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/tape.emel:168:20 ]
+#      │
+#  168 │       (Single(_), ['\'', ..rest]) -> go(rest, column + 1, Bare, word, words)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/tape.emel:168:21 ]
+#      │
+#  168 │       (Single(_), ['\'', ..rest]) -> go(rest, column + 1, Bare, word, words)
+#      │                     ┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/tape.emel:168:22 ]
+#      │
+#  168 │       (Single(_), ['\'', ..rest]) -> go(rest, column + 1, Bare, word, words)
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/tape.emel:168:23 ]
+#      │
+#  168 │       (Single(_), ['\'', ..rest]) -> go(rest, column + 1, Bare, word, words)
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/tape.emel:170:20 ]
+#      │
+#  170 │       (Double(_), ['"', ..rest]) -> go(rest, column + 1, Bare, word, words)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0101]: unterminated string literal
+#      ╭─[ src/tape.emel:170:21 ]
+#      │
+#  170 │       (Double(_), ['"', ..rest]) -> go(rest, column + 1, Bare, word, words)
+#      │                     ───────────────────────────┬───────────────────────────  
+#      │                                                ╰───────────────────────────── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/tape.emel:171:20 ]
+#      │
+#  171 │       (Double(_), ['\\', '"' | '\\' as c, ..rest]) -> go(rest, column + 2, quote, grow(c), words)
+#      │                    ┬  
+#      │                    ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/tape.emel:171:21 ]
+#      │
+#  171 │       (Double(_), ['\\', '"' | '\\' as c, ..rest]) -> go(rest, column + 2, quote, grow(c), words)
+#      │                     ┬  
+#      │                     ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\\`
+#      ╭─[ src/tape.emel:171:22 ]
+#      │
+#  171 │       (Double(_), ['\\', '"' | '\\' as c, ..rest]) -> go(rest, column + 2, quote, grow(c), words)
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/tape.emel:171:23 ]
+#      │
+#  171 │       (Double(_), ['\\', '"' | '\\' as c, ..rest]) -> go(rest, column + 2, quote, grow(c), words)
+#      │                       ┬  
+#      │                       ╰── 
+# ─────╯
+#
+# error[E0105]: unrecognized character `\'`
+#      ╭─[ src/tape.emel:171:26 ]
+#      │
+#  171 │       (Double(_), ['\\', '"' | '\\' as c, ..rest]) -> go(rest, column + 2, quote, grow(c), words)
+#      │                          ┬  
+#      │                          ╰── 
+# ─────╯
+#
+# error[E0101]: unterminated string literal
+#      ╭─[ src/tape.emel:171:27 ]
+#      │
+#  171 │       (Double(_), ['\\', '"' | '\\' as c, ..rest]) -> go(rest, column + 2, quote, grow(c), words)
+#      │                           ───────────────────────────────────┬───────────────────────────────────  
+#      │                                                              ╰───────────────────────────────────── 
+# ─────╯
+#
+# error[E0110]: expected `,` or newline between variants
+#     ╭─[ src/tape.emel:12:24 ]
+#     │
+#  12 │   Keys(Int, List[Key]) | Sleep(Int, Duration) | Wait(Int, Regex, String)
+#     │                        ┬  
+#     │                        ╰── 
+# ────╯
+#
+# error[E0110]: expected variant name
+#     ╭─[ src/tape.emel:13:3 ]
+#     │
+#  13 │   | SetTyping(Int, Duration) | SetTimeout(Int, Duration)
+#     │   ┬  
+#     │   ╰── 
+# ────╯
+#
+# error[E0110]: expected `,` or newline between variants
+#     ╭─[ src/tape.emel:13:5 ]
+#     │
+#  13 │   | SetTyping(Int, Duration) | SetTimeout(Int, Duration)
+#     │     ────┬────  
+#     │         ╰────── 
+# ────╯
+#
+# error[E0110]: expected variant name
+#     ╭─[ src/tape.emel:23:3 ]
+#     │
+#  23 │   | After(tape: Tape)
+#     │   ┬  
+#     │   ╰── 
+# ────╯
+#
+# error[E0110]: expected `,` or newline between variants
+#     ╭─[ src/tape.emel:23:5 ]
+#     │
+#  23 │   | After(tape: Tape)
+#     │     ──┬──  
+#     │       ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/tape.emel:27:3 ]
+#     │
+#  27 │   let raw = source.split("\n")
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/tape.emel:27:7 ]
+#     │
+#  27 │   let raw = source.split("\n")
+#     │       ─┬─  
+#     │        ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/tape.emel:28:3 ]
+#     │
+#  28 │   let start = Before(80, 24, Duration.ms(50), Duration.s(10))
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/tape.emel:28:7 ]
+#     │
+#  28 │   let start = Before(80, 24, Duration.ms(50), Duration.s(10))
+#     │       ──┬──  
+#     │         ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/tape.emel:29:3 ]
+#     │
+#  29 │   let phase = raw.enumerate().try_fold(start, fn(phase, (i, text)) {
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/tape.emel:29:7 ]
+#     │
+#  29 │   let phase = raw.enumerate().try_fold(start, fn(phase, (i, text)) {
+#     │       ──┬──  
+#     │         ╰──── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/tape.emel:35:3 ]
+#     │
+#  35 │   match phase {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/tape.emel:38:7 ]
+#     │
+#  38 │       let line = if raw.last() == Some("") { raw.len() } else { raw.len() + 1 }
+#     │       ─┬─  
+#     │        ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/tape.emel:38:11 ]
+#     │
+#  38 │       let line = if raw.last() == Some("") { raw.len() } else { raw.len() + 1 }
+#     │           ──┬─  
+#     │             ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/tape.emel:47:3 ]
+#     │
+#  47 │   let text = raw.strip_suffix("\r") ?? raw
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/tape.emel:47:7 ]
+#     │
+#  47 │   let text = raw.strip_suffix("\r") ?? raw
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/tape.emel:48:3 ]
+#     │
+#  48 │   let body = text.trim_start()
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/tape.emel:48:7 ]
+#     │
+#  48 │   let body = text.trim_start()
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/tape.emel:49:3 ]
+#     │
+#  49 │   let column = text.char_count() - body.char_count() + 1
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/tape.emel:49:7 ]
+#     │
+#  49 │   let column = text.char_count() - body.char_count() + 1
+#     │       ───┬──  
+#     │          ╰──── 
+# ────╯
+#
+# error[E0110]: expected `{`
+#     ╭─[ src/tape.emel:50:17 ]
+#     │
+#  50 │   if body == "" or body.starts_with("\"") { None } else { Some(Span(line, column, body)) }
+#     │                 ─┬  
+#     │                  ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/tape.emel:50:20 ]
+#     │
+#  50 │   if body == "" or body.starts_with("\"") { None } else { Some(Span(line, column, body)) }
+#     │                    ──┬─  
+#     │                      ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/tape.emel:58:5 ]
+#     │
+#  58 │     let name = span.text.take_while(fn(c) { not c.is_whitespace() })
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/tape.emel:58:9 ]
+#     │
+#  58 │     let name = span.text.take_while(fn(c) { not c.is_whitespace() })
+#     │         ──┬─  
+#     │           ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/tape.emel:64:3 ]
+#     │
+#  64 │   let (name, arg) = command_of(span)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/tape.emel:64:7 ]
+#     │
+#  64 │   let (name, arg) = command_of(span)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/tape.emel:65:3 ]
+#     │
+#  65 │   let here = fn(message) { TapeError(span.line, span.column, message) }
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/tape.emel:65:7 ]
+#     │
+#  65 │   let here = fn(message) { TapeError(span.line, span.column, message) }
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/tape.emel:66:3 ]
+#     │
+#  66 │   match (name, phase) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#     ╭─[ src/tape.emel:67:10 ]
+#     │
+#  67 │     (">" | "wait" | "sleep", Before(..)) -> fail here("${name} must come after run")
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/tape.emel:67:10 ]
+#     │
+#  67 │     (">" | "wait" | "sleep", Before(..)) -> fail here("${name} must come after run")
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/tape.emel:67:10 ]
+#     │
+#  67 │     (">" | "wait" | "sleep", Before(..)) -> fail here("${name} must come after run")
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/tape.emel:67:28 ]
+#     │
+#  67 │     (">" | "wait" | "sleep", Before(..)) -> fail here("${name} must come after run")
+#     │                            ┬  
+#     │                            ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/tape.emel:68:52 ]
+#     │
+#  68 │     ("run", Before(cols, rows, typing, timeout)) ->
+#     │                                                    ┬  
+#     │                                                    ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/tape.emel:69:54 ]
+#     │
+#  69 │       After(Tape(cols, rows, typing, timeout, command(span.line, arg), []))
+#     │                                                      ┬  
+#     │                                                      ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/tape.emel:69:54 ]
+#     │
+#  69 │       After(Tape(cols, rows, typing, timeout, command(span.line, arg), []))
+#     │                                                      ┬  
+#     │                                                      ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/tape.emel:69:54 ]
+#     │
+#  69 │       After(Tape(cols, rows, typing, timeout, command(span.line, arg), []))
+#     │                                                      ┬  
+#     │                                                      ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/tape.emel:69:70 ]
+#     │
+#  69 │       After(Tape(cols, rows, typing, timeout, command(span.line, arg), []))
+#     │                                                                      ┬  
+#     │                                                                      ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/tape.emel:72:38 ]
+#     │
+#  72 │     (">", After(tape)) -> After(tape with { steps: tape.steps ++ [Keys(span.line, keys(arg))] })
+#     │                                      ──┬─  
+#     │                                        ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/tape.emel:72:38 ]
+#     │
+#  72 │     (">", After(tape)) -> After(tape with { steps: tape.steps ++ [Keys(span.line, keys(arg))] })
+#     │                                      ──┬─  
+#     │                                        ╰─── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/tape.emel:73:41 ]
+#     │
+#  73 │     ("wait", After(tape)) -> After(tape with { steps: tape.steps ++ [wait(arg)] })
+#     │                                         ──┬─  
+#     │                                           ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/tape.emel:73:41 ]
+#     │
+#  73 │     ("wait", After(tape)) -> After(tape with { steps: tape.steps ++ [wait(arg)] })
+#     │                                         ──┬─  
+#     │                                           ╰─── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/tape.emel:74:42 ]
+#     │
+#  74 │     ("sleep", After(tape)) -> After(tape with { steps: tape.steps ++ [Sleep(span.line, duration(arg, "sleep"))] })
+#     │                                          ──┬─  
+#     │                                            ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/tape.emel:74:42 ]
+#     │
+#  74 │     ("sleep", After(tape)) -> After(tape with { steps: tape.steps ++ [Sleep(span.line, duration(arg, "sleep"))] })
+#     │                                          ──┬─  
+#     │                                            ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/tape.emel:80:3 ]
+#     │
+#  80 │   let (setting, value) = command_of(arg)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/tape.emel:80:7 ]
+#     │
+#  80 │   let (setting, value) = command_of(arg)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/tape.emel:81:3 ]
+#     │
+#  81 │   match (setting, phase) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/tape.emel:83:7 ]
+#     │
+#  83 │       let (cols, rows) = size(value)
+#     │       ─┬─  
+#     │        ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/tape.emel:83:11 ]
+#     │
+#  83 │       let (cols, rows) = size(value)
+#     │           ┬  
+#     │           ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/tape.emel:88:31 ]
+#     │
+#  88 │     ("typing", After(tape)) ->
+#     │                               ┬  
+#     │                               ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/tape.emel:89:18 ]
+#     │
+#  89 │       After(tape with { steps: tape.steps ++ [SetTyping(span.line, duration(value, "set typing"))] })
+#     │                  ──┬─  
+#     │                    ╰─── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/tape.emel:89:18 ]
+#     │
+#  89 │       After(tape with { steps: tape.steps ++ [SetTyping(span.line, duration(value, "set typing"))] })
+#     │                  ──┬─  
+#     │                    ╰─── 
+# ────╯
+#
+# error[E0110]: expected type name
+#     ╭─[ src/tape.emel:89:23 ]
+#     │
+#  89 │       After(tape with { steps: tape.steps ++ [SetTyping(span.line, duration(value, "set typing"))] })
+#     │                       ┬  
+#     │                       ╰── 
+# ────╯
+#
+# error[E0111]: expected type
+#     ╭─[ src/tape.emel:89:32 ]
+#     │
+#  89 │       After(tape with { steps: tape.steps ++ [SetTyping(span.line, duration(value, "set typing"))] })
+#     │                                ──┬─  
+#     │                                  ╰─── 
+# ────╯
+#
+# error[E0110]: expected `=`
+#     ╭─[ src/tape.emel:89:36 ]
+#     │
+#  89 │       After(tape with { steps: tape.steps ++ [SetTyping(span.line, duration(value, "set typing"))] })
+#     │                                    ┬  
+#     │                                    ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/tape.emel:89:36 ]
+#     │
+#  89 │       After(tape with { steps: tape.steps ++ [SetTyping(span.line, duration(value, "set typing"))] })
+#     │                                    ┬  
+#     │                                    ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/tape.emel:89:37 ]
+#     │
+#  89 │       After(tape with { steps: tape.steps ++ [SetTyping(span.line, duration(value, "set typing"))] })
+#     │                                     ──┬──  
+#     │                                       ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/tape.emel:89:101 ]
+#     │
+#  89 │       After(tape with { steps: tape.steps ++ [SetTyping(span.line, duration(value, "set typing"))] })
+#     │                                                                                                     ┬  
+#     │                                                                                                     ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/tape.emel:91:32 ]
+#     │
+#  91 │     ("timeout", After(tape)) ->
+#     │                                ┬  
+#     │                                ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/tape.emel:92:18 ]
+#     │
+#  92 │       After(tape with { steps: tape.steps ++ [SetTimeout(span.line, duration(value, "set timeout"))] })
+#     │                  ──┬─  
+#     │                    ╰─── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/tape.emel:92:18 ]
+#     │
+#  92 │       After(tape with { steps: tape.steps ++ [SetTimeout(span.line, duration(value, "set timeout"))] })
+#     │                  ──┬─  
+#     │                    ╰─── 
+# ────╯
+#
+# error[E0110]: expected type name
+#     ╭─[ src/tape.emel:92:23 ]
+#     │
+#  92 │       After(tape with { steps: tape.steps ++ [SetTimeout(span.line, duration(value, "set timeout"))] })
+#     │                       ┬  
+#     │                       ╰── 
+# ────╯
+#
+# error[E0111]: expected type
+#     ╭─[ src/tape.emel:92:32 ]
+#     │
+#  92 │       After(tape with { steps: tape.steps ++ [SetTimeout(span.line, duration(value, "set timeout"))] })
+#     │                                ──┬─  
+#     │                                  ╰─── 
+# ────╯
+#
+# error[E0110]: expected `=`
+#     ╭─[ src/tape.emel:92:36 ]
+#     │
+#  92 │       After(tape with { steps: tape.steps ++ [SetTimeout(span.line, duration(value, "set timeout"))] })
+#     │                                    ┬  
+#     │                                    ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/tape.emel:92:36 ]
+#     │
+#  92 │       After(tape with { steps: tape.steps ++ [SetTimeout(span.line, duration(value, "set timeout"))] })
+#     │                                    ┬  
+#     │                                    ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/tape.emel:92:37 ]
+#     │
+#  92 │       After(tape with { steps: tape.steps ++ [SetTimeout(span.line, duration(value, "set timeout"))] })
+#     │                                     ──┬──  
+#     │                                       ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/tape.emel:92:103 ]
+#     │
+#  92 │       After(tape with { steps: tape.steps ++ [SetTimeout(span.line, duration(value, "set timeout"))] })
+#     │                                                                                                       ┬  
+#     │                                                                                                       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/tape.emel:98:3 ]
+#     │
+#  98 │   let text = value.text.trim_end()
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/tape.emel:98:7 ]
+#     │
+#  98 │   let text = value.text.trim_end()
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/tape.emel:99:3 ]
+#     │
+#  99 │   let here = fn(message) { TapeError(value.line, value.column, message) }
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/tape.emel:99:7 ]
+#     │
+#  99 │   let here = fn(message) { TapeError(value.line, value.column, message) }
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/tape.emel:100:3 ]
+#      │
+#  100 │   match text.split_once("x") {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/tape.emel:101:21 ]
+#      │
+#  101 │     Some((c, r)) -> match (Int.parse(c), Int.parse(r)) {
+#      │                     ──┬──  
+#      │                       ╰──── 
+# ─────╯
+#
+# error[E0119]: comparison operators cannot be chained
+#      ╭─[ src/tape.emel:102:45 ]
+#      │
+#  102 │       (Some(cols), Some(rows)) if 1 <= cols <= 1000 and 1 <= rows <= 1000 -> (cols, rows)
+#      │                                             ─┬  
+#      │                                              ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/tape.emel:102:53 ]
+#      │
+#  102 │       (Some(cols), Some(rows)) if 1 <= cols <= 1000 and 1 <= rows <= 1000 -> (cols, rows)
+#      │                                                     ─┬─  
+#      │                                                      ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/tape.emel:102:57 ]
+#      │
+#  102 │       (Some(cols), Some(rows)) if 1 <= cols <= 1000 and 1 <= rows <= 1000 -> (cols, rows)
+#      │                                                         ┬  
+#      │                                                         ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/tape.emel:111:3 ]
+#      │
+#  111 │   let text = value.text.trim_end()
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/tape.emel:111:7 ]
+#      │
+#  111 │   let text = value.text.trim_end()
+#      │       ──┬─  
+#      │         ╰─── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/tape.emel:112:3 ]
+#      │
+#  112 │   let here = fn(message) { TapeError(value.line, value.column, message) }
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/tape.emel:112:7 ]
+#      │
+#  112 │   let here = fn(message) { TapeError(value.line, value.column, message) }
+#      │       ──┬─  
+#      │         ╰─── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/tape.emel:113:3 ]
+#      │
+#  113 │   match text {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/tape.emel:115:48 ]
+#      │
+#  115 │     "${n:digits}ms" -> Duration.ms(Int.parse(n)!)
+#      │                                                ┬  
+#      │                                                ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/tape.emel:115:48 ]
+#      │
+#  115 │     "${n:digits}ms" -> Duration.ms(Int.parse(n)!)
+#      │                                                ┬  
+#      │                                                ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/tape.emel:116:46 ]
+#      │
+#  116 │     "${n:digits}s" -> Duration.s(Int.parse(n)!)
+#      │                                              ┬  
+#      │                                              ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/tape.emel:116:46 ]
+#      │
+#  116 │     "${n:digits}s" -> Duration.s(Int.parse(n)!)
+#      │                                              ┬  
+#      │                                              ╰── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/tape.emel:125:3 ]
+#      │
+#  125 │   match arg.text.strip_prefix(" ") {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/tape.emel:128:7 ]
+#      │
+#  128 │       let column = arg.column + 1
+#      │       ─┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/tape.emel:128:11 ]
+#      │
+#  128 │       let column = arg.column + 1
+#      │           ───┬──  
+#      │              ╰──── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/tape.emel:129:7 ]
+#      │
+#  129 │       let keys = Key.Notation.parse(body)
+#      │       ─┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/tape.emel:129:11 ]
+#      │
+#  129 │       let keys = Key.Notation.parse(body)
+#      │           ──┬─  
+#      │             ╰─── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/tape.emel:137:3 ]
+#      │
+#  137 │   match arg.text.strip_prefix("/") {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/tape.emel:140:7 ]
+#      │
+#  140 │       let regex = Regex.compile(pattern, NO_FLAGS)
+#      │       ─┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/tape.emel:140:11 ]
+#      │
+#  140 │       let regex = Regex.compile(pattern, NO_FLAGS)
+#      │           ──┬──  
+#      │             ╰──── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/tape.emel:148:3 ]
+#      │
+#  148 │   let text = arg.text.trim_end()
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/tape.emel:148:7 ]
+#      │
+#  148 │   let text = arg.text.trim_end()
+#      │       ──┬─  
+#      │         ╰─── 
+# ─────╯
+#
+# error[E0110]: expected `,` or newline between variants
+#      ╭─[ src/tape.emel:154:19 ]
+#      │
+#  154 │ enum Quote { Bare | Single(Int) | Double(Int) }
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/tape.emel:159:5 ]
+#      │
+#  159 │     let grow = fn(c) { Some((word ?? "") + c) }
+#      │     ─┬─  
+#      │      ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/tape.emel:159:9 ]
+#      │
+#  159 │     let grow = fn(c) { Some((word ?? "") + c) }
+#      │         ──┬─  
+#      │           ╰─── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/tape.emel:160:5 ]
+#      │
+#  160 │     match (quote, chars) {
+#      │     ──┬──  
+#      │       ╰──── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/tape.emel:161:28 ]
+#      │
+#  161 │       (Bare, []) -> words ++ word.to_list()
+#      │                            ┬  
+#      │                            ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/tape.emel:161:30 ]
+#      │
+#  161 │       (Bare, []) -> words ++ word.to_list()
+#      │                              ──┬─  
+#      │                                ╰─── 
+# ─────╯
+#
+# error[E0112]: a tuple pattern needs at least two elements
+#      ╭─[ src/tape.emel:162:22 ]
+#      │
+#  162 │       (Single(start) | Double(start), []) -> fail TapeError(arg.line, start, "unterminated quote")
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/tape.emel:162:22 ]
+#      │
+#  162 │       (Single(start) | Double(start), []) -> fail TapeError(arg.line, start, "unterminated quote")
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/tape.emel:162:22 ]
+#      │
+#  162 │       (Single(start) | Double(start), []) -> fail TapeError(arg.line, start, "unterminated quote")
+#      │                      ┬  
+#      │                      ╰── 
+# ─────╯
+#
+# error[E0110]: expected `|`
+#      ╭─[ src/tape.emel:162:41 ]
+#      │
+#  162 │       (Single(start) | Double(start), []) -> fail TapeError(arg.line, start, "unterminated quote")
+#      │                                         ┬  
+#      │                                         ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/tape.emel:162:41 ]
+#      │
+#  162 │       (Single(start) | Double(start), []) -> fail TapeError(arg.line, start, "unterminated quote")
+#      │                                         ┬  
+#      │                                         ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/tape.emel:162:41 ]
+#      │
+#  162 │       (Single(start) | Double(start), []) -> fail TapeError(arg.line, start, "unterminated quote")
+#      │                                         ┬  
+#      │                                         ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/tape.emel:163:15 ]
+#      │
+#  163 │       (Bare, [' ' | '\t', ..rest]) -> go(rest, column + 1, Bare, None, words ++ word.to_list())
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0110]: expected `]`
+#      ╭─[ src/tape.emel:163:17 ]
+#      │
+#  163 │       (Bare, [' ' | '\t', ..rest]) -> go(rest, column + 1, Bare, None, words ++ word.to_list())
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/tape.emel:163:17 ]
+#      │
+#  163 │       (Bare, [' ' | '\t', ..rest]) -> go(rest, column + 1, Bare, None, words ++ word.to_list())
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/tape.emel:163:17 ]
+#      │
+#  163 │       (Bare, [' ' | '\t', ..rest]) -> go(rest, column + 1, Bare, None, words ++ word.to_list())
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/tape.emel:163:17 ]
+#      │
+#  163 │       (Bare, [' ' | '\t', ..rest]) -> go(rest, column + 1, Bare, None, words ++ word.to_list())
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/tape.emel:163:19 ]
+#      │
+#  163 │       (Bare, [' ' | '\t', ..rest]) -> go(rest, column + 1, Bare, None, words ++ word.to_list())
+#      │                   ┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/tape.emel:164:15 ]
+#      │
+#  164 │       (Bare, ['\'', ..rest]) -> go(rest, column + 1, Single(column), grow(""), words)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0110]: expected `]`
+#      ╭─[ src/tape.emel:164:16 ]
+#      │
+#  164 │       (Bare, ['\'', ..rest]) -> go(rest, column + 1, Single(column), grow(""), words)
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/tape.emel:164:16 ]
+#      │
+#  164 │       (Bare, ['\'', ..rest]) -> go(rest, column + 1, Single(column), grow(""), words)
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/tape.emel:164:16 ]
+#      │
+#  164 │       (Bare, ['\'', ..rest]) -> go(rest, column + 1, Single(column), grow(""), words)
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/tape.emel:164:16 ]
+#      │
+#  164 │       (Bare, ['\'', ..rest]) -> go(rest, column + 1, Single(column), grow(""), words)
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/tape.emel:164:17 ]
+#      │
+#  164 │       (Bare, ['\'', ..rest]) -> go(rest, column + 1, Single(column), grow(""), words)
+#      │                 ┬  
+#      │                 ╰── 
+# ─────╯
+#
+# error[E0113]: expected pattern
+#      ╭─[ src/tape.emel:165:15 ]
+#      │
+#  165 │       (Bare, ['"', ..rest]) -> go(rest, column + 1, Double(column), grow(""), words)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0110]: expected `]`
+#      ╭─[ src/tape.emel:165:16 ]
+#      │
+#  165 │       (Bare, ['"', ..rest]) -> go(rest, column + 1, Double(column), grow(""), words)
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0110]: expected `)`
+#      ╭─[ src/tape.emel:165:16 ]
+#      │
+#  165 │       (Bare, ['"', ..rest]) -> go(rest, column + 1, Double(column), grow(""), words)
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/tape.emel:165:16 ]
+#      │
+#  165 │       (Bare, ['"', ..rest]) -> go(rest, column + 1, Double(column), grow(""), words)
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/tape.emel:165:75 ]
+#      │
+#  165 │       (Bare, ['"', ..rest]) -> go(rest, column + 1, Double(column), grow(""), words)
+#      │                                                                           ┬  
+#      │                                                                           ╰── 
+# ─────╯
+#
+# error[E0205]: undefined module `Regex`
+#    ╭─[ src/tape.emel:7:8 ]
+#    │
+#  7 │ import Regex.{Regex, RegexSyntax, NO_FLAGS}
+#    │        ──┬──  
+#    │          ╰──── 
+# ───╯
+#
+# error[E0211]: cannot find value `phase` in this scope
+#     ╭─[ src/tape.emel:35:9 ]
+#     │
+#  35 │   match phase {
+#     │         ──┬──  
+#     │           ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `line` in this scope
+#     ╭─[ src/tape.emel:39:22 ]
+#     │
+#  39 │       fail TapeError(line, 1, "no run line")
+#     │                      ──┬─  
+#     │                        ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `After` in this scope
+#     ╭─[ src/tape.emel:41:5 ]
+#     │
+#  41 │     After(tape) -> tape
+#     │     ──┬──  
+#     │       ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `body` in this scope
+#     ╭─[ src/tape.emel:50:6 ]
+#     │
+#  50 │   if body == "" or body.starts_with("\"") { None } else { Some(Span(line, column, body)) }
+#     │      ──┬─  
+#     │        ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `or` in this scope
+#     ╭─[ src/tape.emel:50:17 ]
+#     │
+#  50 │   if body == "" or body.starts_with("\"") { None } else { Some(Span(line, column, body)) }
+#     │                 ─┬  
+#     │                  ╰── 
+# ────╯
+#
+# error[E0211]: cannot find value `name` in this scope
+#     ╭─[ src/tape.emel:59:6 ]
+#     │
+#  59 │     (name, span.drop(name.char_count()).trim_start())
+#     │      ──┬─  
+#     │        ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `name` in this scope
+#     ╭─[ src/tape.emel:59:22 ]
+#     │
+#  59 │     (name, span.drop(name.char_count()).trim_start())
+#     │                      ──┬─  
+#     │                        ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `name` in this scope
+#     ╭─[ src/tape.emel:66:10 ]
+#     │
+#  66 │   match (name, phase) {
+#     │          ──┬─  
+#     │            ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `After` in this scope
+#     ╭─[ src/tape.emel:69:7 ]
+#     │
+#  69 │       After(Tape(cols, rows, typing, timeout, command(span.line, arg), []))
+#     │       ──┬──  
+#     │         ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `arg` in this scope
+#     ╭─[ src/tape.emel:69:66 ]
+#     │
+#  69 │       After(Tape(cols, rows, typing, timeout, command(span.line, arg), []))
+#     │                                                                  ─┬─  
+#     │                                                                   ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `After` in this scope
+#     ╭─[ src/tape.emel:70:13 ]
+#     │
+#  70 │     ("run", After(tape)) -> fail here("run appears more than once (first on line ${tape.command.line})")
+#     │             ──┬──  
+#     │               ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `here` in this scope
+#     ╭─[ src/tape.emel:70:34 ]
+#     │
+#  70 │     ("run", After(tape)) -> fail here("run appears more than once (first on line ${tape.command.line})")
+#     │                                  ──┬─  
+#     │                                    ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `arg` in this scope
+#     ╭─[ src/tape.emel:71:36 ]
+#     │
+#  71 │     ("set", _) -> set(phase, span, arg)
+#     │                                    ─┬─  
+#     │                                     ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `After` in this scope
+#     ╭─[ src/tape.emel:72:11 ]
+#     │
+#  72 │     (">", After(tape)) -> After(tape with { steps: tape.steps ++ [Keys(span.line, keys(arg))] })
+#     │           ──┬──  
+#     │             ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `After` in this scope
+#     ╭─[ src/tape.emel:72:27 ]
+#     │
+#  72 │     (">", After(tape)) -> After(tape with { steps: tape.steps ++ [Keys(span.line, keys(arg))] })
+#     │                           ──┬──  
+#     │                             ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `After` in this scope
+#     ╭─[ src/tape.emel:73:14 ]
+#     │
+#  73 │     ("wait", After(tape)) -> After(tape with { steps: tape.steps ++ [wait(arg)] })
+#     │              ──┬──  
+#     │                ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `After` in this scope
+#     ╭─[ src/tape.emel:73:30 ]
+#     │
+#  73 │     ("wait", After(tape)) -> After(tape with { steps: tape.steps ++ [wait(arg)] })
+#     │                              ──┬──  
+#     │                                ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `After` in this scope
+#     ╭─[ src/tape.emel:74:15 ]
+#     │
+#  74 │     ("sleep", After(tape)) -> After(tape with { steps: tape.steps ++ [Sleep(span.line, duration(arg, "sleep"))] })
+#     │               ──┬──  
+#     │                 ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `After` in this scope
+#     ╭─[ src/tape.emel:74:31 ]
+#     │
+#  74 │     ("sleep", After(tape)) -> After(tape with { steps: tape.steps ++ [Sleep(span.line, duration(arg, "sleep"))] })
+#     │                               ──┬──  
+#     │                                 ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `here` in this scope
+#     ╭─[ src/tape.emel:75:24 ]
+#     │
+#  75 │     (other, _) -> fail here("unknown command: ${other}")
+#     │                        ──┬─  
+#     │                          ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `setting` in this scope
+#     ╭─[ src/tape.emel:81:10 ]
+#     │
+#  81 │   match (setting, phase) {
+#     │          ───┬───  
+#     │             ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find value `cols` in this scope
+#     ╭─[ src/tape.emel:84:14 ]
+#     │
+#  84 │       Before(cols, rows, typing, timeout)
+#     │              ──┬─  
+#     │                ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `rows` in this scope
+#     ╭─[ src/tape.emel:84:20 ]
+#     │
+#  84 │       Before(cols, rows, typing, timeout)
+#     │                    ──┬─  
+#     │                      ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `After` in this scope
+#     ╭─[ src/tape.emel:86:14 ]
+#     │
+#  86 │     ("size", After(_)) -> fail TapeError(span.line, span.column, "set size must come before run")
+#     │              ──┬──  
+#     │                ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `value` in this scope
+#     ╭─[ src/tape.emel:87:79 ]
+#     │
+#  87 │     ("typing", Before(cols, rows, _, timeout)) -> Before(cols, rows, duration(value, "set typing"), timeout)
+#     │                                                                               ──┬──  
+#     │                                                                                 ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `After` in this scope
+#     ╭─[ src/tape.emel:88:16 ]
+#     │
+#  88 │     ("typing", After(tape)) ->
+#     │                ──┬──  
+#     │                  ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `After` in this scope
+#     ╭─[ src/tape.emel:89:7 ]
+#     │
+#  89 │       After(tape with { steps: tape.steps ++ [SetTyping(span.line, duration(value, "set typing"))] })
+#     │       ──┬──  
+#     │         ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `value` in this scope
+#     ╭─[ src/tape.emel:90:87 ]
+#     │
+#  90 │     ("timeout", Before(cols, rows, typing, _)) -> Before(cols, rows, typing, duration(value, "set timeout"))
+#     │                                                                                       ──┬──  
+#     │                                                                                         ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `After` in this scope
+#     ╭─[ src/tape.emel:91:17 ]
+#     │
+#  91 │     ("timeout", After(tape)) ->
+#     │                 ──┬──  
+#     │                   ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `After` in this scope
+#     ╭─[ src/tape.emel:92:7 ]
+#     │
+#  92 │       After(tape with { steps: tape.steps ++ [SetTimeout(span.line, duration(value, "set timeout"))] })
+#     │       ──┬──  
+#     │         ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `text` in this scope
+#      ╭─[ src/tape.emel:100:9 ]
+#      │
+#  100 │   match text.split_once("x") {
+#      │         ──┬─  
+#      │           ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `and` in this scope
+#      ╭─[ src/tape.emel:102:53 ]
+#      │
+#  102 │       (Some(cols), Some(rows)) if 1 <= cols <= 1000 and 1 <= rows <= 1000 -> (cols, rows)
+#      │                                                     ─┬─  
+#      │                                                      ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `here` in this scope
+#      ╭─[ src/tape.emel:103:34 ]
+#      │
+#  103 │       (Some(_), Some(_)) -> fail here("size must be from 1x1 to 1000x1000: ${text}")
+#      │                                  ──┬─  
+#      │                                    ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `here` in this scope
+#      ╭─[ src/tape.emel:104:17 ]
+#      │
+#  104 │       _ -> fail here("size must be <cols>x<rows>: ${text}")
+#      │                 ──┬─  
+#      │                   ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `here` in this scope
+#      ╭─[ src/tape.emel:106:18 ]
+#      │
+#  106 │     None -> fail here("size must be <cols>x<rows>: ${text}")
+#      │                  ──┬─  
+#      │                    ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `text` in this scope
+#      ╭─[ src/tape.emel:113:9 ]
+#      │
+#  113 │   match text {
+#      │         ──┬─  
+#      │           ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `here` in this scope
+#      ╭─[ src/tape.emel:114:16 ]
+#      │
+#  114 │     "" -> fail here("${what} needs a duration")
+#      │                ──┬─  
+#      │                  ╰─── 
+# ─────╯
+#
+# error[E0212]: module `Std.Duration` has no `ms`
+#      ╭─[ src/tape.emel:115:33 ]
+#      │
+#  115 │     "${n:digits}ms" -> Duration.ms(Int.parse(n)!)
+#      │                                 ─┬  
+#      │                                  ╰── 
+# ─────╯
+#
+# error[E0211]: cannot find value `n` in this scope
+#      ╭─[ src/tape.emel:115:46 ]
+#      │
+#  115 │     "${n:digits}ms" -> Duration.ms(Int.parse(n)!)
+#      │                                              ┬  
+#      │                                              ╰── 
+# ─────╯
+#
+# error[E0212]: module `Std.Duration` has no `s`
+#      ╭─[ src/tape.emel:116:32 ]
+#      │
+#  116 │     "${n:digits}s" -> Duration.s(Int.parse(n)!)
+#      │                                ┬  
+#      │                                ╰── 
+# ─────╯
+#
+# error[E0211]: cannot find value `n` in this scope
+#      ╭─[ src/tape.emel:116:44 ]
+#      │
+#  116 │     "${n:digits}s" -> Duration.s(Int.parse(n)!)
+#      │                                            ┬  
+#      │                                            ╰── 
+# ─────╯
+#
+# error[E0211]: cannot find value `here` in this scope
+#      ╭─[ src/tape.emel:117:28 ]
+#      │
+#  117 │     "${n:digits}m" -> fail here("use ms for milliseconds: ${n}ms")
+#      │                            ──┬─  
+#      │                              ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `here` in this scope
+#      ╭─[ src/tape.emel:118:27 ]
+#      │
+#  118 │     "${n:digits}" -> fail here("duration needs a unit: ${n}ms or ${n}s")
+#      │                           ──┬─  
+#      │                             ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `here` in this scope
+#      ╭─[ src/tape.emel:119:15 ]
+#      │
+#  119 │     _ -> fail here("invalid duration: ${text}")
+#      │               ──┬─  
+#      │                 ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `column` in this scope
+#      ╭─[ src/tape.emel:131:48 ]
+#      │
+#  131 │       if keys == [] { fail TapeError(arg.line, column, "no keys to send") } else { keys }
+#      │                                                ───┬──  
+#      │                                                   ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Wait` in this scope
+#      ╭─[ src/tape.emel:142:7 ]
+#      │
+#  142 │       Wait(arg.line, regex, pattern)
+#      │       ──┬─  
+#      │         ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `regex` in this scope
+#      ╭─[ src/tape.emel:142:22 ]
+#      │
+#  142 │       Wait(arg.line, regex, pattern)
+#      │                      ──┬──  
+#      │                        ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find value `text` in this scope
+#      ╭─[ src/tape.emel:149:6 ]
+#      │
+#  149 │   if text == "" { fail TapeError(arg.line, arg.column, "run needs a command") }
+#      │      ──┬─  
+#      │        ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `text` in this scope
+#      ╭─[ src/tape.emel:150:35 ]
+#      │
+#  150 │   Command(line, split_words(arg), text)
+#      │                                   ──┬─  
+#      │                                     ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find type `Char` in this scope
+#      ╭─[ src/tape.emel:158:21 ]
+#      │
+#  158 │   fn go(chars: List[Char], column: Int, quote: Quote, word: Option[String], words: List[String]) -> List[String] fails TapeError {
+#      │                     ──┬─  
+#      │                       ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Single` in this scope
+#      ╭─[ src/tape.emel:162:8 ]
+#      │
+#  162 │       (Single(start) | Double(start), []) -> fail TapeError(arg.line, start, "unterminated quote")
+#      │        ───┬──  
+#      │           ╰──── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Double` in this scope
+#      ╭─[ src/tape.emel:162:24 ]
+#      │
+#  162 │       (Single(start) | Double(start), []) -> fail TapeError(arg.line, start, "unterminated quote")
+#      │                        ───┬──  
+#      │                           ╰──── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `Option[Span]`, found `()`
+#     ╭─[ src/tape.emel:50:3 ]
+#     │
+#  50 │   if body == "" or body.starts_with("\"") { None } else { Some(Span(line, column, body)) }
+#     │   ────────┬───────  
+#     │           ╰───────── 
+# ────╯
+#
+# error[E0312]: no field or function `drop` for type `Span`
+#     ╭─[ src/tape.emel:56:16 ]
+#     │
+#  56 │     (">", span.drop(1))
+#     │                ──┬─  
+#     │                  ╰─── 
+# ────╯
+#
+# error[E0312]: no field or function `drop` for type `Span`
+#     ╭─[ src/tape.emel:59:17 ]
+#     │
+#  59 │     (name, span.drop(name.char_count()).trim_start())
+#     │                 ──┬─  
+#     │                   ╰─── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `({unknown}, Phase)`, found `(?0)`
+#     ╭─[ src/tape.emel:67:5 ]
+#     │
+#  67 │     (">" | "wait" | "sleep", Before(..)) -> fail here("${name} must come after run")
+#     │     ──┬─  
+#     │       ╰─── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `Phase`, found `fn(String) -> String`
+#     ╭─[ src/tape.emel:67:10 ]
+#     │
+#  67 │     (">" | "wait" | "sleep", Before(..)) -> fail here("${name} must come after run")
+#     │          ─────────┬────────  
+#     │                   ╰────────── 
+# ────╯
+#
+# error[E0317]: refutable pattern in binding: pattern `_` not covered
+#     ╭─[ src/tape.emel:67:12 ]
+#     │
+#  67 │     (">" | "wait" | "sleep", Before(..)) -> fail here("${name} must come after run")
+#     │            ───┬──  
+#     │               ╰──── 
+# ────╯
+#    = help: use `match` to handle the other cases
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/tape.emel:68:5 ]
+#     │
+#  68 │     ("run", Before(cols, rows, typing, timeout)) ->
+#     │     ──────────────────────┬─────────────────────  
+#     │                           ╰─────────────────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/tape.emel:69:7 ]
+#     │
+#  69 │       After(Tape(cols, rows, typing, timeout, command(span.line, arg), []))
+#     │       ───────────────────────┬───────────────────────  
+#     │                              ╰───────────────────────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `Phase`, found `(Int, {unknown})`
+#     ╭─[ src/tape.emel:69:54 ]
+#     │
+#  69 │       After(Tape(cols, rows, typing, timeout, command(span.line, arg), []))
+#     │                                                      ────────┬───────  
+#     │                                                              ╰───────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/tape.emel:70:5 ]
+#     │
+#  70 │     ("run", After(tape)) -> fail here("run appears more than once (first on line ${tape.command.line})")
+#     │     ──────────┬─────────  
+#     │               ╰─────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/tape.emel:71:5 ]
+#     │
+#  71 │     ("set", _) -> set(phase, span, arg)
+#     │     ─────┬────  
+#     │          ╰────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/tape.emel:72:5 ]
+#     │
+#  72 │     (">", After(tape)) -> After(tape with { steps: tape.steps ++ [Keys(span.line, keys(arg))] })
+#     │     ─────────┬────────  
+#     │              ╰────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/tape.emel:73:5 ]
+#     │
+#  73 │     ("wait", After(tape)) -> After(tape with { steps: tape.steps ++ [wait(arg)] })
+#     │     ──────────┬──────────  
+#     │               ╰──────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/tape.emel:74:5 ]
+#     │
+#  74 │     ("sleep", After(tape)) -> After(tape with { steps: tape.steps ++ [Sleep(span.line, duration(arg, "sleep"))] })
+#     │     ───────────┬──────────  
+#     │                ╰──────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/tape.emel:75:5 ]
+#     │
+#  75 │     (other, _) -> fail here("unknown command: ${other}")
+#     │     ─────┬────  
+#     │          ╰────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/tape.emel:86:5 ]
+#     │
+#  86 │     ("size", After(_)) -> fail TapeError(span.line, span.column, "set size must come before run")
+#     │     ─────────┬────────  
+#     │              ╰────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/tape.emel:88:5 ]
+#     │
+#  88 │     ("typing", After(tape)) ->
+#     │     ───────────┬───────────  
+#     │                ╰───────────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `Phase`, found `()`
+#     ╭─[ src/tape.emel:89:23 ]
+#     │
+#  89 │       After(tape with { steps: tape.steps ++ [SetTyping(span.line, duration(value, "set typing"))] })
+#     │                       ───────────────────────────────────────┬──────────────────────────────────────  
+#     │                                                              ╰──────────────────────────────────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/tape.emel:90:5 ]
+#     │
+#  90 │     ("timeout", Before(cols, rows, typing, _)) -> Before(cols, rows, typing, duration(value, "set timeout"))
+#     │     ─────────────────────┬────────────────────  
+#     │                          ╰────────────────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/tape.emel:91:5 ]
+#     │
+#  91 │     ("timeout", After(tape)) ->
+#     │     ────────────┬───────────  
+#     │                 ╰───────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/tape.emel:92:7 ]
+#     │
+#  92 │       After(tape with { steps: tape.steps ++ [SetTimeout(span.line, duration(value, "set timeout"))] })
+#     │       ─────┬────  
+#     │            ╰────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `Phase`, found `()`
+#     ╭─[ src/tape.emel:92:23 ]
+#     │
+#  92 │       After(tape with { steps: tape.steps ++ [SetTimeout(span.line, duration(value, "set timeout"))] })
+#     │                       ────────────────────────────────────────┬───────────────────────────────────────  
+#     │                                                               ╰───────────────────────────────────────── 
+# ────╯
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/tape.emel:93:5 ]
+#     │
+#  93 │     (other, _) -> fail TapeError(arg.line, arg.column, "unknown setting: ${other}")
+#     │     ─────┬────  
+#     │          ╰────── 
+# ────╯
+#
+# error[E0318]: error `ParseError` is not declared in `fails`
+#      ╭─[ src/tape.emel:101:28 ]
+#      │
+#  101 │     Some((c, r)) -> match (Int.parse(c), Int.parse(r)) {
+#      │                            ──────┬─────  
+#      │                                  ╰─────── 
+# ─────╯
+#    = help: add it to `fails` or handle it with `escape`
+#
+# error[E0301]: type mismatch: expected `Int`, found `Option[?5]`
+#      ╭─[ src/tape.emel:102:8 ]
+#      │
+#  102 │       (Some(cols), Some(rows)) if 1 <= cols <= 1000 and 1 <= rows <= 1000 -> (cols, rows)
+#      │        ─────┬────  
+#      │             ╰────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `Int`, found `Option[?6]`
+#      ╭─[ src/tape.emel:102:20 ]
+#      │
+#  102 │       (Some(cols), Some(rows)) if 1 <= cols <= 1000 and 1 <= rows <= 1000 -> (cols, rows)
+#      │                    ─────┬────  
+#      │                         ╰────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `Bool`, found `Int`
+#      ╭─[ src/tape.emel:102:48 ]
+#      │
+#  102 │       (Some(cols), Some(rows)) if 1 <= cols <= 1000 and 1 <= rows <= 1000 -> (cols, rows)
+#      │                                                ──┬─  
+#      │                                                  ╰─── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `Int`, found `Option[?11]`
+#      ╭─[ src/tape.emel:103:8 ]
+#      │
+#  103 │       (Some(_), Some(_)) -> fail here("size must be from 1x1 to 1000x1000: ${text}")
+#      │        ───┬───  
+#      │           ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `Int`, found `Option[?12]`
+#      ╭─[ src/tape.emel:103:17 ]
+#      │
+#  103 │       (Some(_), Some(_)) -> fail here("size must be from 1x1 to 1000x1000: ${text}")
+#      │                 ───┬───  
+#      │                    ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/tape.emel:104:7 ]
+#      │
+#  104 │       _ -> fail here("size must be <cols>x<rows>: ${text}")
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0318]: error `ParseError` is not declared in `fails`
+#      ╭─[ src/tape.emel:115:36 ]
+#      │
+#  115 │     "${n:digits}ms" -> Duration.ms(Int.parse(n)!)
+#      │                                    ──────┬─────  
+#      │                                          ╰─────── 
+# ─────╯
+#    = help: add it to `fails` or handle it with `escape`
+#
+# error[E0313]: type `String` has no field or function `strip_prefix`
+#      ╭─[ src/tape.emel:125:18 ]
+#      │
+#  125 │   match arg.text.strip_prefix(" ") {
+#      │                  ──────┬─────  
+#      │                        ╰─────── 
+# ─────╯
+#
+# error[E0326]: type `fn(Span) -> List[Key] fails TapeError` does not implement `Eq`
+#      ╭─[ src/tape.emel:131:10 ]
+#      │
+#  131 │       if keys == [] { fail TapeError(arg.line, column, "no keys to send") } else { keys }
+#      │          ─────┬────  
+#      │               ╰────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `fn(Span) -> List[Key] fails TapeError`, found `List[?2]`
+#      ╭─[ src/tape.emel:131:18 ]
+#      │
+#  131 │       if keys == [] { fail TapeError(arg.line, column, "no keys to send") } else { keys }
+#      │                  ─┬  
+#      │                   ╰── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `List[Key]`, found `fn(Span) -> List[Key] fails TapeError`
+#      ╭─[ src/tape.emel:131:84 ]
+#      │
+#  131 │       if keys == [] { fail TapeError(arg.line, column, "no keys to send") } else { keys }
+#      │                                                                                    ──┬─  
+#      │                                                                                      ╰─── 
+# ─────╯
+#
+# error[E0313]: type `String` has no field or function `strip_prefix`
+#      ╭─[ src/tape.emel:137:18 ]
+#      │
+#  137 │   match arg.text.strip_prefix("/") {
+#      │                  ──────┬─────  
+#      │                        ╰─────── 
+# ─────╯
+#
+# error[E0310]: expected a number (`Int`, `Int64` or `Float`), found `List[String]`
+#      ╭─[ src/tape.emel:161:21 ]
+#      │
+#  161 │       (Bare, []) -> words ++ word.to_list()
+#      │                     ────┬───  
+#      │                         ╰───── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `(Quote, List[{unknown}])`, found `(?3)`
+#      ╭─[ src/tape.emel:162:7 ]
+#      │
+#  162 │       (Single(start) | Double(start), []) -> fail TapeError(arg.line, start, "unterminated quote")
+#      │       ───────┬──────  
+#      │              ╰──────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `List[String]`, found `fn(?4, List[?6]) -> {unknown}`
+#      ╭─[ src/tape.emel:162:22 ]
+#      │
+#  162 │       (Single(start) | Double(start), []) -> fail TapeError(arg.line, start, "unterminated quote")
+#      │                      ─────────┬─────────  
+#      │                               ╰─────────── 
+# ─────╯
+#
+# error[E0317]: refutable pattern in binding: pattern `[_, ..]` not covered
+#      ╭─[ src/tape.emel:162:39 ]
+#      │
+#  162 │       (Single(start) | Double(start), []) -> fail TapeError(arg.line, start, "unterminated quote")
+#      │                                       ─┬  
+#      │                                        ╰── 
+# ─────╯
+#    = help: use `match` to handle the other cases
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/tape.emel:163:7 ]
+#      │
+#  163 │       (Bare, [' ' | '\t', ..rest]) -> go(rest, column + 1, Bare, None, words ++ word.to_list())
+#      │       ────┬────  
+#      │           ╰────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/tape.emel:164:7 ]
+#      │
+#  164 │       (Bare, ['\'', ..rest]) -> go(rest, column + 1, Single(column), grow(""), words)
+#      │       ────┬────  
+#      │           ╰────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/tape.emel:165:7 ]
+#      │
+#  165 │       (Bare, ['"', ..rest]) -> go(rest, column + 1, Double(column), grow(""), words)
+#      │       ────┬────  
+#      │           ╰────── 
+# ─────╯
+#
+# error[E0301]: type mismatch: expected `List[String]`, found `String`
+#      ╭─[ src/tape.emel:165:16 ]
+#      │
+#  165 │       (Bare, ['"', ..rest]) -> go(rest, column + 1, Double(column), grow(""), words)
+#      │                ─────────────────────────────┬─────────────────────────────  
+#      │                                             ╰─────────────────────────────── 
+# ─────╯
+#
+# 234 errors, 19 warnings
+# --- end wish check ---

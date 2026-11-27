@@ -1,0 +1,59 @@
+# wish-target: pty/src/lib.emel
+
+## ターゲットに依らない PTY の effect．handler はターゲットごとの別の Pome に置く．
+
+# PTY のプロセスから読んだもの．
+pub enum Output {
+  # 届いた出力．
+  Data(Bytes)
+  # プロセスが終わり，出力も終わった．終了コード（signal で終わったら 128 + 番号）．
+  | Exited(Int)
+}
+
+# 端末の上で動く 1 つのプロセス．
+pub effect Pty {
+  # 届いた出力を全部返す．何も無ければ届くまで待つ．
+  # 打ち切られても（Task.timeout の割り込み），届いていた出力は次の read に残る．
+  # プロセスが終わって出力も終わったら Exited．その前に届いた出力はすべて Data で返す．
+  suspend fn read() -> Output
+
+  # プロセスに入力を送る．
+  fn write(b: Bytes) -> ()
+}
+
+# --- wish check (emela 0.28.2) ---
+# (Pome.toml は wish check が仮に置いた: pty/Pome.toml)
+# error[E0110]: expected variant name
+#     ╭─[ src/lib.emel:10:3 ]
+#     │
+#  10 │   | Exited(Int)
+#     │   ┬  
+#     │   ╰── 
+# ────╯
+#
+# error[E0110]: expected `,` or newline between variants
+#     ╭─[ src/lib.emel:10:5 ]
+#     │
+#  10 │   | Exited(Int)
+#     │     ───┬──  
+#     │        ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Bytes` in this scope
+#    ╭─[ src/lib.emel:8:8 ]
+#    │
+#  8 │   Data(Bytes)
+#    │        ──┬──  
+#    │          ╰──── 
+# ───╯
+#
+# error[E0211]: cannot find type `Bytes` in this scope
+#     ╭─[ src/lib.emel:21:15 ]
+#     │
+#  21 │   fn write(b: Bytes) -> ()
+#     │               ──┬──  
+#     │                 ╰──── 
+# ────╯
+#
+# 4 errors
+# --- end wish check ---

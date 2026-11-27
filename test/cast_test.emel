@@ -1,0 +1,53 @@
+import Cast
+
+# The line of an `o` event at 0 from a fresh Writer, with `data`.
+fn written(data: String) -> String {
+  (_, line) = Cast.event(Cast.writer(), 0, "o", data)
+  line
+}
+
+@test
+fn header_writes_the_size_the_type_and_the_command() {
+  assert Cast.header(80, 24, "vim notes.md")
+    == "{\"version\": 3, \"term\": {\"cols\": 80, \"rows\": 24, \"type\": \"xterm-256color\"}, \"command\": \"vim notes.md\"}"
+  assert Cast.header(20, 3, "sh -c \"a\"")
+    == "{\"version\": 3, \"term\": {\"cols\": 20, \"rows\": 3, \"type\": \"xterm-256color\"}, \"command\": \"sh -c \\\"a\\\"\"}"
+}
+
+@test
+fn event_writes_the_interval_from_the_previous_event_in_seconds() {
+  (w, line) = Cast.event(Cast.writer(), 0, "o", "x")
+  assert line == "[0.000, \"o\", \"x\"]"
+  (w, line) = Cast.event(w, 100, "o", "x")
+  assert line == "[0.100, \"o\", \"x\"]"
+  (w, line) = Cast.event(w, 1234, "o", "x")
+  assert line == "[1.134, \"o\", \"x\"]"
+  (w, line) = Cast.event(w, 1234, "o", "x")
+  assert line == "[0.000, \"o\", \"x\"]"
+  (_, line) = Cast.event(w, 61000, "o", "x")
+  assert line == "[59.766, \"o\", \"x\"]"
+}
+
+@test
+fn event_writes_the_code() {
+  (_, line) = Cast.event(Cast.writer(), 5, "x", "0")
+  assert line == "[0.005, \"x\", \"0\"]"
+}
+
+@test
+fn event_writes_data_as_a_json_string() {
+  assert written("\u{1b}[1m") == "[0.000, \"o\", \"\\u001b[1m\"]"
+  assert written("a\r\n") == "[0.000, \"o\", \"a\\r\\n\"]"
+  assert written("\t") == "[0.000, \"o\", \"\\t\"]"
+  assert written("\"") == "[0.000, \"o\", \"\\\"\"]"
+  assert written("\\") == "[0.000, \"o\", \"\\\\\"]"
+  assert written("あ😀") == "[0.000, \"o\", \"あ😀\"]"
+  assert written("\u{0}") == "[0.000, \"o\", \"\\u0000\"]"
+  assert written("\u{7f}") == "[0.000, \"o\", \"\\u007f\"]"
+  assert written("\u{9b}") == "[0.000, \"o\", \"\\u009b\"]"
+}
+
+@test
+fn event_escapes_c1_from_0x80_to_0x9f_and_keeps_0x7e_and_0xa0() {
+  assert written("~\u{80}\u{9f}\u{a0}") == "[0.000, \"o\", \"~\\u0080\\u009f\u{a0}\"]"
+}

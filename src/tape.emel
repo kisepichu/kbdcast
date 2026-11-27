@@ -1,0 +1,419 @@
+# The tape language (the overall design §6). `parse` reads a tape into a Tape, which cannot hold a
+# tape of the wrong shape: one `run` line, `set size` before it, the other steps after it.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
+
+import Key.{Key}
+import Key.Notation.{NotationError}
+import Regex.{Regex, RegexSyntax, NO_FLAGS}
+import Std.Duration.{Duration}
+import Text
+
+## A tape that `parse` read: the size of the terminal, the `typing` and `timeout` that hold from
+## the start, the `run` line, and the lines after it.
+pub type Tape(
+  cols: Int,
+  rows: Int,
+  typing: Duration,
+  timeout: Duration,
+  command: Command,
+  steps: List[Step],
+)
+
+## The `run` line: its number, its arguments split as a shell would (no shell runs), and the text
+## after `run` as written, without the blanks around it (the `command` of the cast header).
+pub type Command(line: Int, argv: List[String], text: String)
+
+## A line after `run`, with its number. `Wait` keeps its pattern as written next to the Regex.
+pub enum Step {
+  Keys(Int, List[Key])
+  Sleep(Int, Duration)
+  Wait(Int, Regex, String)
+  SetTyping(Int, Duration)
+  SetTimeout(Int, Duration)
+}
+
+## Why `parse` rejected a tape: the line and the column (both from 1; the column counts code points)
+## where it went wrong, and what is wrong, in English.
+pub error TapeError(line: Int, column: Int, message: String)
+
+# FRICTION(013): Emela has no literal for the code point of a character, so the characters that
+# patterns look at have names.
+const TAB: Int = 0x09
+const CARRIAGE_RETURN: Int = 0x0D
+const SPACE: Int = 0x20
+const DOUBLE_QUOTE: Int = 0x22
+const SINGLE_QUOTE: Int = 0x27
+const SLASH: Int = 0x2F
+const DIGIT_ZERO: Int = 0x30
+const DIGIT_NINE: Int = 0x39
+const GREATER_THAN: Int = 0x3E
+const BACKSLASH: Int = 0x5C
+
+# What the `set` lines before `run` decide.
+type Settings(cols: Int, rows: Int, typing: Duration, timeout: Duration)
+
+const DEFAULTS: Settings = Settings(
+  cols: 80,
+  rows: 24,
+  typing: Duration.milliseconds(50),
+  timeout: Duration.seconds(10),
+)
+
+# The longest duration that a tape may give, in milliseconds: the largest Int, as the recorder
+# waits for a duration with an Int of milliseconds.
+const LONGEST_MS: Int = 2147483647
+
+# Where the lines read so far leave the tape.
+enum Phase {
+  # No `run` line yet.
+  Before(Settings)
+  # After the `run` line, with the steps so far, the last one first.
+  After(Settings, Command, List[Step])
+}
+
+# A line from the column `column` on: the code points from there to the end of the line.
+# FRICTION(002): std cannot cut a String at a position, and the columns count code points, so a line
+# is read as its code points, and the parts that become Strings are built back (`string_of`).
+type Span(line: Int, column: Int, cps: List[Int])
+
+## Reads the tape `source`. Lines are separated by `\n`, and a `\r` at the end of a line is dropped.
+## Fails at the first line that is wrong, or after the last line if there is no `run` line.
+pub fn parse(source: String) -> Tape fails TapeError {
+  lines = source.split("\n")
+  phase = lines.enumerate().fold(Before(DEFAULTS), |phase, (index, text)| {
+    span_of(index + 1, text) match {
+      Some(span) -> read_line(phase, span)
+      None       -> phase
+    }
+  })
+  phase match {
+    Before(_) -> {
+      # The line after the last one. The empty tape, and a tape that ends with `\n`, end in an
+      # empty piece that is that line.
+      line = if lines.last() == Some("") { lines.length() } else { lines.length() + 1 }
+      fail TapeError(line:, column: 1, message: "no run line")
+    }
+    After(settings, command, steps) -> Tape(
+      cols: settings.cols,
+      rows: settings.rows,
+      typing: settings.typing,
+      timeout: settings.timeout,
+      command:,
+      steps: steps.reverse(),
+    )
+  }
+}
+
+# The line `text`, numbered `line`, without the `\r` at its end and the blanks at its start. None for
+# an empty line and a comment.
+fn span_of(line: Int, text: String) -> Option[Span] {
+  cps = text.code_points()
+  cps = if cps.last() == Some(CARRIAGE_RETURN) { cps.take(cps.length() - 1) } else { cps }
+  span = skip_blanks(Span(line:, column: 1, cps:))
+  span.cps match {
+    []                 -> None
+    [DOUBLE_QUOTE, ..] -> None
+    _                  -> Some(span)
+  }
+}
+
+# `phase` after the line `span`, which is neither empty nor a comment.
+fn read_line(phase: Phase, span: Span) -> Phase fails TapeError {
+  (name, arg) = span.cps match {
+    # `>` is a word by itself: the keys after it decide what may follow it.
+    [GREATER_THAN, ..] -> (">", advance(span, 1))
+    _                  -> word(span)
+  }
+  (name, phase) match {
+    ("run", Before(settings)) -> After(settings, command(span.line, arg), [])
+    ("run", After(_, first, _)) -> fail at(
+      span,
+      "run appears more than once (first on line #{first.line})",
+    )
+    ("set", _)                -> set(phase, span, arg)
+    # FRICTION(015): there is no or-pattern, so each step that must come after `run` has an arm of
+    # its own here.
+    (">", Before(_))          -> fail at(span, "> must come after run")
+    ("wait", Before(_))       -> fail at(span, "wait must come after run")
+    ("sleep", Before(_))      -> fail at(span, "sleep must come after run")
+    (">", After(settings, command, steps)) -> After(
+      settings,
+      command,
+      [Keys(span.line, keys(arg)), ..steps],
+    )
+    ("wait", After(settings, command, steps)) -> After(
+      settings,
+      command,
+      [wait(span.line, arg), ..steps],
+    )
+    ("sleep", After(settings, command, steps)) -> After(
+      settings,
+      command,
+      [Sleep(span.line, duration(arg, "sleep")), ..steps],
+    )
+    _                         -> fail at(span, "unknown command: #{name}")
+  }
+}
+
+# `phase` after the `set` line `span`, whose setting and value are `arg`.
+fn set(phase: Phase, span: Span, arg: Span) -> Phase fails TapeError {
+  (setting, value) = word(arg)
+  (setting, phase) match {
+    ("size", Before(settings)) -> {
+      (cols, rows) = size(value)
+      Before(Settings(cols:, rows:, ..settings))
+    }
+    ("size", After(_, _, _)) -> fail at(span, "set size must come before run")
+    ("typing", Before(settings)) -> Before(
+      Settings(typing: duration(value, "set typing"), ..settings),
+    )
+    ("typing", After(settings, command, steps)) -> After(
+      settings,
+      command,
+      [SetTyping(span.line, duration(value, "set typing")), ..steps],
+    )
+    ("timeout", Before(settings)) -> Before(
+      Settings(timeout: duration(value, "set timeout"), ..settings),
+    )
+    ("timeout", After(settings, command, steps)) -> After(
+      settings,
+      command,
+      [SetTimeout(span.line, duration(value, "set timeout")), ..steps],
+    )
+    ("", _)                  -> fail at(arg, "set needs a setting")
+    _                        -> fail at(arg, "unknown setting: #{setting}")
+  }
+}
+
+# The columns and the rows that `value`, the rest of a `set size` line, gives.
+fn size(value: Span) -> (Int, Int) fails TapeError {
+  text = string_of(trim_end(value.cps))
+  text.split("x") match {
+    [""] -> fail at(value, "set size needs <cols>x<rows>")
+    [cols, rows] if is_number(cols) && is_number(rows) -> (
+      dimension(cols, value, text),
+      dimension(rows, value, text),
+    )
+    _    -> fail at(value, "size must be <cols>x<rows>: #{text}")
+  }
+}
+
+# The number `digits`, one side of the size `text` that `value` holds, which must be 1 to 1000.
+fn dimension(digits: String, value: Span, text: String) -> Int fails TapeError {
+  out_of_range = at(value, "size must be from 1x1 to 1000x1000: #{text}")
+  # More digits than an Int holds is out of range too.
+  n = Int.parse(digits) escape {
+    ParseError(_) -> fail out_of_range
+  }
+  if n < 1 || n > 1000 { fail out_of_range } else { n }
+}
+
+# The duration `<integer>ms` or `<integer>s` that `value`, the rest of a line, gives, which is at
+# most LONGEST_MS. `what` is the start of the line (`sleep`, `set typing`, `set timeout`).
+fn duration(value: Span, what: String) -> Duration fails TapeError {
+  cps = trim_end(value.cps)
+  text = string_of(cps)
+  # FRICTION(016): there is no pattern that splits a String (the wish's `"${n:digits}ms"`), so the
+  # digits are cut off the code points and the unit after them is matched as a String.
+  # FRICTION(041): there is no `List.span`, so the digits end where `find_index` finds something
+  # else.
+  n = cps.find_index(|c| !is_digit(c)).or(cps.length())
+  number = string_of(cps.take(n))
+  if cps.is_empty() {
+    fail at(value, "#{what} needs a duration")
+  } else if n == 0 {
+    fail at(value, "invalid duration: #{text}")
+  } else {
+    string_of(cps.drop(n)) match {
+      ""   -> fail at(value, "duration needs a unit: #{number}ms or #{number}s")
+      "m"  -> fail at(value, "use ms for milliseconds: #{number}ms")
+      "ms" -> Duration.milliseconds(count(number, LONGEST_MS, value, text))
+      "s"  -> Duration.seconds(count(number, LONGEST_MS / 1000, value, text))
+      _    -> fail at(value, "invalid duration: #{text}")
+    }
+  }
+}
+
+# The number `digits` of the duration `text` that `value` holds, which must be at most `max`.
+fn count(digits: String, max: Int, value: Span, text: String) -> Int64 fails TapeError {
+  too_long = at(value, "duration too long: #{text}")
+  # More digits than an Int holds is too long too.
+  n = Int.parse(digits) escape {
+    ParseError(_) -> fail too_long
+  }
+  # FRICTION(061): Int64 has no `parse`, so the number is read as an Int and widened.
+  if n > max { fail too_long } else { Int64.from_int(n) }
+}
+
+# The keys of a `>` line, whose text after the `>` is `arg`.
+fn keys(arg: Span) -> List[Key] fails TapeError {
+  arg.cps match {
+    [SPACE, ..] -> {
+      body = advance(arg, 1)
+      keys = Notation.parse(string_of(body.cps)) escape {
+        NotationError(message:, offset:) -> fail TapeError(
+          line: body.line,
+          column: body.column + offset,
+          message:,
+        )
+      }
+      if keys.is_empty() { fail at(body, "no keys to send") } else { keys }
+    }
+    _ -> fail at(arg, "expected a space after >")
+  }
+}
+
+# The `wait` step on line `line`, whose text after `wait` is `arg`.
+fn wait(line: Int, arg: Span) -> Step fails TapeError {
+  arg.cps match {
+    [SLASH, ..] -> {
+      body = advance(arg, 1)
+      pattern = string_of(body.cps)
+      regex = Regex.compile(pattern, NO_FLAGS) escape {
+        RegexSyntax(message:, offset:) -> fail TapeError(
+          line:,
+          column: body.column + offset,
+          message:,
+        )
+      }
+      Wait(line, regex, pattern)
+    }
+    _ -> fail at(arg, "wait needs /<pattern>")
+  }
+}
+
+# The `run` line `line`, whose text after `run` is `arg`.
+fn command(line: Int, arg: Span) -> Command fails TapeError {
+  text = trim_end(arg.cps)
+  if text.is_empty() { fail at(arg, "run needs a command") }
+  Command(line:, argv: split_words(arg), text: string_of(text))
+}
+
+# Outside quotes, or inside the quote `mark` (`'` or `"`) that opened at the column `open`, for the
+# error if it does not close.
+# FRICTION(015): there is no or-pattern, so the two quotes are one variant that holds its mark, and
+# one arm takes a quote that does not close, whichever it is.
+enum Quote {
+  Bare
+  Quoted(mark: Int, open: Int)
+}
+
+# The words of `arg`, split as a shell would: at blanks, with `'...'` taken as it is, `\"` and `\\`
+# read as escapes inside `"..."`, and a `\` outside quotes taking the next character as it is (a `\`
+# at the end of the line is itself).
+fn split_words(arg: Span) -> List[String] fails TapeError {
+  # The words, and the code points of the word being read, are kept in reverse, so that adding one
+  # does not copy the list.
+  # The words of `cs`, which starts at `column` in the state `quote`, after the reverse of `done`.
+  # `word` is the code points of the word being read, the last first, or None between words (`''`
+  # is a word without code points).
+  fn go(
+    cs: List[Int],
+    column: Int,
+    quote: Quote,
+    word: Option[List[Int]],
+    done: List[String],
+  ) -> List[String] fails TapeError {
+    # A quote starts a word even if nothing comes before it closes.
+    started = Some(word.or([]))
+    grown = |c| Some([c, ..word.or([])])
+    (quote, cs) match {
+      (Bare, [])       -> finish(word, done).reverse()
+      (Quoted(_, open), []) -> fail TapeError(
+        line: arg.line,
+        column: open,
+        message: "unterminated quote",
+      )
+      (Bare, [c, ..rest]) if is_blank(c) -> go(rest, column + 1, Bare, None, finish(word, done))
+      (Bare, [SINGLE_QUOTE, ..rest]) -> go(
+        rest,
+        column + 1,
+        Quoted(SINGLE_QUOTE, column),
+        started,
+        done,
+      )
+      (Bare, [DOUBLE_QUOTE, ..rest]) -> go(
+        rest,
+        column + 1,
+        Quoted(DOUBLE_QUOTE, column),
+        started,
+        done,
+      )
+      (Bare, [BACKSLASH, c, ..rest]) -> go(rest, column + 2, Bare, grown(c), done)
+      (Quoted(mark, _), [c, ..rest]) if c == mark -> go(rest, column + 1, Bare, word, done)
+      # FRICTION(015): there is no or-pattern, so the two escapes in `"..."` are a guard.
+      # FRICTION(019): `emela fmt` stops on a `||` guard that does not fit, so it is in parentheses.
+      (Quoted(DOUBLE_QUOTE, _), [BACKSLASH, c, ..rest]) if (c == DOUBLE_QUOTE
+        || c == BACKSLASH) -> go(rest, column + 2, quote, grown(c), done)
+      (_, [c, ..rest]) -> go(rest, column + 1, quote, grown(c), done)
+    }
+  }
+  go(arg.cps, arg.column, Bare, None, [])
+}
+
+# `done` with `word`, if one was being read, put in front.
+fn finish(word: Option[List[Int]], done: List[String]) -> List[String] {
+  word match {
+    Some(reversed) -> [string_of(reversed.reverse()), ..done]
+    None           -> done
+  }
+}
+
+# The first word of `span`, up to a blank or the end, and what follows it after the blanks.
+fn word(span: Span) -> (String, Span) {
+  # FRICTION(041): there is no `List.span`, so the word ends where `find_index` finds a blank.
+  n = span.cps.find_index(is_blank).or(span.cps.length())
+  (string_of(span.cps.take(n)), skip_blanks(advance(span, n)))
+}
+
+# `span` from its first code point that is not a blank.
+fn skip_blanks(span: Span) -> Span {
+  # FRICTION(041): there is no `List.drop_while` (nor `String.trim_start`, FRICTION(059)), so the
+  # blanks end where `find_index` finds something else.
+  advance(span, span.cps.find_index(|c| !is_blank(c)).or(span.cps.length()))
+}
+
+# `cps` without the blanks at its end.
+fn trim_end(cps: List[Int]) -> List[Int] {
+  # FRICTION(059): String has no `trim_end`, and List has no `drop_while` (FRICTION(041)), so the
+  # blanks are dropped from the front of the reverse.
+  reversed = cps.reverse()
+  reversed.drop(reversed.find_index(|c| !is_blank(c)).or(reversed.length())).reverse()
+}
+
+# `span` without its first `n` code points.
+fn advance(span: Span, n: Int) -> Span {
+  Span(column: span.column + n, cps: span.cps.drop(n), ..span)
+}
+
+# The error `message` at the start of `span`.
+fn at(span: Span, message: String) -> TapeError {
+  TapeError(line: span.line, column: span.column, message:)
+}
+
+# A blank of the tape: a space or a tab, as a shell splits words at them.
+fn is_blank(c: Int) -> Bool {
+  c == SPACE || c == TAB
+}
+
+# FRICTION(039): there is no predicate on the code point of a character in std.
+fn is_digit(c: Int) -> Bool {
+  c >= DIGIT_ZERO && c <= DIGIT_NINE
+}
+
+# One or more decimal digits.
+fn is_number(s: String) -> Bool {
+  s != "" && s.code_points().all(is_digit)
+}
+
+# FRICTION(003): the code points come from the tape, a String, so they are scalar values and `None`
+# cannot happen.
+# FRICTION(040): Option has no `expect`, so the `None` that cannot happen is a match with a panic.
+fn string_of(cps: List[Int]) -> String {
+  Text.from_code_points(cps) match {
+    Some(s) -> s
+    None    -> panic("Tape: a code point of the tape is not a scalar value")
+  }
+}

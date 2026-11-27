@@ -1,0 +1,79 @@
+# The handler of Pty on a pseudo-terminal of Bun (`Bun.Terminal`, from Bun 1.3). The host side is
+# `pty.mjs`.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
+
+import Pty.{Data, Exited, Pty}
+import Std.Array.{Array}
+import Std.Bytes.{Bytes}
+
+## The process could not start (the command does not exist, for example). `message` is the reason
+## that Bun gave.
+pub error SpawnFailed(message: String) derive Show
+
+# A terminal and the process on it, held by `pty.mjs`.
+@external
+type Host
+
+# Starts `argv` on a new terminal of `cols` × `rows` in `cwd`, with the environment of this process
+# and the `NAME=value` entries of `env` over it. When the process cannot start, `open_error` says
+# why.
+@external(js, "./pty.mjs", "open")
+fn open(argv: Array[String], cols: Int, rows: Int, cwd: String, env: Array[String]) -> Host
+  uses { ProcessHost }
+
+# Why the process could not start, or "" when it started.
+# FRICTION(064): an external function cannot fail, and Option is not a boundary type, so the failure
+# of `open` comes back through a second function, with "" for success.
+@external(js, "./pty.mjs", "openError")
+fn open_error(h: Host) -> String
+
+# The output that has arrived, waiting until some arrives. Empty once the process has exited and its
+# output has ended. An interrupted read leaves the output for the next read.
+# FRICTION(064): Option is not a boundary type, so the end of the output comes back as empty
+# Bytes, and the exit code through a second function (`exit_code`).
+@external(js, "./pty.mjs", "read")
+suspend fn read_output(h: Host) -> Bytes
+
+@external(js, "./pty.mjs", "write")
+fn write_input(h: Host, b: Bytes) -> ()
+
+# The exit code of the process once `read_output` has returned empty: its code, or 128 + the number
+# of the signal that ended it.
+@external(js, "./pty.mjs", "exitCode")
+fn exit_code(h: Host) -> Int
+
+# Ends the process if it is still running (SIGTERM, then SIGKILL after 1 s) and closes the terminal.
+@external(js, "./pty.mjs", "close")
+suspend fn close(h: Host) -> ()
+
+## `with BunPty(argv, cols, rows, cwd, env) { ... }` runs `argv` on a terminal of `cols` × `rows`,
+## in the directory `cwd`, with the environment of this process and the `NAME=value` entries of
+## `env` over it. Entering the with fails with SpawnFailed when the process cannot start. Leaving it
+## ends the process if it is still running (SIGTERM, then SIGKILL after 1 s) and closes the terminal.
+pub handler BunPty(host: Host): Pty {
+  # FRICTION(063): init cannot declare `fails SpawnFailed` (writing it panics the parser); its E is
+  # inferred.
+  init(argv: List[String], cols: Int, rows: Int, cwd: String, env: List[String]) {
+    host = open(Array.from_list(argv), cols, rows, cwd, Array.from_list(env))
+    message = open_error(host)
+    if message != "" {
+      fail SpawnFailed(message:)
+    }
+    BunPty(host:)
+  }
+
+  release {
+    close(self.host)
+  }
+
+  suspend fn read(resume) {
+    b = read_output(self.host)
+    resume(if b.is_empty() { Exited(exit_code(self.host)) } else { Data(b) })
+  }
+
+  fn write(b) {
+    write_input(self.host, b)
+  }
+}

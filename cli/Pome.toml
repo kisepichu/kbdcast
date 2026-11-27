@@ -1,0 +1,18 @@
+[pome]
+name = "github.com/kisepichu/kbdcast/cli"
+version = "0.1.0"
+emela = "0.28.2"
+
+[dependencies]
+"github.com/kisepichu/kbdcast" = "v0.1.0"
+"github.com/kisepichu/kbdcast/pty-bun" = "v0.1.0"
+
+[replace]
+"github.com/kisepichu/kbdcast" = { path = ".." }
+"github.com/kisepichu/kbdcast/pty" = { path = "../pty" }
+"github.com/kisepichu/kbdcast/pty-bun" = { path = "../pty-bun" }
+"github.com/kisepichu/kbdcast/regex" = { path = "../regex" }
+"github.com/kisepichu/kbdcast/text" = { path = "../text" }
+
+[external]
+allow = ["github.com/kisepichu/kbdcast/pty-bun"]

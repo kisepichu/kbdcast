@@ -1,0 +1,204 @@
+# The recorder's handler of Driver (spec §7): runs the tape on a process on a PTY, keeps the screen
+# in a VT, and writes the cast to stdout as it goes. `record` is its entry point. Every operation
+# that lets time pass reads the PTY until a deadline and feeds the VT, each read cut by
+# `Fiber.timeout` (design §9). Cast times are tape time: a sleep and the typing after a key count
+# the time since the start of their window, kept within the window, and a wait counts none.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
+
+import Cast
+import Cast.{Writer}
+import Key.Encode
+import Pty.{Pty, Output, Data, Exited}
+import Recorder.{Driver, ProcessExited, RecordError, WaitTimeout}
+import Regex.{Regex}
+import Std.Bytes.{Bytes}
+import Std.Clock.{Clock}
+import Std.Duration.{Duration}
+import Std.Fiber
+import Std.Instant.{Instant}
+import Std.Process.{Stdout}
+import Std.State.{State}
+import Tape.{Tape}
+import Utf8.{Decoder}
+import Vt
+
+## Records `tape` on the process that Pty runs: writes the header of the cast for the tape's size
+## and command to Stdout, and then an event for each key it sends, each output it reads and the exit
+## of the process. Fails with RecordError as `Recorder.run_tape` does. It uses Pty, Clock and
+## Stdout, and Async for `Fiber.timeout`.
+# FRICTION(073): a handler cannot change its fields, so LiveDriver keeps its state in State, which
+# only a function that wraps the with can open. `record` is that function; the final state is not
+# needed.
+pub fn record(tape: Tape) -> () fails RecordError uses { Async, Clock, Pty, Stdout } {
+  (_, _) = State.run(recording(tape.cols, tape.rows), || {
+    with LiveDriver(tape.cols, tape.rows, tape.command.text) { Recorder.run_tape(tape) }
+  })
+}
+
+# What LiveDriver keeps from one operation to the next: the VT of the screen, the UTF-8 decoder of
+# the output, the tape time in milliseconds, the Writer of the cast, and the exit code once the
+# process has exited.
+type Recording(
+  vt: Vt.Terminal,
+  decoder: Decoder,
+  tape_ms: Int,
+  writer: Writer,
+  exit_code: Option[Int],
+)
+
+# The state of a LiveDriver on a terminal of `cols` columns and `rows` rows, before anything has
+# happened.
+fn recording(cols: Int, rows: Int) -> Recording {
+  Recording(
+    vt: Vt.new(cols, rows),
+    decoder: Utf8.decoder(),
+    tape_ms: 0,
+    writer: Cast.writer(),
+    exit_code: None,
+  )
+}
+
+# `with LiveDriver(cols, rows, command) { ... }` writes the header of the cast for a terminal of
+# `cols` × `rows` running `command`, and then an event for each key it sends, each output it reads
+# and the exit of the process. It uses Pty, Clock and Stdout, and Async for `Fiber.timeout`. Its
+# state is in `State[Recording]`, which `record` opens with `recording(cols, rows)`.
+# FRICTION(073): the state is in State, not in the fields of the handler.
+handler LiveDriver: Driver {
+  init(cols: Int, rows: Int, command: String) {
+    (use Stdout).print_line(Cast.header(cols, rows, command))
+    LiveDriver
+  }
+
+  suspend fn press(key, resume) {
+    running()
+    st = use State[Recording]
+    bytes = Encode.encode(key, Vt.input_modes(st.get().vt))
+    (use Pty).write(bytes)
+    event(st.get().tape_ms, "i", text_of(bytes))
+    resume(())
+  }
+
+  suspend fn idle(d, resume) {
+    running()
+    window = millis(d)
+    read_window((use Clock).now(), window, 0)
+    (use State[Recording]).update(|r| Recording(tape_ms: r.tape_ms + window, ..r))
+    resume(())
+  }
+
+  suspend fn wait_for(pattern, source, timeout, resume) {
+    running()
+    wait_screen(pattern, (use Clock).now().add(timeout))
+    resume(())
+  }
+}
+
+# Fails if the process has exited.
+fn running() -> () fails ProcessExited uses { State[Recording] } {
+  (use State[Recording]).get().exit_code match {
+    Some(code) -> fail ProcessExited(code:)
+    None       -> ()
+  }
+}
+
+# Reads the PTY until `window` milliseconds have passed since `start`. The output read at a time is
+# at the tape time plus the time since `start`, kept within the window and not before `previous`,
+# the time of the output before it in the window.
+# FRICTION(032): Clock reads only the wall clock, which can step; `previous` and the two clamps keep
+# the times of a window in order and inside it.
+fn read_window(start: Instant, window: Int, previous: Int) -> ()
+  fails ProcessExited
+  uses { Async, Clock, Pty, State[Recording], Stdout } {
+  clock = use Clock
+  left = window - millis(clock.now().since(start))
+  if left > 0 {
+    pty = use Pty
+    Fiber.timeout(left, || pty.read()) match {
+      None -> ()
+      Some(output) -> {
+        at = Int.max(previous, Int.min(millis(clock.now().since(start)), window))
+        receive(output, (use State[Recording]).get().tape_ms + at)
+        read_window(start, window, at)
+      }
+    }
+  }
+}
+
+# Reads the PTY until the screen matches `pattern`, looking at it before the first read and after
+# each. The output is at the tape time, which a wait does not move. Fails with the screen if it does
+# not match by `deadline`.
+fn wait_screen(pattern: Regex, deadline: Instant) -> ()
+  fails WaitTimeout | ProcessExited
+  uses { Async, Clock, Pty, State[Recording], Stdout } {
+  st = use State[Recording]
+  screen = Vt.text(st.get().vt)
+  if !Regex.is_match(pattern, screen) {
+    left = millis(deadline.since((use Clock).now()))
+    if left <= 0 {
+      fail WaitTimeout(screen:)
+    }
+    pty = use Pty
+    Fiber.timeout(left, || pty.read()) match {
+      None -> fail WaitTimeout(screen:)
+      Some(output) -> {
+        receive(output, st.get().tape_ms)
+        wait_screen(pattern, deadline)
+      }
+    }
+  }
+}
+
+# Takes in what a read gave at `at_ms` of tape time: output goes through the decoder and the VT,
+# whose replies go back to the process, and into an `o` event unless it ends no character; an exit
+# goes into an `x` event, after which every operation fails.
+fn receive(output: Output, at_ms: Int) -> ()
+  fails ProcessExited
+  uses { Pty, State[Recording], Stdout } {
+  st = use State[Recording]
+  output match {
+    Data(bytes) -> {
+      r = st.get()
+      (decoder, text) = Utf8.feed(r.decoder, bytes)
+      (vt, replies) = Vt.feed(r.vt, text)
+      st.set(Recording(vt:, decoder:, ..r))
+      if text != "" {
+        event(at_ms, "o", text)
+      }
+      pty = use Pty
+      replies.each(|reply| pty.write(Vt.reply_bytes(reply)))
+    }
+    Exited(code) -> {
+      event(at_ms, "x", Int.to_string(code))
+      st.update(|r| Recording(exit_code: Some(code), ..r))
+      fail ProcessExited(code:)
+    }
+  }
+}
+
+# Writes the line of the event `code` with `data` at `at_ms` of tape time.
+fn event(at_ms: Int, code: String, data: String) -> () uses { State[Recording], Stdout } {
+  st = use State[Recording]
+  r = st.get()
+  (writer, line) = Cast.event(r.writer, at_ms, code, data)
+  st.set(Recording(writer:, ..r))
+  (use Stdout).print_line(line)
+}
+
+# The text of the bytes that a key sends, which Encode makes from a String.
+# FRICTION(040): the bytes are UTF-8, so `decode_utf8` cannot return `None`, and Option has no
+# `expect`.
+fn text_of(bytes: Bytes) -> String {
+  bytes.decode_utf8() match {
+    Some(text) -> text
+    None       -> panic("a key sends bytes that are not UTF-8: #{bytes}")
+  }
+}
+
+# `d` in milliseconds.
+# FRICTION(074): Fiber.timeout and Clock.sleep take milliseconds as an Int, and a Duration holds an
+# Int64, so a length of time is narrowed to an Int to wait for it.
+fn millis(d: Duration) -> Int {
+  Int64.to_int(d.to_milliseconds())
+}

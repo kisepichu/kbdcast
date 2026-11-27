@@ -237,7 +237,7 @@ encoder は kitty keyboard protocol を扱わない（2 の spec §2。WezTerm �
 flowchart TB
   run[run_tape: tape が何を意味するか] -->|uses Driver| drv
   subgraph live[本番用の layer]
-    drv[LiveDriver handler<br/>状態: Terminal、tape の時間] -->|uses| ports[Pty / Clock / Stdout]
+    drv[Recorder.Live.record<br/>LiveDriver と State（VT、tape の時間）] -->|uses| ports[Pty / Clock / Stdout]
     ports --> impl[BunPty / SystemClock / SystemStdout]
   end
   run -.テスト.-> td[TestDriver: 呼ばれた操作を記録]

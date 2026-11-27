@@ -1,0 +1,203 @@
+import Key.Notation
+import Regex
+import Std.Duration.{Duration}
+import Tape.{Step, Keys, Sleep, Wait, SetTyping, SetTimeout, TapeError}
+
+# A step as text to compare: Regex has no Eq, so a Wait shows only its line and pattern.
+fn describe(step: Step) -> String {
+  step match {
+    Keys(line, keys)       -> "#{line} > #{keys.map(|k| Notation.print(k)).join(" ")}"
+    Sleep(line, d)         -> "#{line} sleep #{d}"
+    Wait(line, _, pattern) -> "#{line} wait /#{pattern}"
+    SetTyping(line, d)     -> "#{line} set typing #{d}"
+    SetTimeout(line, d)    -> "#{line} set timeout #{d}"
+  }
+}
+
+fn steps(source: String) -> List[String] fails TapeError {
+  Tape.parse(source).steps.map(describe)
+}
+
+# The arguments of the `run` line of a tape that is only `run` and `rest`.
+fn argv(rest: String) -> List[String] fails TapeError {
+  Tape.parse("run #{rest}").command.argv
+}
+
+# The line, the column and the message of the TapeError that `parse` fails with, or `(0, 0, "")`
+# if it does not fail.
+fn failure(source: String) -> (Int, Int, String) {
+  {
+    Tape.parse(source)
+    (0, 0, "")
+  } escape {
+    TapeError(line:, column:, message:) -> (line, column, message)
+  }
+}
+
+@test
+fn parse_reads_the_settings_the_command_and_the_steps() {
+  tape = Tape.parse(
+    """
+    " demo
+    set size 100x30
+    set typing 60ms
+    run vim 'notes.md'
+    wait /notes\\.md
+    > ihello<Esc>
+    sleep 1s
+    set timeout 3s
+    > :wq<CR>
+    """,
+  )
+  assert tape.cols == 100
+  assert tape.rows == 30
+  assert tape.typing == Duration.milliseconds(60)
+  assert tape.timeout == Duration.seconds(10)
+  assert tape.command.line == 4
+  assert tape.command.argv == ["vim", "notes.md"]
+  assert tape.command.text == "vim 'notes.md'"
+  assert tape.steps.map(describe)
+    == [
+      "5 wait /notes\\.md",
+      "6 > i h e l l o <Esc>",
+      "7 sleep 1000ms",
+      "8 set timeout 3000ms",
+      "9 > : w q <CR>",
+    ]
+  regex = tape.steps match {
+    [Wait(_, regex, _), ..] -> regex
+    _                       -> panic("the first step is not a Wait")
+  }
+  assert Regex.is_match(regex, "notes.md")
+  assert !Regex.is_match(regex, "notesXmd")
+}
+
+@test
+fn parse_uses_the_defaults_without_set_lines() {
+  tape = Tape.parse("run x")
+  assert tape.cols == 80
+  assert tape.rows == 24
+  assert tape.typing == Duration.milliseconds(50)
+  assert tape.timeout == Duration.seconds(10)
+  assert tape.command.argv == ["x"]
+  assert tape.steps.map(describe) == []
+}
+
+@test
+fn parse_makes_a_set_line_after_run_a_step() {
+  tape = Tape.parse("run x\nset typing 10ms")
+  assert tape.typing == Duration.milliseconds(50)
+  assert tape.steps.map(describe) == ["2 set typing 10ms"]
+}
+
+@test
+fn parse_skips_comments_blank_lines_and_leading_blanks() {
+  command = Tape.parse("  \" c\n\n  run   a  b ").command
+  assert command.line == 3
+  assert command.argv == ["a", "b"]
+  # Neither the blanks after `run` nor those at the end of the line are in the text.
+  assert command.text == "a  b"
+}
+
+@test
+fn parse_drops_the_carriage_return_at_the_end_of_a_line() {
+  tape = Tape.parse("run x\r\n> a\r\n")
+  assert tape.command.argv == ["x"]
+  assert tape.steps.map(describe) == ["2 > a"]
+}
+
+@test
+fn parse_sends_the_blanks_after_the_first_one_as_keys() {
+  assert steps("run x\n> a b") == ["2 > a <Space> b"]
+  assert steps("run x\n>  a") == ["2 > <Space> a"]
+}
+
+@test
+fn parse_keeps_the_blanks_at_the_end_of_a_pattern() {
+  assert steps("run x\nwait /ready  ") == ["2 wait /ready  "]
+}
+
+@test
+fn parse_reads_durations_in_ms_and_s() {
+  assert steps("run x\nsleep 0ms\nsleep 2s\nsleep 1500ms")
+    == ["2 sleep 0ms", "3 sleep 2000ms", "4 sleep 1500ms"]
+  # The longest duration in each unit.
+  assert steps("run x\nsleep 2147483647ms\nsleep 2147483s")
+    == ["2 sleep 2147483647ms", "3 sleep 2147483000ms"]
+}
+
+@test
+fn parse_splits_the_run_line_as_a_shell_does() {
+  assert argv("a b  c") == ["a", "b", "c"]
+  assert argv("'a b' c") == ["a b", "c"]
+  assert argv("\"a \\\"b\\\" \\\\ c\"") == ["a \"b\" \\ c"]
+  assert argv("a\\ b") == ["a b"]
+  assert argv("'it'\"'\"'s'") == ["it's"]
+  assert argv("''") == [""]
+  assert argv("sh -c 'printf \"%s\" x'") == ["sh", "-c", "printf \"%s\" x"]
+}
+
+@test
+fn parse_rejects_a_tape_without_exactly_one_run_line() {
+  # The line after the last one: an empty tape has none, and a final `\n` ends a line.
+  assert failure("") == (1, 1, "no run line")
+  assert failure("set typing 10ms\n") == (2, 1, "no run line")
+  assert failure("run a\nrun b") == (2, 1, "run appears more than once (first on line 1)")
+}
+
+@test
+fn parse_rejects_a_line_on_the_wrong_side_of_run() {
+  assert failure("> a\nrun x") == (1, 1, "> must come after run")
+  assert failure("wait /x\nrun x") == (1, 1, "wait must come after run")
+  assert failure("sleep 1s\nrun x") == (1, 1, "sleep must come after run")
+  assert failure("run x\nset size 10x10") == (2, 1, "set size must come before run")
+}
+
+@test
+fn parse_rejects_an_unknown_command_or_setting() {
+  assert failure("run x\nfoo bar") == (2, 1, "unknown command: foo")
+  assert failure("set color red\nrun x") == (1, 5, "unknown setting: color")
+  assert failure("set\nrun x") == (1, 4, "set needs a setting")
+}
+
+@test
+fn parse_rejects_a_size_out_of_shape_or_range() {
+  assert failure("set size 80\nrun x") == (1, 10, "size must be <cols>x<rows>: 80")
+  assert failure("set size 0x24\nrun x") == (1, 10, "size must be from 1x1 to 1000x1000: 0x24")
+  assert failure("set size\nrun x") == (1, 9, "set size needs <cols>x<rows>")
+}
+
+@test
+fn parse_rejects_a_duration_that_is_not_ms_or_s() {
+  assert failure("run x\nsleep 500") == (2, 7, "duration needs a unit: 500ms or 500s")
+  assert failure("run x\nsleep 500m") == (2, 7, "use ms for milliseconds: 500ms")
+  assert failure("run x\nsleep fast") == (2, 7, "invalid duration: fast")
+  assert failure("run x\nsleep") == (2, 6, "sleep needs a duration")
+  assert failure("set typing\nrun x") == (1, 11, "set typing needs a duration")
+}
+
+@test
+fn parse_rejects_a_duration_longer_than_2147483647ms() {
+  assert failure("run x\nsleep 2147483648ms") == (2, 7, "duration too long: 2147483648ms")
+  assert failure("run x\nsleep 2147484s") == (2, 7, "duration too long: 2147484s")
+}
+
+@test
+fn parse_rejects_a_run_line_it_cannot_split() {
+  assert failure("run") == (1, 4, "run needs a command")
+  assert failure("run sh -c 'abc") == (1, 11, "unterminated quote")
+}
+
+@test
+fn parse_rejects_a_keys_line_it_cannot_read() {
+  assert failure("run x\n>abc") == (2, 2, "expected a space after >")
+  assert failure("run x\n> ") == (2, 3, "no keys to send")
+  assert failure("run x\n> <Ecs>") == (2, 3, "unknown key name: <Ecs>")
+  assert failure("run x\n  > ab<Foo>") == (2, 7, "unknown key name: <Foo>")
+}
+
+@test
+fn parse_rejects_a_wait_line_it_cannot_compile() {
+  assert failure("run x\nwait foo") == (2, 6, "wait needs /<pattern>")
+  assert failure("run x\nwait /a(b") == (2, 8, "unterminated group")
+}

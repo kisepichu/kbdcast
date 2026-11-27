@@ -1,0 +1,101 @@
+# A handler of Pty for the tests of LiveDriver: a process that writes what a script says when the
+# virtual time of TestClock reaches it (0 at the start of the test), and keeps what it is sent.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
+
+import Pty.{Pty, Output, Data, Exited}
+import Std.Bytes.{Bytes}
+import Std.Clock.{Clock}
+import Std.Instant.{Instant}
+import Std.State.{State}
+
+## What the process does at a time, in milliseconds of virtual time.
+pub enum Event {
+  ## Writes the bytes, which can be read from that time on.
+  Emit(Int, Bytes)
+  ## Exits with the code, which is read from that time on, once every Emit has been read.
+  Exit(Int, Int)
+}
+
+## The state of a FakePty: the output not read yet, each with the time it can be read from, in
+## order; the time and the code of the exit; and the bytes written to the process, in order.
+pub type Script(output: List[(Int, Bytes)], exit: Option[(Int, Int)], written: List[Bytes])
+
+## The script of `events`, which come in the order of their times, before anything is written.
+pub fn script(events: List[Event]) -> Script {
+  events.fold(Script(output: [], exit: None, written: []), |s, e| {
+    e match {
+      Emit(at, b)    -> Script(output: s.output.append([(at, b)]), ..s)
+      Exit(at, code) -> Script(exit: Some((at, code)), ..s)
+    }
+  })
+}
+
+# Longer than any test: a read with nothing to come waits this long, which is until it is
+# interrupted.
+# FRICTION(082): there is no direct way to wait until interrupted, so the wait is the longest sleep.
+const FOREVER: Int = 2147483647
+
+## `with FakePty(echo) { ... }` plays the script in `State[Script]` on the time of Clock. `read`
+## gives all the output that can be read, joined, and waits for the next if there is none. With
+## `echo`, what is written can be read at once, as a terminal echoes what is typed.
+pub handler FakePty(echo: Bool): Pty {
+  init(echo: Bool) {
+    FakePty(echo:)
+  }
+
+  suspend fn read(resume) {
+    resume(next_output())
+  }
+
+  fn write(b) {
+    now = millis((use Clock).now())
+    echo = self.echo
+    (use State[Script]).update(|s| {
+      output = if echo {
+        (before, after) = s.output.partition(|(at, _)| at <= now)
+        before.append([(now, b), ..after])
+      } else {
+        s.output
+      }
+      Script(output:, written: s.written.append([b]), ..s)
+    })
+  }
+}
+
+# The output that can be read at the time of Clock, after waiting for the next if there is none.
+fn next_output() -> Output uses { Clock, State[Script] } {
+  clock = use Clock
+  st = use State[Script]
+  s = st.get()
+  now = millis(clock.now())
+  (ready, later) = s.output.partition(|(at, _)| at <= now)
+  (ready, later, s.exit) match {
+    ([_, ..], _, _) -> {
+      st.set(Script(output: later, ..s))
+      Data(Bytes.concat(ready.map(|(_, b)| b)))
+    }
+    ([], [], Some((at, code))) if at <= now -> Exited(code)
+    # FRICTION(015): there is no or-pattern, so waiting for the next output, and for the exit when
+    # no output is left, have an arm each with the same body.
+    ([], [(at, _), ..], _) -> {
+      clock.sleep(at - now)
+      next_output()
+    }
+    ([], [], Some((at, _))) -> {
+      clock.sleep(at - now)
+      next_output()
+    }
+    # FRICTION(082): waits until interrupted by sleeping for the largest Int.
+    ([], [], None) -> {
+      clock.sleep(FOREVER)
+      next_output()
+    }
+  }
+}
+
+# The virtual time of `t`, in milliseconds from the start of the test.
+fn millis(t: Instant) -> Int {
+  Int64.to_int(t.to_unix_milliseconds())
+}
