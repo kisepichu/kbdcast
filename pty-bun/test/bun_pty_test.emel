@@ -1,0 +1,113 @@
+import Brix.Assert
+import Lib.{BunPty, SpawnFailed}
+import Pty.{Data, Exited, Pty}
+import Std.Bytes.{Bytes}
+import Std.Clock.{Clock, SystemClock}
+import Std.Duration
+import Std.Fiber
+
+# Every test runs a real process on a real pseudo-terminal, in /tmp.
+
+# The output of the process until it exits, as text, and its exit code. `out` is what came before.
+fn read_all(out: Bytes) -> (String, Int) {
+  (use Pty).read() match {
+    Data(b)      -> read_all(out.append(b))
+    Exited(code) -> (Assert.some(out.decode_utf8()), code)
+  }
+}
+
+# The output and the exit code of `argv` on a terminal of `cols` × `rows`, with `env` over the
+# environment.
+fn run(argv: List[String], cols: Int, rows: Int, env: List[String]) -> (String, Int)
+  fails SpawnFailed {
+  with BunPty(argv, cols, rows, "/tmp", env) {
+    read_all(Bytes.empty())
+  }
+}
+
+@test
+fn read_gives_the_output_and_then_the_exit_code() {
+  assert run(["sh", "-c", "printf hello"], 80, 24, []) == ("hello", 0)
+}
+
+@test
+fn write_sends_input_to_the_process() {
+  with BunPty(["sh", "-c", "read x; echo got:$x; exit 3"], 80, 24, "/tmp", []) {
+    (use Pty).write(Bytes.encode_utf8("abc\r"))
+    (out, code) = read_all(Bytes.empty())
+    assert out.contains("got:abc")
+    assert code == 3
+  }
+}
+
+# TERM is set as the recorder sets it, so that tput does not depend on the environment of the test.
+@test
+fn the_terminal_has_the_size_it_was_opened_with() {
+  assert run(["sh", "-c", "tput cols; tput lines"], 33, 7, ["TERM=xterm-256color"])
+    == ("33\r\n7\r\n", 0)
+}
+
+@test
+fn env_is_set_over_the_environment() {
+  assert run(["sh", "-c", "echo $TERM"], 80, 24, ["TERM=xterm-256color"])
+    == ("xterm-256color\r\n", 0)
+}
+
+@test
+fn the_process_runs_in_cwd() {
+  assert run(["pwd"], 80, 24, []) == ("/tmp\r\n", 0)
+}
+
+@test
+fn a_process_ended_by_a_signal_exits_with_128_and_the_signal() {
+  (_, code) = run(["sh", "-c", "kill -9 $$"], 80, 24, [])
+  assert code == 137
+}
+
+# The first read is cut off before the output arrives; the output is not lost.
+@test
+fn an_interrupted_read_loses_no_output() {
+  with SystemClock, BunPty(["sh", "-c", "sleep 0.2; printf late"], 80, 24, "/tmp", []) {
+    pty = use Pty
+    assert Fiber.timeout(50, || pty.read()) == None
+    assert pty.read() == Data(Bytes.encode_utf8("late"))
+  }
+}
+
+# A child in the background keeps the terminal open for 5 s; the output still ends soon after the
+# process exits. The timeout counts on the timers of the host, not on the wall clock.
+@test
+fn the_output_ends_soon_after_the_process_exits() {
+  with SystemClock {
+    assert Fiber.timeout(3000, || run(["sh", "-c", "sleep 5 & echo bye"], 80, 24, []))
+      == Some(("bye\r\n", 0))
+  }
+}
+
+# The process ignores SIGTERM; release sends SIGKILL after 1 s, so leaving the with does not wait
+# for the 30 s. Without the 200 ms the with is left before sh has set the trap, and SIGTERM ends it
+# at once; the lower bound checks that SIGTERM was ignored.
+@test
+fn leaving_the_with_ends_a_process_that_ignores_sigterm() {
+  with SystemClock {
+    clock = use Clock
+    start = clock.now()
+    left = Fiber.timeout(5000, || {
+      with BunPty(["sh", "-c", "trap '' TERM; sleep 30"], 80, 24, "/tmp", []) {
+        clock.sleep(200)
+      }
+    })
+    assert left == Some(())
+    assert clock.now().since(start) >= Duration.milliseconds(1000)
+  }
+}
+
+@test
+fn a_command_that_does_not_exist_fails_to_spawn() {
+  message = {
+    with BunPty(["no-such-command-kbdcast"], 80, 24, "/tmp", []) { "" }
+  } escape {
+    SpawnFailed(message:) -> message
+  }
+  assert message.contains("no-such-command-kbdcast")
+}

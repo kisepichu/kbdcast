@@ -23,6 +23,7 @@
   VT の解釈の wish（`wish/terminal.emel`、サブプロジェクト 3 の計画の Task 5）でも、7 行に `let` を書いた（`:80`、`:146`、`:192`、`:227-229`、`:232`。`:146` は右辺が前置の match の `let level = match n.and_then(List.first) { ... }`）
   tape のパーサの wish（`wish/tape.emel`、サブプロジェクト 1 の計画の Task 1）でも、21 行に `let` を書いた（`:27-29`、`:38`、`:47-49`、`:58`、`:64-65`、`:80`、`:83`、`:98-99`、`:111-112`、`:128-129`、`:140`、`:148`、`:159`。`:64`、`:80`、`:83` は `let (name, arg) = ...` のように組を分ける形、`:65`、`:99`、`:112`、`:159` は右辺が closure の `let here = fn(message) { ... }`）
   cast の writer の wish（`wish/cast.emel`、サブプロジェクト 1 の計画の Task 2）でも、3 行に `let` を書いた（`:8`、`:17`、`:23`）
+  BunPty の wish（`wish/pty_bun.emel`、サブプロジェクト 1 の計画の Task 3）でも、3 行に `let` を書いた（`:38`、`:39`、`:51`）
 - 診断:
   wish check（emela 0.28.2、`wish/text.emel:52-155`）。`let` の行ごとに 2 つ出る:
   - `let` に ``error[E0118]: expected expression``
@@ -63,6 +64,8 @@
   tape のパーサの wish（サブプロジェクト 1 の Task 1）では、21 行すべてに E0118 と E0122 が 1 つずつ（42）。束縛されなかった名前の E0211 が 28 続いた（`here` が 9、`text` が 4、`name` が 3、`arg` と `value` が 2 つずつ、`phase`、`line`、`body`、`cols`、`rows`、`setting`、`column`、`regex`）。253 の診断のうち 70 がこの 1 つの誤りから出ている。`:29` の右辺の `try_fold`（016）と closure、`:47-49` の `strip_suffix`、`??`、`trim_start`、`char_count`（002、059）、`:58` の `take_while`（041）、`:98`、`:111`、`:148` の `trim_end`（059）には届かなかった（`:47` の `??` は字句の E0105 だけが出た）
 
   cast の writer の wish（サブプロジェクト 1 の Task 2）では、3 行すべてに E0118 と E0122 が 1 つずつ（6）。束縛されなかった名前の E0211 が 1 続いた（`line`）。`cmd` と `frac` は、使う所が `${...}`（033）で補間でなかったので、E0211 も出なかった。8 の診断のうち 7 がこの 1 つの誤りから出ている。右辺の `Json.String`（062）と `pad_start`（060）には届かなかった
+
+  BunPty の wish（サブプロジェクト 1 の Task 3）では、wish check が compiler の panic（063）で何も出さなかった。panic の原因の `fails` だけを消した写しの `emela check`（2026-11-28）では、3 行すべてに E0118 と E0122 が 1 つずつ（6）。束縛されなかった名前の E0211 が 4 続いた（`message` と `bytes` が 2 つずつ）。28 の診断のうち 10 がこの 1 つの誤りから出ている。`:38` の右辺の `argv.to_array()`（016）には届かなかった
 - 回避策: `let` を消して `start = Int.max(from, 0)` と書いた（`text/src/lib.emel` の `slice`）。regex の `regex/src/syntax.emel`、`regex/src/class.emel`、`regex/src/vm.emel`、`regex/src/lib.emel`、テストの `regex/test/pattern_gen.emel`、key の `src/key.emel`（`(rep_code, rep_mods) = representative(c)`）、表記の `src/key/notation.emel`、decode の `src/key/decode.emel`、golden の補助の `test/golden.emel` も同じく `let` を消した。正しい構文に直しただけなので、コードに印は付けない
   encode（Task 6、`src/key/encode.emel`）も同じく `let` を消した（`higher = ...`、`m = key.mods()`、`cr = ...`。`:174` の `final` は、F1〜F4 を腕に分けたので（009）束縛が要らなくなった）
   UTF-8 デコーダ（Task 1、`src/utf8.emel`）も同じく `let` を消した（`code_point = ...`、`bytes_seen = ...`、`(next, strings) = read(...)`。`push` の `(d, out) = acc` は、fold を位置で歩く再帰にした（055）ので要らなくなった）。module の直下の定数は `const REPLACEMENT: String = "\u{FFFD}"`（`[data.const]`。名前は大文字）にした
@@ -73,6 +76,7 @@
   VT の公開 API（Task 6、`src/vt.emel`）も同じく `let` を消した（`(parser, actions) = ...`、`(term, replies) = ...`、`s = ...`、`(col, row, visible) = ...`）
   tape のパーサ（サブプロジェクト 1 の Task 1、`src/tape.emel`）も同じく `let` を消した（`lines = ...`、`(name, arg) = ...`、`(setting, value) = ...`、`(cols, rows) = size(value)` など）。`here = fn(message) { ... }` の closure は、どの関数も行の一部（`Span`）から error を作るので、top-level の `at(span, message)` にした（回り道ではない）
   cast の writer（サブプロジェクト 1 の Task 2、`src/cast.emel`）では、`header` と `event` の束縛は、literal の中に呼び出しをそのまま書いたので要らなくなり、`interval` は `let` を消した（`millis = ms % 1000`。0 で埋める所は 060）
+  BunPty（サブプロジェクト 1 の Task 3、`pty-bun/src/lib.emel`）も同じく `let` を消した（`host = open(...)`、`message = open_error(host)`、`b = read_output(self.host)`）
 - コスト:
   コードのコストは無い。直すには spec を引く必要があった。診断から分かるのは `let` が式として読めないことだけで、wish-first（AGENTS.md 規則 1）では spec を読む前に wish を書くので、そのときの手がかりは診断しかない。後に続く 4 つの E0211 は束縛の失敗の後追いで、wish の本当の診断（`String.from_scalars` の E0212、003）を埋もれさせる
 - spec:

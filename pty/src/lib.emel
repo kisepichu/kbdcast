@@ -1,0 +1,26 @@
+# The effect of a process on a pseudo-terminal, for every target. The handlers are in other Pomes,
+# one for each target.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
+
+import Std.Bytes.{Bytes}
+
+## What `read` gives.
+pub enum Output {
+  ## The output that has arrived.
+  Data(Bytes)
+  ## The process has exited and its output has ended. The exit code of the process, or 128 + the
+  ## number of the signal that ended it.
+  Exited(Int)
+} derive Eq, Show
+
+## A process on a pseudo-terminal.
+pub effect Pty {
+  ## All the output that has arrived, waiting until some arrives. A read that is interrupted (by
+  ## `Fiber.timeout`) loses nothing: the output stays for the next read. Once the process has
+  ## exited and its output has ended, `Exited`; all the output before it comes first as `Data`.
+  suspend fn read() -> Output
+  ## Sends `b` to the process as input.
+  fn write(b: Bytes) -> ()
+}
