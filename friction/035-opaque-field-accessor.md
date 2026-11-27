@@ -22,15 +22,18 @@
   pub opaque type Screen(cols: Int, rows: Int, grid: Array[Array[Cell]])
   pub fn cols(s: Screen) -> Int = s.cols
   ```
+  VT の解釈の wish（`wish/terminal.emel:42-47`、`:62`、サブプロジェクト 3 の計画の Task 5）でも、opaque な `Terminal` の欄 `screen`（見えている方の画面）と、計画の Interfaces の読む関数 `screen(t)` に同じ名前を付けた（`pub fn screen(t: Terminal) -> Screen = t.screen`）。`cursor` と `input_modes` は、読む関数が欄を組にする（`(t.col, t.row, t.visible)`）か、欄の名前が違った（`modes`）ので、ぶつからなかった
 - 診断:
   wish check（v0.28.2）の 42 の診断のうち 2: ``error[E0334]: function `code` has the same name as a field of `Key` ``（`:25`）と、`mods` の同じもの（`:27`）。help は付かない
   repo の外の使い捨ての Pome での最小の形（`pub opaque type Key(code: Int)` と `pub fn code(k: Key) -> Int { k.code }`、2026-11-27）でも同じ 1 つ
   encode の wish check（v0.28.2）: `:49` に ``error[E0312]: no field `code` for type `Key` `` と ``= help: call it as `key.code(...)` ``（`[type.rules]` の method call の候補）。`:45` は `let`（004）の行にあり、届かなかった。help のとおりに直せる良い診断
   VT の画面の wish check（v0.28.2）: ``error[E0334]: function `cols` has the same name as a field of `Screen` `` と、`rows` の同じもの（`:69`、`:71`）。help は付かない
+  VT の解釈の wish check（v0.28.2）: ``error[E0334]: function `screen` has the same name as a field of `Terminal` ``（`:62`）。本体は `=`（020）で読まれなかったが、この 1 つは出た。help は付かない
 - 回避策:
   欄の名前を `key_code` と `key_mods` にした（`src/key.emel` の `Key`、`FRICTION(035)` の印）。読む関数の `code` と `mods` は計画の Interfaces のまま。外からは `Key.code(k)` か `k.code()`（`[type.rules]` の method call）で読む
   encode（Task 6、`src/key/encode.emel` の `sent`）は、E0312 の help のとおり `key.mods()` と `key.code() match` にした。正しい書き方に直しただけなので、コードに印は付けない
   VT の画面（`src/vt/screen.emel` の `Screen`、`FRICTION(035)` の印）: 欄の名前を `col_count` と `row_count` にした。読む関数の `cols` と `rows` は計画の Interfaces のまま。3 つ目の欄 `grid` は、wish でも読む関数（`lines`）と名前が違ったので、そのまま
+  VT の解釈（`src/vt/terminal.emel` の `Terminal`、`FRICTION(035)` の印）: 見えている方の画面の欄を `active`、もう一方を `inactive` にした。読む関数の `screen` は計画の Interfaces のまま。primary と alternate を入れ替える所（`to_alternate`、`to_primary`）では、「見えている方」と「もう一方」の名前の方が avt の `buffer` と `other_buffer` に近く読みやすいので、名前の付け替えはほとんどコストになっていない。欄の大きさも画面と揃えて `col_count` と `row_count` にしたが、これは E0334 によるものではない（`cols` と `rows` を読む公開の関数は無い）
 - コスト:
   読むだけの関数 2 つ（6 行）と、欄の名前の接頭辞。欄は外から見えないので API には出ない。consumer の側のコストは、読むたびの `()` だけ（encode の 2 か所など）。普段のコードに基盤レベルは漏れていない
 - spec: `[module.opaque]`、`[data.type]`（「Such a function MUST NOT have the name of a field of that type (E0334)」）、`[type.rules]`（method call の探索の (1) 欄と (2) モジュールの関数）、`proposals/method-call.md:78`、`spec/diagnostics.md` の E0334
