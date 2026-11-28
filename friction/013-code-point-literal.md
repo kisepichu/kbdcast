@@ -44,6 +44,7 @@
   UTF-8 デコーダ（`src/utf8.emel`）: 出すのは String なので、1 文字の String の const にした（`const REPLACEMENT: String = "\u{FFFD}"`）。`[lex.literal]` のとおりの書き方で、回り道ではないので印は付けない
   VT の解釈（`src/vt/terminal.emel` の `csi` と `esc`、`FRICTION(013)` の印 2 か所）: encode と同じく、腕の文字を 16 進の literal にし、行末のコメントで文字と avt の関数の名前を示した（`(None, 0x41) -> (cursor_up(t, n), []) # A CUU`、`(Some(0x3F), 0x68) -> ... # ? h DECSET`）。CSI の終わりの文字の 35 と、private の印と中間の文字の 6 つは const にしなかった（腕ごとに 1 回しか出ず、行末のコメントで足りる）。avt が ESC の後の `@`〜`_` を C1 にする所は、wish の 4 つの腕でなく avt と同じ 1 つの guard（`(None, _) if f >= 0x40 && f <= 0x5F -> execute(t, f + 0x40)`）にした。DEC の罫線の表は、avt の `SPECIAL_GFX_CHARS` の 31 文字を string の literal に書いて `code_points()` で Array にした（`const DRAWING`）
   tape のパーサ（`src/tape.emel`、サブプロジェクト 1 の計画の Task 1、`FRICTION(013)` の印）: 表記と同じく、パターンと比べる式に書く文字を const にした（`TAB`、`CARRIAGE_RETURN`、`SPACE`、`DOUBLE_QUOTE`、`SINGLE_QUOTE`、`SLASH`、`DIGIT_ZERO`、`DIGIT_NINE`、`GREATER_THAN`、`BACKSLASH` の 10 個。`[GREATER_THAN, ..]`、`(Bare, [SINGLE_QUOTE, ..rest])`、`Quoted(DOUBLE_QUOTE, column)`）
+  キーの帯のテスト（`test/strip_test.emel:9-10`、サブプロジェクト 4 の計画の Task 2）: 全角の文字を、16 進の literal の const と行末のコメントにした（`const HIRAGANA_A: Int = 0x3042 # あ`、`const HIRAGANA_I: Int = 0x3044 # い`。`class_test` と同じく印は付けない）
 - コスト:
   const の宣言が 51 行（ファイルの 570 行のうち）。読むときに名前と文字を対応させる必要がある。const の名前は大文字、数字、`_` だけ（`[lex.name]`）なので、`d` と `D` は `SMALL_D` と `CAPITAL_D` に書き分けた。性能のコストは無い。普段のコードに基盤レベルは漏れていない
   class では、9 つの文字を 16 進で書き、行末のコメントで文字を示した（7 行）

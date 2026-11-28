@@ -29,7 +29,8 @@ pub opaque type Overlay(
 )
 
 ## The overlay of a cast with the header `h`, before its first event, and the header line of the
-## output, without a newline: the header `h.json` with `term.rows` one more.
+## output, without a newline: the header `h.json` with `term.rows` one more. `h` comes from
+## `Cast.read`: a Header whose `json` is not an object with an object `term` is a defect.
 pub fn start(h: Header) -> (Overlay, String) {
   vt = Vt.new(h.cols, h.rows)
   strip = Strip.strip()
