@@ -15,9 +15,9 @@
   wish check（v0.28.2）: `String.lines` に ``error[E0212]: module `String` has no `lines` ``。help は付かない。同じ行の前置の match（E0142）と `enumerate(from: 1)`（016）にも出た
 - 回避策:
   `text.split("\n").enumerate()` にした。`split` は空の text に `[""]` を返す（`[api.string]`）ので、空の cast を最初の腕の guard `if text != ""` で分け、`_` の腕で `the cast is empty` にした（`src/cast.emel` の `read`、`FRICTION(083)` の印）。`_` の腕は、`split` が返さない `[]` も受ける。`split` は最後の `\n` の後ろにも空の部分を作るが、イベントの空の行は飛ばすので、そこには何も要らない
-  tape のパーサ（`src/tape.emel` の `parse`、サブプロジェクト 1 の Task 1）も `source.split("\n")` で分けている。`run` の行が無いときの error の行（最後の行の次）は、最後の部分が `""` かどうかで分けて数える（`if lines.last() == Some("") { lines.length() } else { lines.length() + 1 }`）。`lines` があれば `lines.length() + 1` の 1 つで書ける
+  tape のパーサ（`src/tape.emel` の `parse`、サブプロジェクト 1 の Task 1）も `source.split("\n")` で分けている。`run` の行が無いときの error の行（最後の行の次）は、最後の部分が `""` かどうかで分けて数える（`if lines.last() == Some("") { lines.length() } else { lines.length() + 1 }`。`FRICTION(083)` の印は、サブプロジェクト 4 の最終レビューの後の fix で付けた）。`lines` があれば `lines.length() + 1` の 1 つで書ける。行末の `\r` を手で落とす `span_of` の 1 行（`src/tape.emel:114`）も、`Stdin.read_line` の決まりに従う `lines` なら `lines` が落とす（違うのは `\n` の無い最後の行が `\r` で終わるときだけで、tape の doc はそれも落とすと決めているので、この行は残り、印も付けない）
 - コスト:
-  cast: guard の 1 つと、それを説明するコメントの 1 行。tape: `if` の 1 つ。どちらも、`split` の結果の端の `""` が行かどうかを、使う側が毎回決める。普段のコードに基盤レベルは漏れていない
+  cast: guard の 1 つと、それを説明するコメントの 1 行。tape: `if` の 1 つ（`\r` を落とす `span_of` の 1 行は、`lines` があっても `\n` の無い最後の行のために残る）。どちらも、`split` の結果の端の `""` が行かどうかを、使う側が毎回決める。普段のコードに基盤レベルは漏れていない
 - spec:
   `[api.string]`（`split`。「With a non-empty separator, `split("", ",")` is `[""]`」）。`[api.std.process]` の `Stdin.read_line` は行を決めている: 「A line ends at `\n`. The `\n`, and a `\r` immediately before it, are not part of the line. The text after the last `\n`, if not empty, is the last line.」。同じ決まりで String を行に分ける関数は無い
 - 既存:
