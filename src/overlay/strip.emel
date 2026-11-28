@@ -86,7 +86,8 @@ fn fit(marks: List[String], cols: Int) -> Option[String] {
   }
 }
 
-# The right end of `mark`, the last mark when it does not fit alone, in `cols - 2` columns.
+# The part in inverse when `mark`, the last mark, does not fit alone: `…`, its right end in
+# `cols - 2` columns, and a space. `None` if `cols` is less than 3.
 fn right_end(mark: String, cols: Int) -> Option[String] {
   if cols < 3 {
     None

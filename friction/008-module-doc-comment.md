@@ -32,6 +32,7 @@
   - LiveDriver（サブプロジェクト 1 の計画の Task 5）: wish（`wish/live.emel:3-6`）は、モジュールの説明（Driver を PTY、VT、cast の writer で動かす本番用の handler であること、その状態、時間が流れる操作を期限まで PTY を読む処理にすること）をファイルの先頭の `#` の 4 行に書き、`module Recorder.Live`（048）を続けた。`src/recorder/live.emel` の先頭も `#` のコメントにした（`FRICTION(008)` の印）。VT の parser と同じ理由で、ここに数える
   - FakePty（サブプロジェクト 1 の計画の Task 5）: test の handler で、wish は無い。`test/fake_pty.emel` の先頭の説明（TestClock の仮想の時間で script を流し、書かれた bytes を持つ Pty の handler であること）は `#` のコメントにした（`FRICTION(008)` の印）
   - cli の main（サブプロジェクト 1 の計画の Task 6）: wish（`wish/main.emel:3-5`）は、モジュールの説明（`kbdcast rec <tape>` が何をするか、終了コード）をファイルの先頭の `#` の 3 行に書いた。`cli/src/main.emel` の先頭も `#` のコメントにした（`FRICTION(008)` の印。最終レビューの後の修正で付けた）。entry のモジュールは何も公開せず、依存する側の `emela doc` にも出ないが、cli の Pome の文書と hover に出したかった説明であることは他と同じなので、ここに数える
+  - キーの帯（サブプロジェクト 4 の計画の Task 2）: wish（`wish/strip.emel:2`）は、モジュールの説明（キーの帯であること、最後の印から FADE_MS 以内に押したキーを、押した順に vim の表記で並べること）をファイルの先頭の `#` の 1 行に書いた。`src/overlay/strip.emel` の先頭も `#` のコメントにした（`FRICTION(008)` の印）。`emela doc` に出したかった説明であることは他と同じなので、ここに数える
 - コスト: 計画の「モジュールの doc comment」を、生成した文書に出ないコメントで代えた。`emela doc` の文書にも hover にもモジュールの説明が出ない。std も同じ書き方なので、std のモジュールの説明も生成した文書には出ない。普段のコードに基盤レベルは漏れていない
 - spec:
   `[lex.comment]`（`spec/language/02-lexical.md:14`: 「`##` is a doc comment. It attaches to the declaration, local fn, variant, field, effect operation, or handler item that immediately follows it.」。モジュールは入っていない）、`[lsp.doc]`。`emela doc` の節は `spec/tooling/commands.md` に無い（`04-modules.md:181` と `lsp.md:240` で触れているだけ）
