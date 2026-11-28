@@ -144,9 +144,9 @@ fn read_events(lines: List[(Int, String)]) -> List[Event] fails CastError {
       (interval, code, data) = read_event(line, text)
       time = clock + interval
       ms = time * 1000.0
-      # FRICTION(088): Int has no largest value, and Float has no conversion to Int that fails, so
-      # the bound is written by hand. The time is never negative and `Float.round` rounds 0.5 up,
-      # so it gives more than 2147483647 (or is a defect, as for Infinity) exactly from
+      # FRICTION(088): core has no `Int.MAX`, and Float has no conversion to Int that fails, so
+      # the bound is written by hand. The time is never negative and `Float.round` rounds 0.5 away
+      # from 0, so it gives more than 2147483647 (or is a defect, as for Infinity) exactly from
       # 2147483647.5.
       if ms >= 2147483647.5 {
         fail CastError(line:, message: "the time is too large (more than 2147483647 ms)")
