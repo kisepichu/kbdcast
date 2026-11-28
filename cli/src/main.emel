@@ -105,7 +105,10 @@ fn overlay(path: String) -> ExitCode {
 }
 
 # Reads the text of the file at `path` and gives it to `f`. When the file cannot be read, writes
-# why to stderr and gives the exit code of a failure without calling `f`.
+# why to stderr and gives the exit code of a failure without calling `f`. A file error that `f`
+# raises is reported against `path` too.
+# FRICTION(087): an escape arm cannot leave the function, so the escape around `read_text` covers
+# the rest of the subcommand, which comes in as `f`.
 fn reading(path: String, f: fn(String) -> ExitCode) -> ExitCode {
   f((use FileSystem).read_text(path)) escape {
     FileNotFound(..)                -> failure("#{path}: no such file")

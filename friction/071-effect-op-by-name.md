@@ -23,7 +23,7 @@
 - 回避策: `run_steps` の始めで `driver = use Driver` と capability を束ね、`driver.press(key)`、`driver.idle(typing)`、`driver.wait_for(...)` と呼んだ（`src/recorder.emel`）。spec の決まった形に直しただけなので、コードに印は付けない
   LiveDriver（`src/recorder/live.emel`）は、`(use Stdout).print_line(...)`、`(use Clock).now()`、`(use Pty).write(...)` と、閉包に渡す所は `pty = use Pty` と束ねて `|| pty.read()` と書いた。印は付けない
   cli の main（`cli/src/main.emel`）は、`(use Args).list()`、`(use Stderr).print_line(...)`、`(use FileSystem).read_text(path)` と書いた。印は付けない
-  cli の overlay（`cli/src/main.emel` の `overlay`、サブプロジェクト 4 の Task 4）も、`(use FileSystem).read_text(path)` と `(use Stdout).print_line(line)` と書き、List の `each` には操作を関数の値のまま `lines.each((use Stdout).print_line)` と渡した。印は付けない
+  cli の overlay（`cli/src/main.emel` の `overlay`、サブプロジェクト 4 の Task 4）も、`(use FileSystem).read_text(path)` と `(use Stdout).print_line(line)` と書き、List の `each` には操作を関数の値のまま `lines.each((use Stdout).print_line)` と渡した。印は付けない。`read_text` の呼び出しは、Task 4 の review の後の fix（`5a4e655`）で、`rec` と共有する `reading` の中に移った（`f((use FileSystem).read_text(path))`。087）
 - コスト: 束縛の 1 行。普段のコードに基盤レベルは漏れていない（`use` は基盤レベルの keyword ではない）
 - spec: `[effect.use]`（「Operations can be called only through a capability value, in the form `log.info(...)`. There is no form that calls them directly by effect name (`Logger.info(...)`).」）、`spec/diagnostics.md` の E0217 と W0302
 - 既存: 決まった設計（`[effect.use]`）
