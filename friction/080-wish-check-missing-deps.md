@@ -1,6 +1,6 @@
 # 080 wish-check-missing-deps
 
-- 状態: open
+- 状態: filed
 - Emela: v0.28.2
 - 意図: wish-first（AGENTS.md 規則 1）で、兄弟の Pome を import する単位の wish を、実装の前に `tools/wish.ts check` で検査し、spec を読む前の書き方の誤りを診断で見る。import する Pome が、wish の時点の manifest にまだ無いことがある（新しい Pome に置く仮の Pome.toml、または計画が wish の commit の後の Step で依存を足すとき）。サブプロジェクト 1 の cli の main（`wish/main.emel`、計画の Task 6）は root と pty-bun を、LiveDriver（`wish/live.emel`、Task 5）は pty を import する
 - こう書きたかった: wish の import（`wish/main.emel:13-18` の `import Kbdcast.Tape.{Tape, TapeError}` から `import PtyBun.{BunPty, SpawnFailed}` まで、`wish/live.emel` の `import Pty.{Pty, Output}`）が、計画の依存のとおりに解決され、wish の中の誤り（030、071 など）まで診断が届く
@@ -13,4 +13,4 @@
 - コスト: wish-first の診断が、兄弟の Pome を使う所のうち、依存が wish の時点の manifest にまだ無いとき（新しい Pome の仮の Pome.toml、または計画が wish の commit の後の Step で依存を足すとき）に失われる。規則 1 は「spec を調べる前に」wish を書くので、その時の手がかりは診断だけで、import の先の誤り（module の名前の取り違え、effect を名前で呼ぶ形など）は実装まで見えない。普段のコードに基盤レベルは漏れていない
 - spec: `[module.pome]`（`spec/language/04-modules.md:178`「A module can import only the Pomes listed in its own `[dependencies]`」、`:288` の `[replace]` はその Pome を build するときだけ効く）、`spec/diagnostics.md` の E0205、E0211。kbdcast の側は `tools/wish.ts` の `provisionalManifest`（`[pome]` だけを書く）と、計画の Step の順（wish の commit の後に依存を足す）
 - 既存: kbdcast の issue #21（open。仮の Pome.toml に依存が無く、兄弟の Pome を import する wish が E0205 で止まる、というこの 080 そのもの。2026-11-28 に `gh issue view 21 --repo kisepichu/kbdcast` で確かめた）。kbdcast の issue #12（closed。root に Pome.toml があると、入れ子の新しい Pome の wish が黙って検査されない）で仮の Pome.toml を置くようになったが、依存は書かない。2026-11-28、`gh issue list --repo kisepichu/kbdcast --state all --search wish` で検索し、依存の話は #21 の他に無かった
-- 行き先: kbdcast の道具の friction（emela には出さない）。行き先は `tools/wish.ts`: 仮の Pome.toml に、計画の `[dependencies]` と `[replace]`（wish の頭の注釈などで受ける）を書けるようにするか、wish check の前に依存を足す Step を計画に置く。kbdcast の issue #21（open）にしたが、直しは未着手
+- 行き先: kbdcast の道具の friction（emela には出さない）→ issue: https://github.com/kisepichu/kbdcast/issues/21（2026-11-27 UTC に作成。open で、直しは未着手）。行き先は `tools/wish.ts`: 仮の Pome.toml に、計画の `[dependencies]` と `[replace]`（wish の頭の注釈などで受ける）を書けるようにするか、wish check の前に依存を足す Step を計画に置く
