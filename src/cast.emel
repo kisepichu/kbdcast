@@ -90,8 +90,8 @@ pub error CastError(line: Int, message: String) derive Eq, Show
 ## Reads the cast `text`, whose lines are separated by `\n`: the header on the first line, and the
 ## `o`, `i`, `m` and `x` events on the lines after it, in order. Empty lines and comments (`#`) are
 ## skipped, and so are the events of other codes, whose intervals still count. The time of an event
-## is the sum of the intervals up to it, in seconds, rounded to milliseconds; a time past the largest
-## Int of milliseconds (about 24.8 days) is a defect. Fails at the first line that is wrong.
+## is the sum of the intervals up to it, in seconds, rounded to milliseconds, and must not be more
+## than 2147483647 ms (the largest Int, about 24.8 days). Fails at the first line that is wrong.
 pub fn read(text: String) -> (Header, List[Event]) fails CastError {
   # FRICTION(083): String has no `lines`, and `split` gives `[""]` for the empty text, so the guard
   # tells the empty cast apart.
@@ -143,7 +143,15 @@ fn read_events(lines: List[(Int, String)]) -> List[Event] fails CastError {
       line = index + 1
       (interval, code, data) = read_event(line, text)
       time = clock + interval
-      at_ms = Float.round(time * 1000.0)
+      ms = time * 1000.0
+      # FRICTION(088): Int has no largest value, and Float has no conversion to Int that fails, so
+      # the bound is written by hand. The time is never negative and `Float.round` rounds 0.5 up,
+      # so it gives more than 2147483647 (or is a defect, as for Infinity) exactly from
+      # 2147483647.5.
+      if ms >= 2147483647.5 {
+        fail CastError(line:, message: "the time is too large (more than 2147483647 ms)")
+      }
+      at_ms = Float.round(ms)
       events = code match {
         "o" -> [Output(at_ms, data), ..events]
         "i" -> [Input(at_ms, data), ..events]

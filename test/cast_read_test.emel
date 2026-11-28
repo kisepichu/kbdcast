@@ -108,5 +108,9 @@ fn read_rejects_an_event_that_it_cannot_read() {
   assert failure("#{HEADER}\n[0.1, \"o\"]") == (2, "an event is [interval, code, data]")
   assert failure("#{HEADER}\n[0.1, 1, \"a\"]") == (2, "an event is [interval, code, data]")
   assert failure("#{HEADER}\n[-0.1, \"o\", \"a\"]") == (2, "the interval is negative")
+  assert failure("#{HEADER}\n[3000000, \"o\", \"a\"]")
+    == (2, "the time is too large (more than 2147483647 ms)")
+  assert failure("#{HEADER}\n[2000000, \"o\", \"a\"]\n[200000, \"o\", \"b\"]")
+    == (3, "the time is too large (more than 2147483647 ms)")
   assert failure("#{HEADER}\n[0.1, \"r\", \"90x30\"]") == (2, "resize events are not supported")
 }
