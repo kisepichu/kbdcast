@@ -1,13 +1,18 @@
 # The entry of kbdcast (spec §9). `kbdcast rec <tape>` reads the tape, parses it, and records it
-# under BunPty, SystemClock and SystemStdout, writing the cast to stdout. An error goes to stderr
-# with exit code 1, and wrong arguments write the usage with exit code 2.
+# under BunPty, SystemClock and SystemStdout, writing the cast to stdout. `kbdcast overlay <cast>`
+# reads a cast and writes the cast with the keys in a strip under the screen to stdout (overlay spec
+# §7). An error goes to stderr with exit code 1, and wrong arguments write the usage with exit code
+# 2.
 #
 # FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
 # is a plain comment.
 
+import Kbdcast.Cast
+import Kbdcast.Cast.{CastError}
 import Kbdcast.Key.Encode
 import Kbdcast.Key.Encode.{Unencodable, NeedsOtherKeys, NeedsKitty, One, Two}
 import Kbdcast.Key.Notation
+import Kbdcast.Overlay
 import Kbdcast.Recorder.{RecordError, Reason, CannotSend, Exited, TimedOut}
 import Kbdcast.Recorder.Live
 import Kbdcast.Tape.{Command, TapeError}
@@ -27,6 +32,7 @@ import Std.Path
 import Std.Process.{
   Args,
   Stderr,
+  Stdout,
   ExitCode,
   SystemArgs,
   SystemStderr,
@@ -39,9 +45,10 @@ import Std.Process.{
 fn main() -> ExitCode {
   with SystemArgs, SystemStderr, SystemFileSystem {
     (use Args).list() match {
-      ["rec", path] -> rec(path)
+      ["rec", path]     -> rec(path)
+      ["overlay", path] -> overlay(path)
       _ -> {
-        (use Stderr).print_line("usage: kbdcast rec <tape>")
+        (use Stderr).print_line("usage: kbdcast rec <tape> | kbdcast overlay <cast>")
         exit_code(2)
       }
     }
@@ -78,6 +85,32 @@ fn rec(path: String) -> ExitCode {
     InvalidText(..)                     -> failure("#{path}: not valid UTF-8")
     FileSystemFailure(message:, ..)     -> failure("#{path}: #{message}")
     TapeError(line:, column:, message:) -> failure("#{path}:#{line}:#{column}: #{message}")
+  }
+}
+
+# Reads the cast at `path` and writes the cast that `Overlay` makes to stdout, each line as soon as
+# it is made.
+fn overlay(path: String) -> ExitCode {
+  {
+    (header, events) = Cast.read((use FileSystem).read_text(path))
+    with SystemStdout {
+      (first, line) = Overlay.start(header)
+      (use Stdout).print_line(line)
+      last = events.fold(first, |o, e| {
+        (next, lines) = Overlay.step(o, e)
+        lines.each((use Stdout).print_line)
+        next
+      })
+      Overlay.finish(last).each((use Stdout).print_line)
+    }
+    EXIT_SUCCESS
+  } escape {
+    FileNotFound(..)                -> failure("#{path}: no such file")
+    FileAccessDenied(..)            -> failure("#{path}: permission denied")
+    IsADirectory(..)                -> failure("#{path}: is a directory")
+    InvalidText(..)                 -> failure("#{path}: not valid UTF-8")
+    FileSystemFailure(message:, ..) -> failure("#{path}: #{message}")
+    CastError(line:, message:)      -> failure("#{path}:#{line}: #{message}")
   }
 }
 

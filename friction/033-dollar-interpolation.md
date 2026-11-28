@@ -15,6 +15,7 @@
   cli の main の wish（`wish/main.emel:32`、`:35`、`:43-44`、`:57`、`:59-60`、`:62`、`:68`、サブプロジェクト 1 の計画の Task 6）でも、stderr に書く error の文と Duration の文字列の 10 の literal に `${...}` を書いた（`"${path}: ${reason}"`、`"${path}:${line}:${column}: ${message}"`、`"/${pattern} did not appear within ${duration(timeout)}\nscreen:\n${screen}"`、`"${d.as_ms() / 1000}s"` など）
   cast の reader の wish（`wish/cast_read.emel:29`、`:40`、`:41`、サブプロジェクト 4 の計画の Task 1）でも、CastError の message の 3 つの literal に `${...}` を書いた（`"invalid JSON: ${e.message}"`、`"only asciicast v3 is supported (this is version ${v}; ...)"`、同じ文の `${json.version}`）
   overlay の合成の wish（`wish/overlay.emel:102`、`:110`、`:138-141`、サブプロジェクト 4 の計画の Task 3）でも、端末の列の CUP と SGR の引数の 6 つの literal に `${...}` を書いた（`"\e[${cursor.0 + 1};${cursor.1 + 1}H"`、`"\e[${i + 1};1H"`、`"${base + n}"`、`"${extended};5;${n}"`、`"${extended};2;${r};${g};${b}"` など）
+  cli の overlay の wish（`wish/main_overlay.emel:27`、`:33`、サブプロジェクト 4 の計画の Task 4）でも、stderr に書く error の文の 2 つの literal に `${...}` を書いた（`"${path}: ${e}"`、`"${path}:${line}: ${message}"`）
 - 診断:
   なし。wish check（v0.28.2）は `wish/differential.emel:27` の `test "..." {` の E0126 で止まり、`:31` には届かなかった（016）
   repo の外の使い捨ての Pome での最小の形（v0.28.2、2026-11-26。friction-review の後の修正のときと、この修正のときの 2 回）: `pub fn message(b: Int) -> String { "message ${b}" }` は、`emela check` が何も出さずに 0 で終わる。値は `${b}` が文字のまま残った `"message ${b}"` で、`dbg` もそう出し、`!= "message 1"` と code point が 12 個であることを確かめるテストが通った
@@ -27,6 +28,7 @@
   cli の main の wish check（v0.28.2）でも、10 の literal のどれにも `${` についての診断は無い（`:57`、`:59`、`:62` に出たのは、同じ腕の `->` の後の改行（078）の E0110 だけ。`:68` は同じ行の `as_ms` の E0315（016））
   cast の reader の wish check（v0.28.2）でも、3 つの literal のどれにも `${` についての診断は無い（`:29` に出たのは同じ腕の `Err` の E0211（016）だけで、`:40-41` には何も出ない）
   overlay の合成の wish check（v0.28.2）でも、6 つの literal のどれにも `${` についての診断は無い（`:102` と `:110` に出たのは、同じ literal の `\e` の E0107（016）と、同じ行の `let`（004）の E0118 と E0122 だけ。`:138-141` は `=>` の腕（E0110）の本体で、読まれなかった）。`${cursor.0 + 1}` などは名前でなく式なので、下の行き先の警告の範囲（`${`、名前、`}`）には `${extended}`、`${n}`、`${r}`、`${g}`、`${b}` だけが入る
+  cli の overlay の wish check（v0.28.2）でも、2 つの literal に `${` についての診断は無い（どちらも `let`（004）で崩れた行の右辺の match と `catch` の腕の中にあり、読まれなかった）
 - 回避策: 書き直したテスト（`regex/test/differential_test.emel`）は、失敗をそのまま `Property.check_with` まで伝える形にしたので（016）、message を組み立てる所が無くなった。補間を書くなら `"generated pattern #{pattern} was rejected: #{message} at #{offset}"`（`[lex.literal]`）。正しい書き方に直しただけなので、コードに印は付けない
   表記（Task 3、`src/key/notation.emel`）は `#{...}` に直した。正しい書き方に直しただけなので、コードに印は付けない。表記のテストは message と `print` の結果を完全に一致させるので、直さなければテストが落ちて気づけた
   encode（Task 6、`src/key/encode.emel`）は `#{...}` に直した（`"#{CSI}#{final}"`、`"#{CSI}27;#{modifier_number(m)};#{c}~"`）。正しい書き方に直しただけなので、コードに印は付けない。encode の固定の例と golden の表のテストは bytes を完全に一致させるので、直さなければテストが落ちて気づけた
@@ -36,6 +38,7 @@
   cli の main（サブプロジェクト 1 の Task 6、`cli/src/main.emel`）は `#{...}` に直した（`"#{path}:#{line}:#{column}: #{message}"`、`"/#{pattern} did not appear within #{dur(timeout)}\nscreen:\n#{screen}"` など）。正しい書き方に直しただけなので、コードに印は付けない。cli には permanent なテストが無く（E2E は smoke）、直さなくてもコンパイルは通るので、error の文を E2E の smoke で 1 つずつ出して確かめた
   cast の reader（サブプロジェクト 4 の Task 1、`src/cast.emel`）は `#{...}` に直した（`"invalid JSON: #{message}"`、`"... (this is version #{shown}; ...)"`）。正しい書き方に直しただけなので、コードに印は付けない。version の文はテストが message を完全に一致させるので、直さなければテストが落ちて気づけた。`invalid JSON: ` の文は、テストが接頭辞だけを確かめる（後ろは Std.Json の message）ので、`${e.message}` のままでも通ってしまう。使い捨てのテストで `dbg` に出し、``invalid JSON: expected `,` or `}` `` のように Std.Json の message が入ることを確かめた
   overlay の合成（サブプロジェクト 4 の Task 3、`src/overlay.emel`）は `#{...}` に直した（`"\u{1b}[#{i + 1};1H#{String.concat(parts)}\u{1b}[0m"`、`"#{base + n}"`、`"#{extended};5;#{n}"`、`"#{extended};2;#{r};#{g};#{b}"` など）。正しい書き方に直しただけなので、コードに印は付けない。固定の例のテストは `o` の data を完全に一致させるので、直さなければテストが落ちて気づけた
+  cli の overlay（サブプロジェクト 4 の Task 4、`cli/src/main.emel`）は `#{...}` に直した（`"#{path}:#{line}: #{message}"`。ファイルの error は `rec` と同じ文）。正しい書き方に直しただけなので、コードに印は付けない。cli には permanent なテストが無く、直さなくてもコンパイルは通るので、error の文を E2E の smoke で 1 つずつ出して確かめた（`/nonexistent.cast: no such file`、v2 の cast と `r` の cast の `<cast>:<行>: <message>`）
 - コスト:
   コードのコストは無い（増えた行は 0。普段のコードに基盤レベルは漏れていない）。危ういのは、この誤りがコンパイルも実行も通ること。失敗の message のように、テストが落ちたときにしか読まない文字列で起き、落ちて初めて `${pattern}` が値でないと分かる。今回は wish check が手前の E0126 で止まったので、診断が無いことにも気づかず、使い捨ての Pome で確かめて初めて分かった
   encode の `{...}` は `${...}` より見分けにくい: `{` と `}` は JSON や正規表現の量指定子（`a{2}`）など、文字として書くことの多い文字なので、下の行き先の警告の範囲を `{name}` に広げると誤検出が増える。このメモの警告の案は `${` に限ったままにし、`{name}` は使い道の記録にとどめる
