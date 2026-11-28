@@ -1,0 +1,463 @@
+# wish-target: src/overlay/strip.emel
+# キーの帯。最後の印から FADE_MS 以内に押したキーを、押した順に vim の表記で並べる。
+
+import Key.Notation.{print}
+import Key.Decode.{Decoded, Key, Paste, Unknown}
+import Vt.Width.{is_wide}
+import Vt.Screen.{Cell, Pen, DEFAULT_PEN, Occupancy, Narrow, WideHead, WideTail}
+
+pub const FADE_MS: Int = 1500
+
+# marks は押した順。last_ms は最後の印の時刻（印が無ければ None）。
+pub opaque type Strip(marks: List[String], last_ms: Option[Int])
+
+pub fn strip() -> Strip = Strip(marks: [], last_ms: None)
+
+pub fn press(s: Strip, at_ms: Int, keys: List[Decoded]) -> Strip {
+  let added = keys.filter_map(mark)
+  if added.is_empty() {
+    s
+  } else {
+    Strip(marks: marks(s, at_ms) ++ added, last_ms: Some(at_ms))
+  }
+}
+
+pub fn marks(s: Strip, at_ms: Int) -> List[String] =
+  match s.last_ms {
+    Some(last) if at_ms < last + FADE_MS -> s.marks
+    _ -> []
+  }
+
+pub fn clears_at(s: Strip) -> Option[Int] = s.last_ms.map(fn(last) { last + FADE_MS })
+
+pub fn row(marks: List[String], cols: Int) -> List[Cell] =
+  match fit(marks, cols) {
+    None -> blanks(cols)
+    Some(part) -> {
+      let shown = cells(part, Pen(inverse: True, ..DEFAULT_PEN))
+      shown ++ blanks(cols - shown.length())
+    }
+  }
+
+fn mark(key: Decoded) -> Option[String] =
+  match key {
+    Key(k) -> Some(print(k))
+    Paste(_) -> Some("<Paste>")
+    Unknown(_) -> None
+  }
+
+# 反転で書く部分（" " + 中身 + " "）。書くものが無ければ None。
+fn fit(marks: List[String], cols: Int) -> Option[String] {
+  let whole = " " ++ marks.join("") ++ " "
+  # 古い印から 1 つずつ落とした残り。最後の印は残す。
+  let dropped = List.range(1, marks.length()).map(fn(n) { " …" ++ marks.drop(n).join("") ++ " " })
+  match marks {
+    [] -> None
+    _ if width(whole) <= cols -> Some(whole)
+    _ -> match dropped.find(fn(t) { width(t) <= cols }) {
+      Some(t) -> Some(t)
+      None -> right_end(marks.last(), cols)
+    }
+  }
+}
+
+# 最後の印 1 つでも入らないとき、その印の右の端を cols - 2 列ぶん残す。
+fn right_end(mark: String, cols: Int) -> Option[String] =
+  if cols < 3 {
+    None
+  } else {
+    let end = take_right(mark.chars().reverse(), cols - 2)
+    # 端が全角の途中にかかったら、その文字の代わりに空白
+    Some("…" ++ " ".repeat(cols - 2 - width(end)) ++ end ++ " ")
+  }
+
+# reversed は右から読んだ文字。room 列に入るだけ取る。
+fn take_right(reversed: List[Char], room: Int) -> String =
+  match reversed {
+    [c, ..rest] if char_width(c) <= room -> take_right(rest, room - char_width(c)) ++ c.to_string()
+    _ -> ""
+  }
+
+fn cells(text: String, pen: Pen) -> List[Cell] =
+  text.chars().flat_map(fn(c) {
+    if is_wide(c) {
+      [Cell(char: c.to_string(), pen: pen, occupancy: WideHead), Cell(char: "", pen: pen, occupancy: WideTail)]
+    } else {
+      [Cell(char: c.to_string(), pen: pen, occupancy: Narrow)]
+    }
+  })
+
+fn blanks(n: Int) -> List[Cell] = List.repeat(Cell(char: " ", pen: DEFAULT_PEN, occupancy: Narrow), n)
+
+fn width(text: String) -> Int = text.chars().map(char_width).sum()
+
+fn char_width(c: Char) -> Int = if is_wide(c) { 2 } else { 1 }
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/overlay/strip.emel:14:8 ]
+#     │
+#  14 │ pub fn strip() -> Strip = Strip(marks: [], last_ms: None)
+#     │        ──┬──  
+#     │          ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/overlay/strip.emel:14:25 ]
+#     │
+#  14 │ pub fn strip() -> Strip = Strip(marks: [], last_ms: None)
+#     │                         ┬  
+#     │                         ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay/strip.emel:17:3 ]
+#     │
+#  17 │   let added = keys.filter_map(mark)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay/strip.emel:17:7 ]
+#     │
+#  17 │   let added = keys.filter_map(mark)
+#     │       ──┬──  
+#     │         ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay/strip.emel:21:35 ]
+#     │
+#  21 │     Strip(marks: marks(s, at_ms) ++ added, last_ms: Some(at_ms))
+#     │                                   ┬  
+#     │                                   ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/overlay/strip.emel:21:37 ]
+#     │
+#  21 │     Strip(marks: marks(s, at_ms) ++ added, last_ms: Some(at_ms))
+#     │                                     ──┬──  
+#     │                                       ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay/strip.emel:21:37 ]
+#     │
+#  21 │     Strip(marks: marks(s, at_ms) ++ added, last_ms: Some(at_ms))
+#     │                                     ──┬──  
+#     │                                       ╰──── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/overlay/strip.emel:25:8 ]
+#     │
+#  25 │ pub fn marks(s: Strip, at_ms: Int) -> List[String] =
+#     │        ──┬──  
+#     │          ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/overlay/strip.emel:25:52 ]
+#     │
+#  25 │ pub fn marks(s: Strip, at_ms: Int) -> List[String] =
+#     │                                                    ┬  
+#     │                                                    ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/overlay/strip.emel:31:8 ]
+#     │
+#  31 │ pub fn clears_at(s: Strip) -> Option[Int] = s.last_ms.map(fn(last) { last + FADE_MS })
+#     │        ────┬────  
+#     │            ╰────── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/overlay/strip.emel:31:43 ]
+#     │
+#  31 │ pub fn clears_at(s: Strip) -> Option[Int] = s.last_ms.map(fn(last) { last + FADE_MS })
+#     │                                           ┬  
+#     │                                           ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/overlay/strip.emel:33:8 ]
+#     │
+#  33 │ pub fn row(marks: List[String], cols: Int) -> List[Cell] =
+#     │        ─┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/overlay/strip.emel:33:58 ]
+#     │
+#  33 │ pub fn row(marks: List[String], cols: Int) -> List[Cell] =
+#     │                                                          ┬  
+#     │                                                          ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/overlay/strip.emel:42:4 ]
+#     │
+#  42 │ fn mark(key: Decoded) -> Option[String] =
+#     │    ──┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/overlay/strip.emel:42:41 ]
+#     │
+#  42 │ fn mark(key: Decoded) -> Option[String] =
+#     │                                         ┬  
+#     │                                         ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay/strip.emel:51:3 ]
+#     │
+#  51 │   let whole = " " ++ marks.join("") ++ " "
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay/strip.emel:51:7 ]
+#     │
+#  51 │   let whole = " " ++ marks.join("") ++ " "
+#     │       ──┬──  
+#     │         ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay/strip.emel:53:3 ]
+#     │
+#  53 │   let dropped = List.range(1, marks.length()).map(fn(n) { " …" ++ marks.drop(n).join("") ++ " " })
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay/strip.emel:53:7 ]
+#     │
+#  53 │   let dropped = List.range(1, marks.length()).map(fn(n) { " …" ++ marks.drop(n).join("") ++ " " })
+#     │       ───┬───  
+#     │          ╰───── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/overlay/strip.emel:54:3 ]
+#     │
+#  54 │   match marks {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/overlay/strip.emel:57:10 ]
+#     │
+#  57 │     _ -> match dropped.find(fn(t) { width(t) <= cols }) {
+#     │          ──┬──  
+#     │            ╰──── 
+# ────╯
+#
+# error[E0148]: anonymous functions are written `|x| body`
+#     ╭─[ src/overlay/strip.emel:57:29 ]
+#     │
+#  57 │     _ -> match dropped.find(fn(t) { width(t) <= cols }) {
+#     │                             ──┬──  
+#     │                               ╰──── 
+# ────╯
+#    = help: write `|t| width(t) <= cols`
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/overlay/strip.emel:65:4 ]
+#     │
+#  65 │ fn right_end(mark: String, cols: Int) -> Option[String] =
+#     │    ────┬────  
+#     │        ╰────── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/overlay/strip.emel:65:57 ]
+#     │
+#  65 │ fn right_end(mark: String, cols: Int) -> Option[String] =
+#     │                                                         ┬  
+#     │                                                         ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/overlay/strip.emel:75:4 ]
+#     │
+#  75 │ fn take_right(reversed: List[Char], room: Int) -> String =
+#     │    ─────┬────  
+#     │         ╰────── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/overlay/strip.emel:75:58 ]
+#     │
+#  75 │ fn take_right(reversed: List[Char], room: Int) -> String =
+#     │                                                          ┬  
+#     │                                                          ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/overlay/strip.emel:81:4 ]
+#     │
+#  81 │ fn cells(text: String, pen: Pen) -> List[Cell] =
+#     │    ──┬──  
+#     │      ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/overlay/strip.emel:81:48 ]
+#     │
+#  81 │ fn cells(text: String, pen: Pen) -> List[Cell] =
+#     │                                                ┬  
+#     │                                                ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/overlay/strip.emel:90:4 ]
+#     │
+#  90 │ fn blanks(n: Int) -> List[Cell] = List.repeat(Cell(char: " ", pen: DEFAULT_PEN, occupancy: Narrow), n)
+#     │    ───┬──  
+#     │       ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/overlay/strip.emel:90:33 ]
+#     │
+#  90 │ fn blanks(n: Int) -> List[Cell] = List.repeat(Cell(char: " ", pen: DEFAULT_PEN, occupancy: Narrow), n)
+#     │                                 ┬  
+#     │                                 ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/overlay/strip.emel:92:4 ]
+#     │
+#  92 │ fn width(text: String) -> Int = text.chars().map(char_width).sum()
+#     │    ──┬──  
+#     │      ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/overlay/strip.emel:92:31 ]
+#     │
+#  92 │ fn width(text: String) -> Int = text.chars().map(char_width).sum()
+#     │                               ┬  
+#     │                               ╰── 
+# ────╯
+#
+# error[E0130]: a function without a body must be `@external`
+#     ╭─[ src/overlay/strip.emel:94:4 ]
+#     │
+#  94 │ fn char_width(c: Char) -> Int = if is_wide(c) { 2 } else { 1 }
+#     │    ─────┬────  
+#     │         ╰────── 
+# ────╯
+#
+# error[E0122]: expected newline after declaration
+#     ╭─[ src/overlay/strip.emel:94:31 ]
+#     │
+#  94 │ fn char_width(c: Char) -> Int = if is_wide(c) { 2 } else { 1 }
+#     │                               ┬  
+#     │                               ╰── 
+# ────╯
+#
+# error[E0212]: module `Vt.Screen` has no `Narrow`
+#    ╭─[ src/overlay/strip.emel:7:54 ]
+#    │
+#  7 │ import Vt.Screen.{Cell, Pen, DEFAULT_PEN, Occupancy, Narrow, WideHead, WideTail}
+#    │                                                      ───┬──  
+#    │                                                         ╰──── 
+# ───╯
+#
+# error[E0211]: cannot find value `added` in this scope
+#     ╭─[ src/overlay/strip.emel:18:6 ]
+#     │
+#  18 │   if added.is_empty() {
+#     │      ──┬──  
+#     │        ╰──── 
+# ────╯
+#
+# error[E0334]: function `marks` has the same name as a field of `Strip`
+#     ╭─[ src/overlay/strip.emel:25:8 ]
+#     │
+#  25 │ pub fn marks(s: Strip, at_ms: Int) -> List[String] =
+#     │        ──┬──  
+#     │          ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `whole` in this scope
+#     ╭─[ src/overlay/strip.emel:56:16 ]
+#     │
+#  56 │     _ if width(whole) <= cols -> Some(whole)
+#     │                ──┬──  
+#     │                  ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `whole` in this scope
+#     ╭─[ src/overlay/strip.emel:56:39 ]
+#     │
+#  56 │     _ if width(whole) <= cols -> Some(whole)
+#     │                                       ──┬──  
+#     │                                         ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `dropped` in this scope
+#     ╭─[ src/overlay/strip.emel:57:16 ]
+#     │
+#  57 │     _ -> match dropped.find(fn(t) { width(t) <= cols }) {
+#     │                ───┬───  
+#     │                   ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find type `Char` in this scope
+#     ╭─[ src/overlay/strip.emel:75:30 ]
+#     │
+#  75 │ fn take_right(reversed: List[Char], room: Int) -> String =
+#     │                              ──┬─  
+#     │                                ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find type `Char` in this scope
+#     ╭─[ src/overlay/strip.emel:94:18 ]
+#     │
+#  94 │ fn char_width(c: Char) -> Int = if is_wide(c) { 2 } else { 1 }
+#     │                  ──┬─  
+#     │                    ╰─── 
+# ────╯
+#
+# error[E0305]: wrong number of arguments: `Strip` takes 2, found 1
+#     ╭─[ src/overlay/strip.emel:21:5 ]
+#     │
+#  21 │     Strip(marks: marks(s, at_ms) ++ added, last_ms: Some(at_ms))
+#     │     ───────────────┬───────────────  
+#     │                    ╰───────────────── 
+# ────╯
+#
+# error[E0310]: expected a number (`Int`, `Int64` or `Float`), found `List[String]`
+#     ╭─[ src/overlay/strip.emel:21:18 ]
+#     │
+#  21 │     Strip(marks: marks(s, at_ms) ++ added, last_ms: Some(at_ms))
+#     │                  ─────────┬────────  
+#     │                           ╰────────── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `String`, found `Option[String]`
+#     ╭─[ src/overlay/strip.emel:59:25 ]
+#     │
+#  59 │       None -> right_end(marks.last(), cols)
+#     │                         ──────┬─────  
+#     │                               ╰─────── 
+# ────╯
+#
+# 45 errors, 1 warning
+# --- end wish check ---
