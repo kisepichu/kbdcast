@@ -60,10 +60,18 @@ fn fed_lines(t: Vt.Terminal, lines: List[String]) -> Vt.Terminal fails SyntaxErr
   })
 }
 
+# A header of 6 columns and `rows` rows with fields that `Overlay.start` does not look at.
+fn full_header(rows: Int) -> String {
+  palette = "#000000:#111111:#222222:#333333:#444444:#555555:#666666:#777777"
+  theme = "{\"fg\": \"#ffffff\", \"bg\": \"#000000\", \"palette\": \"#{palette}\"}"
+  term = "{\"cols\": 6, \"rows\": #{rows}, \"type\": \"xterm-256color\", \"theme\": #{theme}}"
+  "{\"version\": 3, \"term\": #{term}, \"title\": \"demo\", \"command\": \"vim notes.md\"}"
+}
+
 @test
-fn start_writes_the_header_with_one_more_row() {
-  (_, written) = Overlay.start(header(HEADER))
-  assert Json.parse(written) == Json.parse("{\"version\": 3, \"term\": {\"cols\": 6, \"rows\": 3}}")
+fn start_writes_the_header_with_one_more_row_and_the_other_fields_as_they_are() {
+  (_, written) = Overlay.start(header(full_header(2)))
+  assert Json.parse(written) == Json.parse(full_header(3))
 }
 
 @test
@@ -215,6 +223,8 @@ fn the_overlay_draws_the_screen_the_strip_and_the_cursor_after_every_event() {
       |(o, drawn, app, strip), e| {
         (o, lines) = Overlay.step(o, e)
         drawn = fed_lines(drawn, lines)
+        # FRICTION(015): there is no or-pattern, so a marker and an exit have an arm each with the
+        # same body.
         (app, strip, t) = e match {
           Output(t, s) -> (fed(app, s), strip, t)
           Input(t, s)  -> (app, Strip.press(strip, t, Decode.decode(Bytes.encode_utf8(s))), t)
