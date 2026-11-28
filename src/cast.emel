@@ -1,12 +1,13 @@
 # The lines of an asciicast v3 file (https://docs.asciinema.org/manual/asciicast/v3/): the header,
-# and one line per event. Times come in as whole milliseconds of tape time from the start of the
-# recording; only this module turns them into intervals in seconds.
+# and one line per event. Outside this module, times are whole milliseconds from the start of the
+# recording; only this module turns them into intervals in seconds (`event`) and back (`read`).
 #
 # FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
 # is a plain comment.
 
 import Std.Bytes
-import Std.Json
+import Std.Dynamic.{Dynamic, DecodeError, Fields, Items, Number, Text}
+import Std.Json.{SyntaxError}
 
 ## What `event` keeps from one line to the next: the time of the previous event, in milliseconds
 ## from the start of the recording.
@@ -63,5 +64,115 @@ fn hex(byte: Int) -> String {
   Bytes.from_list([byte]) match {
     Some(b) -> Bytes.to_hex(b)
     None    -> panic("a byte out of 0 to 255: #{byte}")
+  }
+}
+
+## The header of a cast that `read` read: the size of the terminal, and the whole header as written
+## (with the fields that `read` does not look at, such as `term.theme` and `title`).
+pub type Header(cols: Int, rows: Int, json: Dynamic) derive Eq, Show
+
+## An event of a cast that `read` read: its time in milliseconds from the start of the recording,
+## and its data.
+pub enum Event {
+  # `o`: what the application wrote to the terminal.
+  Output(Int, String)
+  # `i`: what the terminal sent to the application.
+  Input(Int, String)
+  # `m`: a marker, with its label.
+  Marker(Int, String)
+  # `x`: the exit of the application, with its status.
+  Exit(Int, String)
+} derive Eq, Show
+
+## Why `read` rejected a cast: the line where it went wrong (from 1), and what is wrong, in English.
+pub error CastError(line: Int, message: String) derive Eq, Show
+
+## Reads the cast `text`, whose lines are separated by `\n`: the header on the first line, and the
+## `o`, `i`, `m` and `x` events on the lines after it, in order. Empty lines and comments (`#`) are
+## skipped, and so are the events of other codes, whose intervals still count. The time of an event
+## is the sum of the intervals up to it, in seconds, rounded to milliseconds; a time past the largest
+## Int of milliseconds (about 24.8 days) is a defect. Fails at the first line that is wrong.
+pub fn read(text: String) -> (Header, List[Event]) fails CastError {
+  # FRICTION(083): String has no `lines`, and `split` gives `[""]` for the empty text, so the guard
+  # tells the empty cast apart.
+  text.split("\n").enumerate() match {
+    [(_, first), ..rest] if text != "" -> (read_header(first), read_events(rest))
+    _                                  -> fail CastError(line: 1, message: "the cast is empty")
+  }
+}
+
+# The header, `text` on line 1.
+fn read_header(text: String) -> Header fails CastError {
+  json = parse(1, text)
+  json match {
+    Fields(_) -> ()
+    _         -> fail CastError(line: 1, message: "the header is not a JSON object")
+  }
+  # A missing `version` is Null, as `Dynamic.field` reads a missing key.
+  version = Dynamic.field(json, "version", Dynamic.int) escape {
+    DecodeError(actual:, ..) -> fail unsupported(Json.to_string(actual))
+  }
+  if version != 3 { fail unsupported("#{version}") }
+  Header(cols: dimension(json, "cols"), rows: dimension(json, "rows"), json:)
+}
+
+# The CastError for a header whose `version` is not 3 but `shown`.
+fn unsupported(shown: String) -> CastError {
+  CastError(
+    line: 1,
+    message: "only asciicast v3 is supported (this is version #{shown}; asciinema convert -f asciicast-v3 can convert it)",
+  )
+}
+
+# `term.<name>` of the header `json`, which must be an integer of at least 1.
+fn dimension(json: Dynamic, name: String) -> Int fails CastError {
+  too_small = CastError(line: 1, message: "the header needs term.cols and term.rows of at least 1")
+  n = Dynamic.field(json, "term", |term| Dynamic.field(term, name, Dynamic.int)) escape {
+    DecodeError(..) -> fail too_small
+  }
+  if n < 1 { fail too_small } else { n }
+}
+
+# The events on the lines after the header, each with its index from 0 in the cast.
+fn read_events(lines: List[(Int, String)]) -> List[Event] fails CastError {
+  # The time of the last event in seconds, and the events so far, the last one first.
+  (_, events) = lines.fold((0.0, []), |(clock, events), (index, text)| {
+    if text == "" || text.starts_with("#") {
+      (clock, events)
+    } else {
+      line = index + 1
+      (interval, code, data) = read_event(line, text)
+      time = clock + interval
+      at_ms = Float.round(time * 1000.0)
+      events = code match {
+        "o" -> [Output(at_ms, data), ..events]
+        "i" -> [Input(at_ms, data), ..events]
+        "m" -> [Marker(at_ms, data), ..events]
+        "x" -> [Exit(at_ms, data), ..events]
+        "r" -> fail CastError(line:, message: "resize events are not supported")
+        _   -> events
+      }
+      (time, events)
+    }
+  })
+  events.reverse()
+}
+
+# The interval in seconds, the code and the data of the event `text` on line `line`.
+fn read_event(line: Int, text: String) -> (Float, String, String) fails CastError {
+  parse(line, text) match {
+    Items([Number(n), Text(code), Text(data)]) -> {
+      interval = n.to_float()
+      if interval < 0.0 { fail CastError(line:, message: "the interval is negative") }
+      (interval, code, data)
+    }
+    _ -> fail CastError(line:, message: "an event is [interval, code, data]")
+  }
+}
+
+# The JSON value `text` on line `line`.
+fn parse(line: Int, text: String) -> Dynamic fails CastError {
+  Json.parse(text) escape {
+    SyntaxError(message:, ..) -> fail CastError(line:, message: "invalid JSON: #{message}")
   }
 }
