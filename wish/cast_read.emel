@@ -1,0 +1,567 @@
+# wish-target: src/cast.emel
+# Cast の reader（asciicast v3）。writer（header、writer、event）は既にこの module にあり、ここには reader の部分だけを書く。
+
+import Std.Json
+import Std.Dynamic.{Dynamic}
+
+pub type Header(cols: Int, rows: Int, json: Dynamic)  # json は header の全体
+
+# Int は録画の始まりからのミリ秒
+pub enum Event {
+  Output(Int, String)
+  | Input(Int, String)
+  | Marker(Int, String)
+  | Exit(Int, String)
+}
+
+pub error CastError(line: Int, message: String)
+
+pub fn read(text: String) -> (Header, List[Event]) fails CastError {
+  match String.lines(text) |> List.enumerate(from: 1) {
+    [] -> fail CastError(1, "the cast is empty")
+    [(n, first), ..rest] -> (read_header(n, first), read_events(rest))
+  }
+}
+
+fn parse(line: Int, s: String) -> Dynamic fails CastError {
+  match Json.parse(s) {
+    Ok(json) -> json
+    Err(e) -> fail CastError(line, "invalid JSON: ${e.message}")
+  }
+}
+
+fn read_header(line: Int, s: String) -> Header fails CastError {
+  let json = parse(line, s)
+  if !Dynamic.is_object(json) {
+    fail CastError(line, "the header is not a JSON object")
+  }
+  match json.version?.as_int {
+    Some(3) -> ()
+    Some(v) -> fail CastError(line, "only asciicast v3 is supported (this is version ${v}; asciinema convert -f asciicast-v3 can convert it)")
+    None -> fail CastError(line, "only asciicast v3 is supported (this is version ${json.version}; asciinema convert -f asciicast-v3 can convert it)")
+  }
+  match (json.term?.cols?.as_int, json.term?.rows?.as_int) {
+    (Some(cols), Some(rows)) if cols >= 1 && rows >= 1 -> Header(cols, rows, json)
+    _ -> fail CastError(line, "the header needs term.cols and term.rows of at least 1")
+  }
+}
+
+# interval は Float の秒のまま足し、各イベントでその和をミリ秒に丸める。
+# 知らないコードのイベントも時刻は進める（interval は前のイベントからの差）。
+fn read_events(lines: List[(Int, String)]) -> List[Event] fails CastError {
+  let (_, events) = List.fold(lines, (0.0, []), fn((clock, events), (n, s)) {
+    if s == "" || String.starts_with(s, "#") {
+      (clock, events)
+    } else {
+      let (interval, code, data) = read_event(n, s)
+      let now = clock + interval
+      let at = Float.round(now * 1000.0) |> Float.to_int
+      match code {
+        "o" -> (now, [Output(at, data), ..events])
+        "i" -> (now, [Input(at, data), ..events])
+        "m" -> (now, [Marker(at, data), ..events])
+        "x" -> (now, [Exit(at, data), ..events])
+        "r" -> fail CastError(n, "resize events are not supported")
+        _ -> (now, events)
+      }
+    }
+  })
+  List.reverse(events)
+}
+
+fn read_event(line: Int, s: String) -> (Float, String, String) fails CastError {
+  match parse(line, s).as_list {
+    Some([i, c, d]) -> match (i.as_number, c.as_string, d.as_string) {
+      (Some(interval), Some(code), Some(data)) if interval >= 0.0 -> (interval, code, data)
+      (Some(_), Some(_), Some(_)) -> fail CastError(line, "the interval is negative")
+      _ -> fail CastError(line, "an event is [interval, code, data]")
+    }
+    _ -> fail CastError(line, "an event is [interval, code, data]")
+  }
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0105]: unrecognized character `?`
+#     ╭─[ src/cast.emel:38:21 ]
+#     │
+#  38 │   match json.version?.as_int {
+#     │                     ┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `?`
+#     ╭─[ src/cast.emel:43:19 ]
+#     │
+#  43 │   match (json.term?.cols?.as_int, json.term?.rows?.as_int) {
+#     │                   ┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `?`
+#     ╭─[ src/cast.emel:43:25 ]
+#     │
+#  43 │   match (json.term?.cols?.as_int, json.term?.rows?.as_int) {
+#     │                         ┬  
+#     │                         ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `?`
+#     ╭─[ src/cast.emel:43:44 ]
+#     │
+#  43 │   match (json.term?.cols?.as_int, json.term?.rows?.as_int) {
+#     │                                            ┬  
+#     │                                            ╰── 
+# ────╯
+#
+# error[E0105]: unrecognized character `?`
+#     ╭─[ src/cast.emel:43:50 ]
+#     │
+#  43 │   match (json.term?.cols?.as_int, json.term?.rows?.as_int) {
+#     │                                                  ┬  
+#     │                                                  ╰── 
+# ────╯
+#
+# error[E0110]: expected variant name
+#     ╭─[ src/cast.emel:12:3 ]
+#     │
+#  12 │   | Input(Int, String)
+#     │   ┬  
+#     │   ╰── 
+# ────╯
+#
+# error[E0110]: expected `,` or newline between variants
+#     ╭─[ src/cast.emel:12:5 ]
+#     │
+#  12 │   | Input(Int, String)
+#     │     ──┬──  
+#     │       ╰──── 
+# ────╯
+#
+# error[E0110]: expected variant name
+#     ╭─[ src/cast.emel:13:3 ]
+#     │
+#  13 │   | Marker(Int, String)
+#     │   ┬  
+#     │   ╰── 
+# ────╯
+#
+# error[E0110]: expected `,` or newline between variants
+#     ╭─[ src/cast.emel:13:5 ]
+#     │
+#  13 │   | Marker(Int, String)
+#     │     ───┬──  
+#     │        ╰──── 
+# ────╯
+#
+# error[E0110]: expected variant name
+#     ╭─[ src/cast.emel:14:3 ]
+#     │
+#  14 │   | Exit(Int, String)
+#     │   ┬  
+#     │   ╰── 
+# ────╯
+#
+# error[E0110]: expected `,` or newline between variants
+#     ╭─[ src/cast.emel:14:5 ]
+#     │
+#  14 │   | Exit(Int, String)
+#     │     ──┬─  
+#     │       ╰─── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/cast.emel:20:3 ]
+#     │
+#  20 │   match String.lines(text) |> List.enumerate(from: 1) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/cast.emel:27:3 ]
+#     │
+#  27 │   match Json.parse(s) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/cast.emel:34:3 ]
+#     │
+#  34 │   let json = parse(line, s)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/cast.emel:34:7 ]
+#     │
+#  34 │   let json = parse(line, s)
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/cast.emel:38:3 ]
+#     │
+#  38 │   match json.version?.as_int {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0110]: expected `{`
+#     ╭─[ src/cast.emel:38:21 ]
+#     │
+#  38 │   match json.version?.as_int {
+#     │                     ┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/cast.emel:38:21 ]
+#     │
+#  38 │   match json.version?.as_int {
+#     │                     ┬  
+#     │                     ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/cast.emel:43:3 ]
+#     │
+#  43 │   match (json.term?.cols?.as_int, json.term?.rows?.as_int) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/cast.emel:43:19 ]
+#     │
+#  43 │   match (json.term?.cols?.as_int, json.term?.rows?.as_int) {
+#     │                   ┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0110]: expected `{`
+#     ╭─[ src/cast.emel:43:19 ]
+#     │
+#  43 │   match (json.term?.cols?.as_int, json.term?.rows?.as_int) {
+#     │                   ┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/cast.emel:43:19 ]
+#     │
+#  43 │   match (json.term?.cols?.as_int, json.term?.rows?.as_int) {
+#     │                   ┬  
+#     │                   ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/cast.emel:52:3 ]
+#     │
+#  52 │   let (_, events) = List.fold(lines, (0.0, []), fn((clock, events), (n, s)) {
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/cast.emel:52:7 ]
+#     │
+#  52 │   let (_, events) = List.fold(lines, (0.0, []), fn((clock, events), (n, s)) {
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/cast.emel:73:3 ]
+#     │
+#  73 │   match parse(line, s).as_list {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/cast.emel:74:24 ]
+#     │
+#  74 │     Some([i, c, d]) -> match (i.as_number, c.as_string, d.as_string) {
+#     │                        ──┬──  
+#     │                          ╰──── 
+# ────╯
+#
+# error[E0212]: module `String` has no `lines`
+#     ╭─[ src/cast.emel:20:16 ]
+#     │
+#  20 │   match String.lines(text) |> List.enumerate(from: 1) {
+#     │                ──┬──  
+#     │                  ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Ok` in this scope
+#     ╭─[ src/cast.emel:28:5 ]
+#     │
+#  28 │     Ok(json) -> json
+#     │     ─┬  
+#     │      ╰── 
+# ────╯
+#
+# error[E0211]: cannot find constructor `Err` in this scope
+#     ╭─[ src/cast.emel:29:5 ]
+#     │
+#  29 │     Err(e) -> fail CastError(line, "invalid JSON: ${e.message}")
+#     │     ─┬─  
+#     │      ╰─── 
+# ────╯
+#
+# error[E0212]: module `Std.Dynamic` has no `is_object`
+#     ╭─[ src/cast.emel:35:15 ]
+#     │
+#  35 │   if !Dynamic.is_object(json) {
+#     │               ────┬────  
+#     │                   ╰────── 
+# ────╯
+#    = help: did you mean `object`?
+#
+# error[E0211]: cannot find value `json` in this scope
+#     ╭─[ src/cast.emel:35:25 ]
+#     │
+#  35 │   if !Dynamic.is_object(json) {
+#     │                         ──┬─  
+#     │                           ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `json` in this scope
+#     ╭─[ src/cast.emel:38:9 ]
+#     │
+#  38 │   match json.version?.as_int {
+#     │         ──┬─  
+#     │           ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `json` in this scope
+#     ╭─[ src/cast.emel:43:10 ]
+#     │
+#  43 │   match (json.term?.cols?.as_int, json.term?.rows?.as_int) {
+#     │          ──┬─  
+#     │            ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `events` in this scope
+#     ╭─[ src/cast.emel:69:16 ]
+#     │
+#  69 │   List.reverse(events)
+#     │                ───┬──  
+#     │                   ╰──── 
+# ────╯
+#
+# error[E0212]: module `Cast` has no `Writer`
+#     ╭─[ src/recorder/live.emel:11:14 ]
+#     │
+#  11 │ import Cast.{Writer}
+#     │              ───┬──  
+#     │                 ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find type `Writer` in this scope
+#     ╭─[ src/recorder/live.emel:47:11 ]
+#     │
+#  47 │   writer: Writer,
+#     │           ───┬──  
+#     │              ╰──── 
+# ────╯
+#    = help: did you mean `Driver`?
+#
+# error[E0212]: module `Cast` has no `writer`
+#     ╭─[ src/recorder/live.emel:58:18 ]
+#     │
+#  58 │     writer: Cast.writer(),
+#     │                  ───┬──  
+#     │                     ╰──── 
+# ────╯
+#
+# error[E0212]: module `Cast` has no `header`
+#     ╭─[ src/recorder/live.emel:70:34 ]
+#     │
+#  70 │     (use Stdout).print_line(Cast.header(cols, rows, command))
+#     │                                  ───┬──  
+#     │                                     ╰──── 
+# ────╯
+#
+# error[E0212]: module `Cast` has no `event`
+#      ╭─[ src/recorder/live.emel:184:25 ]
+#      │
+#  184 │   (writer, line) = Cast.event(r.writer, at_ms, code, data)
+#      │                         ──┬──  
+#      │                           ╰──── 
+# ─────╯
+#
+# error[E0212]: module `Cast` has no `event`
+#    ╭─[ test/cast_test.emel:5:20 ]
+#    │
+#  5 │   (_, line) = Cast.event(Cast.writer(), 0, "o", data)
+#    │                    ──┬──  
+#    │                      ╰──── 
+# ───╯
+#
+# error[E0212]: module `Cast` has no `writer`
+#    ╭─[ test/cast_test.emel:5:31 ]
+#    │
+#  5 │   (_, line) = Cast.event(Cast.writer(), 0, "o", data)
+#    │                               ───┬──  
+#    │                                  ╰──── 
+# ───╯
+#
+# error[E0212]: module `Cast` has no `header`
+#     ╭─[ test/cast_test.emel:11:15 ]
+#     │
+#  11 │   assert Cast.header(80, 24, "vim notes.md")
+#     │               ───┬──  
+#     │                  ╰──── 
+# ────╯
+#
+# error[E0212]: module `Cast` has no `header`
+#     ╭─[ test/cast_test.emel:13:15 ]
+#     │
+#  13 │   assert Cast.header(20, 3, "sh -c \"a\"")
+#     │               ───┬──  
+#     │                  ╰──── 
+# ────╯
+#
+# error[E0212]: module `Cast` has no `event`
+#     ╭─[ test/cast_test.emel:19:20 ]
+#     │
+#  19 │   (w, line) = Cast.event(Cast.writer(), 0, "o", "x")
+#     │                    ──┬──  
+#     │                      ╰──── 
+# ────╯
+#
+# error[E0212]: module `Cast` has no `writer`
+#     ╭─[ test/cast_test.emel:19:31 ]
+#     │
+#  19 │   (w, line) = Cast.event(Cast.writer(), 0, "o", "x")
+#     │                               ───┬──  
+#     │                                  ╰──── 
+# ────╯
+#
+# error[E0212]: module `Cast` has no `event`
+#     ╭─[ test/cast_test.emel:21:20 ]
+#     │
+#  21 │   (w, line) = Cast.event(w, 100, "o", "x")
+#     │                    ──┬──  
+#     │                      ╰──── 
+# ────╯
+#
+# error[E0212]: module `Cast` has no `event`
+#     ╭─[ test/cast_test.emel:23:20 ]
+#     │
+#  23 │   (w, line) = Cast.event(w, 1234, "o", "x")
+#     │                    ──┬──  
+#     │                      ╰──── 
+# ────╯
+#
+# error[E0212]: module `Cast` has no `event`
+#     ╭─[ test/cast_test.emel:25:20 ]
+#     │
+#  25 │   (w, line) = Cast.event(w, 1234, "o", "x")
+#     │                    ──┬──  
+#     │                      ╰──── 
+# ────╯
+#
+# error[E0212]: module `Cast` has no `event`
+#     ╭─[ test/cast_test.emel:27:20 ]
+#     │
+#  27 │   (_, line) = Cast.event(w, 61000, "o", "x")
+#     │                    ──┬──  
+#     │                      ╰──── 
+# ────╯
+#
+# error[E0212]: module `Cast` has no `event`
+#     ╭─[ test/cast_test.emel:33:20 ]
+#     │
+#  33 │   (_, line) = Cast.event(Cast.writer(), 5, "x", "0")
+#     │                    ──┬──  
+#     │                      ╰──── 
+# ────╯
+#
+# error[E0212]: module `Cast` has no `writer`
+#     ╭─[ test/cast_test.emel:33:31 ]
+#     │
+#  33 │   (_, line) = Cast.event(Cast.writer(), 5, "x", "0")
+#     │                               ───┬──  
+#     │                                  ╰──── 
+# ────╯
+#
+# error[E0306]: no parameter named `from` in `enumerate`
+#     ╭─[ src/cast.emel:20:46 ]
+#     │
+#  20 │   match String.lines(text) |> List.enumerate(from: 1) {
+#     │                                              ──┬─  
+#     │                                                ╰─── 
+# ────╯
+#
+# error[E0318]: error `SyntaxError` is not declared in `fails`
+#     ╭─[ src/cast.emel:27:9 ]
+#     │
+#  27 │   match Json.parse(s) {
+#     │         ──────┬──────  
+#     │               ╰──────── 
+# ────╯
+#    = help: add it to `fails` or handle it with `escape`
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/cast.emel:29:5 ]
+#     │
+#  29 │     Err(e) -> fail CastError(line, "invalid JSON: ${e.message}")
+#     │     ───┬──  
+#     │        ╰──── 
+# ────╯
+#
+# error[E0313]: type `Dynamic` has no field or function `as_list`
+#     ╭─[ src/cast.emel:73:24 ]
+#     │
+#  73 │   match parse(line, s).as_list {
+#     │                        ───┬───  
+#     │                           ╰───── 
+# ────╯
+#
+# error[E0314]: the type of this value must be known to access field `as_number`
+#     ╭─[ src/cast.emel:74:33 ]
+#     │
+#  74 │     Some([i, c, d]) -> match (i.as_number, c.as_string, d.as_string) {
+#     │                                 ────┬────  
+#     │                                     ╰────── 
+# ────╯
+#    = help: add a type annotation
+#
+# error[E0314]: the type of this value must be known to access field `as_string`
+#     ╭─[ src/cast.emel:74:46 ]
+#     │
+#  74 │     Some([i, c, d]) -> match (i.as_number, c.as_string, d.as_string) {
+#     │                                              ────┬────  
+#     │                                                  ╰────── 
+# ────╯
+#    = help: add a type annotation
+#
+# error[E0314]: the type of this value must be known to access field `as_string`
+#     ╭─[ src/cast.emel:74:59 ]
+#     │
+#  74 │     Some([i, c, d]) -> match (i.as_number, c.as_string, d.as_string) {
+#     │                                                           ────┬────  
+#     │                                                               ╰────── 
+# ────╯
+#    = help: add a type annotation
+#
+# warning[W0301]: unreachable match arm
+#     ╭─[ src/cast.emel:77:7 ]
+#     │
+#  77 │       _ -> fail CastError(line, "an event is [interval, code, data]")
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# 57 errors, 3 warnings
+# --- end wish check ---
