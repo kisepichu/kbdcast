@@ -80,7 +80,12 @@ fn fit(marks: List[String], cols: Int) -> Option[String] {
     _ if width(whole) <= cols -> Some(whole)
     # The oldest marks dropped: the newest that fit with ` …` and ` `, which take 3 columns.
     _ -> ends(marks, cols - 3) match {
-      []     -> marks.last().and_then(|last| right_end(last, cols))
+      # FRICTION(040): Option has no `expect`, and the empty `marks` went to the first arm, so the
+      # None that cannot happen is a match with a panic.
+      [] -> marks.last() match {
+        Some(last) -> right_end(last, cols)
+        None       -> panic("no last mark, but the marks are not empty")
+      }
       newest -> Some(" …#{newest.join("")} ")
     }
   }
