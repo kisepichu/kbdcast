@@ -1,0 +1,230 @@
+import Std.Bytes
+import Std.Json.{SyntaxError}
+import Std.Dynamic.{Items, Text}
+import Brix.Pbt.Gen.{Gen}
+import Brix.Pbt.Property
+import Cast.{CastError, Header, Event, Output, Input, Marker, Exit}
+import Overlay
+import Overlay.Strip
+import Key.Decode
+import Vt
+import Vt.Screen.{Cell}
+import VtGolden.{CASES}
+import Cut
+
+# The header of the fixed examples: a terminal of 6 columns and 2 rows.
+const HEADER: String = "{\"version\": 3, \"term\": {\"cols\": 6, \"rows\": 2}}"
+
+# The header `text` as `Cast.read` reads it.
+fn header(text: String) -> Header fails CastError {
+  (h, _) = Cast.read(text)
+  h
+}
+
+# The lines that `step` writes for each of `events` in turn from the `start` of HEADER, and the
+# lines of `finish` after them.
+fn run(events: List[Event]) -> (List[List[String]], List[String]) fails CastError {
+  (o, _) = Overlay.start(header(HEADER))
+  (o, steps) = events.fold((o, []), |(o, steps), e| {
+    (next, lines) = Overlay.step(o, e)
+    (next, steps.append([lines]))
+  })
+  (steps, Overlay.finish(o))
+}
+
+# The line of the event `code` with `data`, `interval_ms` after the event before it.
+fn line(interval_ms: Int, code: String, data: String) -> String {
+  (_, written) = Cast.event(Cast.writer(), interval_ms, code, data)
+  written
+}
+
+# The code and the data of the event line `l`.
+fn event_of(l: String) -> (String, String) fails SyntaxError {
+  Json.parse(l) match {
+    Items([_, Text(code), Text(data)]) -> (code, data)
+    _                                  -> panic("not an event line: #{l}")
+  }
+}
+
+# `t` after the output `s`, without the replies.
+fn fed(t: Vt.Terminal, s: String) -> Vt.Terminal {
+  (next, _) = Vt.feed(t, s)
+  next
+}
+
+# `t` after the data of the `o` events among `lines`, in order.
+fn fed_lines(t: Vt.Terminal, lines: List[String]) -> Vt.Terminal fails SyntaxError {
+  lines.fold(t, |t, l| {
+    (code, data) = event_of(l)
+    if code == "o" { fed(t, data) } else { t }
+  })
+}
+
+@test
+fn start_writes_the_header_with_one_more_row() {
+  (_, written) = Overlay.start(header(HEADER))
+  assert Json.parse(written) == Json.parse("{\"version\": 3, \"term\": {\"cols\": 6, \"rows\": 3}}")
+}
+
+@test
+fn step_writes_the_rows_that_change_with_the_cursor_and_finish_clears_the_strip() {
+  (steps, last) = run(
+    [Output(0, "ab"), Input(100, "x"), Output(200, ""), Output(200, "c"), Marker(300, "m1")],
+  )
+  assert steps
+    == [
+      [line(0, "o", "\u{1b}[1;1H\u{1b}[0mab    \u{1b}[0m\u{1b}[1;3H")],
+      [line(100, "o", "\u{1b}[3;1H\u{1b}[0;7m x \u{1b}[0m   \u{1b}[0m\u{1b}[1;3H")],
+      [],
+      [line(100, "o", "\u{1b}[1;1H\u{1b}[0mabc   \u{1b}[0m\u{1b}[1;4H")],
+      [line(100, "m", "m1")],
+    ]
+  # The strip clears 1500 ms after the last mark, at 1600.
+  assert last == [line(1300, "o", "\u{1b}[3;1H\u{1b}[0m      \u{1b}[0m\u{1b}[1;4H")]
+}
+
+@test
+fn step_first_clears_a_strip_that_fades_before_the_event() {
+  (steps, _) = run([Input(0, "a"), Output(2000, "z")])
+  assert steps.get(1)
+    == Some(
+      [
+        line(1500, "o", "\u{1b}[3;1H\u{1b}[0m      \u{1b}[0m\u{1b}[1;1H"),
+        line(500, "o", "\u{1b}[1;1H\u{1b}[0mz     \u{1b}[0m\u{1b}[1;2H"),
+      ],
+    )
+}
+
+@test
+fn step_writes_the_cursor_alone_when_only_its_visibility_changes() {
+  (steps, _) = run([Output(0, "\u{1b}[?25l")])
+  assert steps == [[line(0, "o", "\u{1b}[1;1H\u{1b}[?25l")]]
+}
+
+@test
+fn a_row_sets_the_attributes_and_the_colors_of_its_cells() {
+  (steps, _) = run([Output(0, "\u{1b}[1;31;44mA\u{1b}[0m")])
+  assert steps
+    == [[line(0, "o", "\u{1b}[1;1H\u{1b}[0;1;31;44mA\u{1b}[0m     \u{1b}[0m\u{1b}[1;2H")]]
+}
+
+@test
+fn a_row_writes_a_256_color_and_an_rgb_color_in_their_extended_forms() {
+  (steps, _) = run([Output(0, "\u{1b}[38;5;196m\u{1b}[48;2;1;2;3mB")])
+  prefix = "\u{1b}[1;1H\u{1b}[0;38;5;196;48;2;1;2;3mB"
+  # One `o` event, whose data starts with `prefix`.
+  assert steps.flatten().map(event_of).map(|(code, data)| (code, data.starts_with(prefix)))
+    == [("o", True)]
+}
+
+@test
+fn a_row_writes_a_wide_character_once() {
+  (steps, _) = run([Output(0, "あ")])
+  assert steps == [[line(0, "o", "\u{1b}[1;1H\u{1b}[0mあ    \u{1b}[0m\u{1b}[1;3H")]]
+}
+
+@test
+fn step_writes_an_exit_as_it_is() {
+  (steps, _) = run([Input(0, "x"), Exit(10, "0")])
+  assert steps.get(1) == Some([line(10, "x", "0")])
+}
+
+@test
+fn step_marks_a_paste_as_one_mark() {
+  (steps, _) = run([Input(0, "\u{1b}[200~hi\u{1b}[201~")])
+  drawn = fed_lines(Vt.new(6, 3), steps.flatten())
+  assert Vt.lines(drawn).drop(2) == [Strip.row(["<Paste>"], 6)]
+}
+
+# The golden case at `index`, which is less than the number of cases.
+# FRICTION(040): Option has no `expect`, so the None that cannot happen is a match with a panic.
+fn golden(index: Int) -> (String, Int, Int, String, String) {
+  CASES.get(index) match {
+    Some(case) -> case
+    None       -> panic("there is no golden case #{index}")
+  }
+}
+
+# A golden case by its index, where to cut its input (at most 3 positions, which `Cut.pieces` takes
+# modulo the length), and what to type after each piece (a number for `typed`).
+# FRICTION(028): brix has no `element` nor `and_then`, so the case is drawn as its index, the count
+# of the cuts apart from the positions that `Cut.cuts` draws, and the inputs as numbers.
+fn golden_inputs() -> Gen[(Int, (List[Int], List[Int]))] {
+  cuts = Gen.pair(Gen.int_between(0, 3), Cut.cuts()) |> Gen.map(|(count, at)| at.take(count))
+  key = Gen.int_between(0, 4)
+  keys = Gen.pair(key, Gen.pair(key, Gen.pair(key, key)))
+    |> Gen.map(|(a, (b, (c, d)))| [a, b, c, d])
+  Gen.pair(Gen.int_between(0, CASES.length() - 1), Gen.pair(cuts, keys))
+}
+
+# What the property types after an output, by `key` from 0 to 4: nothing, `a`, Enter, Esc or Up.
+# FRICTION(028): brix has no `element`, so the input is drawn as a number and picked here.
+fn typed(key: Int) -> List[String] {
+  key match {
+    1 -> ["a"]
+    2 -> ["\r"]
+    3 -> ["\u{1b}"]
+    4 -> ["\u{1b}[A"]
+    _ -> []
+  }
+}
+
+# The `pieces` as outputs, each followed by what its number in `keys` types, 10 ms apart from 0.
+fn events(pieces: List[String], keys: List[Int]) -> List[Event] {
+  made = List.zip(pieces, keys).flat_map(|(piece, key)| {
+    [|t| Output(t, piece), ..typed(key).map(|s| |t| Input(t, s))]
+  })
+  made.enumerate().map(|(i, make)| make(i * 10))
+}
+
+# What the terminal `drawn` shows of the overlay of a terminal of `rows` rows: the rows of the
+# application, the strip row, and the cursor.
+fn seen(drawn: Vt.Terminal, rows: Int) -> (List[List[Cell]], List[List[Cell]], Option[(Int, Int)]) {
+  lines = Vt.lines(drawn)
+  (lines.take(rows), lines.drop(rows), Vt.cursor(drawn))
+}
+
+# What the overlay should show for the application's terminal `app` and the strip's `marks`: the
+# screen of `app`, the row of `marks`, and the cursor of `app` with its column at most `cols - 1`.
+fn expected(
+  app: Vt.Terminal,
+  marks: List[String],
+) -> (List[List[Cell]], List[List[Cell]], Option[(Int, Int)]) {
+  (cols, _) = Vt.size(app)
+  (
+    Vt.lines(app),
+    [Strip.row(marks, cols)],
+    Vt.cursor(app).map(|(col, row)| (Int.min(col, cols - 1), row)),
+  )
+}
+
+# A golden input, cut into 1 to 4 outputs with inputs between them, 10 ms apart: after each event,
+# feeding the data of the overlay's `o` events so far to a terminal one row taller shows the screen
+# that the outputs so far make, the strip of the inputs so far, and the cursor. After `finish`, the
+# strip is cleared.
+@test
+fn the_overlay_draws_the_screen_the_strip_and_the_cursor_after_every_event() {
+  Property.check(golden_inputs(), |(index, (at, keys))| {
+    (_, cols, rows, input, _) = golden(index)
+    (o, _) = Overlay.start(
+      header("{\"version\": 3, \"term\": {\"cols\": #{cols}, \"rows\": #{rows}}}"),
+    )
+    start = (o, Vt.new(cols, rows + 1), Vt.new(cols, rows), Strip.strip())
+    (o, drawn, app, _) = events(Cut.pieces(input, at), keys).fold(
+      start,
+      |(o, drawn, app, strip), e| {
+        (o, lines) = Overlay.step(o, e)
+        drawn = fed_lines(drawn, lines)
+        (app, strip, t) = e match {
+          Output(t, s) -> (fed(app, s), strip, t)
+          Input(t, s)  -> (app, Strip.press(strip, t, Decode.decode(Bytes.encode_utf8(s))), t)
+          Marker(t, _) -> (app, strip, t)
+          Exit(t, _)   -> (app, strip, t)
+        }
+        assert seen(drawn, rows) == expected(app, Strip.marks(strip, t))
+        (o, drawn, app, strip)
+      },
+    )
+    assert seen(fed_lines(drawn, Overlay.finish(o)), rows) == expected(app, [])
+  })
+}

@@ -1,0 +1,220 @@
+# The overlay: a cast with the screen of the application and, in one more row under it, the strip
+# of the keys pressed. Each event of the cast that it reads updates a VT of the application's size
+# and the strip, and the cast that it writes draws again only the rows of the screen and the strip
+# that changed since the last drawing, then the cursor where the VT has it.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
+
+import Std.Bytes
+import Std.Json
+import Std.Dynamic.{Dynamic, Encode, Fields}
+import Cast.{Header, Event, Output, Input, Marker, Exit, Writer}
+import Overlay.Strip.{Strip}
+import Key.Decode
+import Vt
+import Vt.Screen.{Cell, Pen, Color, Indexed, Rgb, Normal, Bold, Faint, WideTail}
+
+## The composition so far: the VT of the application, the strip, the Writer of the output, the
+## time of the last drawing, and what the output has drawn: the rows (the application's and the
+## strip's), the cursor (its column at most `cols - 1`) and whether the cursor is visible.
+pub opaque type Overlay(
+  vt: Vt.Terminal,
+  strip: Strip,
+  writer: Writer,
+  now: Int,
+  shown: List[List[Cell]],
+  cursor: (Int, Int),
+  visible: Bool,
+)
+
+## The overlay of a cast with the header `h`, before its first event, and the header line of the
+## output, without a newline: the header `h.json` with `term.rows` one more.
+pub fn start(h: Header) -> (Overlay, String) {
+  vt = Vt.new(h.cols, h.rows)
+  strip = Strip.strip()
+  # The terminal of the output starts as a new VT does: blank, with a visible cursor at the top left.
+  (shown, cursor) = drawing(vt, strip, 0)
+  o = Overlay(
+    vt:,
+    strip:,
+    writer: Cast.writer(),
+    now: 0,
+    shown:,
+    cursor:,
+    visible: Vt.cursor(vt).is_some(),
+  )
+  (o, Json.to_string(with_rows(h.json, h.rows + 1)))
+}
+
+## The overlay after the event `e`, and the lines of the output for it, without newlines. If the
+## strip clears before `e`, the drawing at that time comes first. An output updates the VT (its
+## replies are dropped) and an input the strip, and the drawing at the time of `e` follows if
+## anything changed. A marker and an exit are written as they are. An input is not written.
+pub fn step(o: Overlay, e: Event) -> (Overlay, List[String]) {
+  t = time(e)
+  (o, cleared) = clear_until(o, t)
+  (o, passed) = e match {
+    Output(_, s) -> {
+      (vt, _) = Vt.feed(o.vt, s)
+      (Overlay(vt:, ..o), [])
+    }
+    Input(_, s) -> (
+      Overlay(strip: Strip.press(o.strip, t, Decode.decode(Bytes.encode_utf8(s))), ..o),
+      [],
+    )
+    Marker(_, s) -> write(o, t, "m", s)
+    Exit(_, s) -> write(o, t, "x", s)
+  }
+  (o, drawn) = compose(o, t)
+  (o, List.flatten([cleared, passed, drawn]))
+}
+
+## The lines of the output after the last event: if the strip is shown, the drawing at the time it
+## clears.
+pub fn finish(o: Overlay) -> List[String] {
+  clear_time(o) match {
+    Some(c) -> {
+      (_, lines) = compose(o, c)
+      lines
+    }
+    None -> []
+  }
+}
+
+# The time of `e`, in milliseconds from the start of the recording.
+# FRICTION(015): there is no or-pattern, so each variant has an arm of its own with the same body.
+fn time(e: Event) -> Int {
+  e match {
+    Output(t, _) -> t
+    Input(t, _)  -> t
+    Marker(t, _) -> t
+    Exit(t, _)   -> t
+  }
+}
+
+# `json`, a header that `Cast.read` read, with `term.rows` set to `rows`.
+# FRICTION(085): Std.Dynamic has no way to set the value at a path, so the header and its `term`
+# are opened as Maps, the value is put in, and both are built again. `Cast.read` checked that both
+# are objects, but a Dynamic does not keep that, so the other shapes are defects.
+fn with_rows(json: Dynamic, rows: Int) -> Dynamic {
+  json match {
+    Fields(header) -> header.get("term") match {
+      Some(Fields(term)) -> Fields(
+        header.insert("term", Fields(term.insert("rows", Encode.to_dynamic(rows)))),
+      )
+      _ -> panic("the header has no term object: #{Json.to_string(json)}")
+    }
+    _ -> panic("the header is not a JSON object: #{Json.to_string(json)}")
+  }
+}
+
+# When the strip clears, if it is shown at the time of the last drawing.
+fn clear_time(o: Overlay) -> Option[Int] {
+  Strip.clears_at(o.strip) match {
+    Some(c) if c > o.now -> Some(c)
+    _                    -> None
+  }
+}
+
+# The drawing at the time the strip clears, if that is not after `t`.
+fn clear_until(o: Overlay, t: Int) -> (Overlay, List[String]) {
+  clear_time(o) match {
+    Some(c) if c <= t -> compose(o, c)
+    _                 -> (o, [])
+  }
+}
+
+fn write(o: Overlay, t: Int, code: String, data: String) -> (Overlay, List[String]) {
+  (writer, line) = Cast.event(o.writer, t, code, data)
+  (Overlay(writer:, ..o), [line])
+}
+
+# The rows of the VT `vt` and of the strip `s` at `t`, and the cursor of `vt` with its column at
+# most `cols - 1`.
+fn drawing(vt: Vt.Terminal, s: Strip, t: Int) -> (List[List[Cell]], (Int, Int)) {
+  (cols, _) = Vt.size(vt)
+  (col, row) = Vt.cursor_position(vt)
+  (Vt.lines(vt).append([Strip.row(Strip.marks(s, t), cols)]), (Int.min(col, cols - 1), row))
+}
+
+# The drawing at `t`: one `o` event with the rows that changed, from the top, then the cursor, and
+# whether it is visible if that changed. Nothing if nothing changed.
+fn compose(o: Overlay, t: Int) -> (Overlay, List[String]) {
+  (screen, cursor) = drawing(o.vt, o.strip, t)
+  visible = Vt.cursor(o.vt).is_some()
+  changed = List.zip(o.shown, screen).enumerate().filter_map(|(i, (old, new))| {
+    if old == new { None } else { Some(draw_row(i, new)) }
+  })
+  o = Overlay(now: t, ..o)
+  if changed.is_empty() && cursor == o.cursor && visible == o.visible {
+    (o, [])
+  } else {
+    (col, row) = cursor
+    dectcem = if visible == o.visible {
+      ""
+    } else if visible {
+      "\u{1b}[?25h"
+    } else {
+      "\u{1b}[?25l"
+    }
+    data = "#{String.concat(changed)}\u{1b}[#{row + 1};#{col + 1}H#{dectcem}"
+    write(Overlay(shown: screen, cursor:, visible:, ..o), t, "o", data)
+  }
+}
+
+# The row `i` (from 0) with `cells`: a CUP to its start, then each cell's character, after an SGR
+# where the pen is not that of the cell before it, and the default pen at the end. The right half of
+# a wide character is not written.
+fn draw_row(i: Int, cells: List[Cell]) -> String {
+  written = cells.filter(|c| c.occupancy != WideTail)
+  before = [None, ..written.map(|c| Some(c.pen))]
+  parts = List.zip(before, written).map(|(pen, c)| {
+    if pen == Some(c.pen) { character(c.char) } else { "#{sgr(c.pen)}#{character(c.char)}" }
+  })
+  "\u{1b}[#{i + 1};1H#{String.concat(parts)}\u{1b}[0m"
+}
+
+# `CSI 0 m` and the attributes of `p`: the intensity, italic, underline, blink, inverse,
+# strikethrough, the foreground and the background.
+fn sgr(p: Pen) -> String {
+  attributes = List.flatten(
+    [
+      p.intensity match {
+        Normal -> []
+        Bold   -> ["1"]
+        Faint  -> ["2"]
+      },
+      if p.italic { ["3"] } else { [] },
+      if p.underline { ["4"] } else { [] },
+      if p.blink { ["5"] } else { [] },
+      if p.inverse { ["7"] } else { [] },
+      if p.strikethrough { ["9"] } else { [] },
+      color(p.foreground, 30, 90, 38),
+      color(p.background, 40, 100, 48),
+    ],
+  )
+  "\u{1b}[#{["0", ..attributes].join(";")}m"
+}
+
+# The SGR parameters of the color `c`: `base + n` for the colors 0 to 7, `bright + n - 8` for 8 to
+# 15, `extended;5;n` for the other indexed colors and `extended;2;r;g;b` for RGB.
+fn color(c: Option[Color], base: Int, bright: Int, extended: Int) -> List[String] {
+  c match {
+    None                       -> []
+    Some(Indexed(n)) if n < 8  -> ["#{base + n}"]
+    Some(Indexed(n)) if n < 16 -> ["#{bright + n - 8}"]
+    Some(Indexed(n))           -> ["#{extended};5;#{n}"]
+    Some(Rgb(r, g, b))         -> ["#{extended};2;#{r};#{g};#{b}"]
+  }
+}
+
+# FRICTION(003): the code point of a cell is a scalar value, but `String.from_code_point` returns an
+# Option.
+# FRICTION(040): Option has no `expect`, so the None that cannot happen is a match with a panic.
+fn character(c: Int) -> String {
+  String.from_code_point(c) match {
+    Some(s) -> s
+    None    -> panic("a cell holds #{c}, which is not a scalar value")
+  }
+}
