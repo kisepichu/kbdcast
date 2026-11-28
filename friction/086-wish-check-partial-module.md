@@ -11,4 +11,4 @@
 - コスト: 既にある module の一部だけを書いた wish では、その module を import する module と test の診断が、wish の診断に混ざる（cast の reader では 60 のうち 17）。数を数えるメモでは手で除く必要があり、Task 1 では除かずに書いた。import する所が多い module ほど増える。数え方は、このメモでは warning も含める（cast の reader の 60、overlay の合成の 119 と同じ。キーの帯の 45 は error だけで、W0203 を含めると 46）。普段のコードに基盤レベルは漏れていない
 - spec: kbdcast の側だけ。`tools/wish.ts` の `checkWish`（`:65-66`。wish の本文を写しの `<wish-target>` に `writeFileSync` で書くので、既にある file は wish で置き換わる。足す形は選べない）。AGENTS.md 規則 1（wish は「推測の文法で『こう書きたい』コード」で、module の全体を書くとは決めていない）
 - 既存: 080（同じ道具の、依存が wish の時点の manifest に無いときの friction）。kbdcast の issue #12（closed。入れ子の新しい Pome の wish が黙って検査されない）と #21（open。080 の仮の Pome の依存）は、別の話題。2026-11-28、`gh issue list --repo kisepichu/kbdcast --state all --search wish` で検索し、一部の wish の話は無かった
-- 行き先: kbdcast の道具の friction（emela には出さない）。行き先は `tools/wish.ts`: wish の頭の注釈（`# wish-mode: extend` など）で、wish の本文を既にある module の後ろに足す形を選べるようにするか、置き換えたまま、wish-target の外の file の診断を印を付けた別の組にして書く。未着手
+- 行き先: kbdcast の道具の friction（emela には出さない）。行き先は `tools/wish.ts`: wish の頭の注釈（`# wish-mode: extend` など）で、wish の本文を既にある module の後ろに足す形を選べるようにするか、置き換えたまま、wish-target の外の file の診断を印を付けた別の組にして書く。kbdcast の issue #24 にした
