@@ -221,10 +221,11 @@ git commit --no-gpg-sign -m "feat: 最近のキーを vim の表記で並べる�
 
 **Files:**
 - Create: `wish/overlay.emel`、`src/overlay.emel`
-- Test: `test/overlay_test.emel`
+- Modify: `src/vt.emel`（`cursor_position` を足す。実装の中で決めた。ESCALATION 1）
+- Test: `test/overlay_test.emel`、`test/vt_test.emel`
 
 **Interfaces:**
-- Consumes: Task 1 の `Cast`（`Header`、`Event`、`writer`、`event`）、Task 2 の `Overlay.Strip`、3 の `Vt`、2 の `Key.Decode.decode`
+- Consumes: Task 1 の `Cast`（`Header`、`Event`、`writer`、`event`）、Task 2 の `Overlay.Strip`、3 の `Vt`（`cursor_position` を含む）、2 の `Key.Decode.decode`
 - Produces（module `Overlay`、`src/overlay.emel`）:
   - `pub opaque type Overlay`
   - `pub fn start(h: Header) -> (Overlay, String)`（出力の header の行。`h.json` の `term.rows` だけを rows + 1 にした JSON）
@@ -273,7 +274,7 @@ header: `start` の行を `Std.Json.parse` すると、`term.cols` が 6、`term
 | `Output(0, "\e[38;5;196m\e[48;2;1;2;3mB")` | 行は `\e[0;38;5;196;48;2;1;2;3mB` で始まる |
 | `Output(0, "あ")` | data は `\e[1;1H\e[0mあ    \e[0m\e[1;3H` |
 | `Input(0, "x")`、`Exit(10, "0")` | `Exit` の `step` の出力は `[0.010, "x", "0"]` の行だけ |
-| `Input(0, "\u{1b}[200~hi\u{1b}[201~")` | 帯の行は `[ <Paste> ]` |
+| `Input(0, "\u{1b}[200~hi\u{1b}[201~")` | 帯の行は `Strip.row(["<Paste>"], 6)`（`[…ste> ]`。` <Paste> ` は 9 列で入らない） |
 
 性質（brix の pbt）: 3 の `VtGolden.CASES` から行を選び、入力をランダムな位置で 1〜4 つの `Output` に分ける（時刻は 0 から 10 ms ずつ増やす）。間にランダムに `Input`（`a`、`\r`、`\u{1b}`、`\u{1b}[A` のどれか）を挟む。`start` から順に `step` し `finish` した出力のうち、`o` の data を順に `Vt.new(cols, rows + 1)` に `feed` する。各イベントの後で:
 
@@ -353,11 +354,11 @@ Expected: どれも終了コード 0。`/tmp/vim.keys.cast` の header の `term
 frame を PNG にして見る（`read` の tool で画像を開ける）:
 
 ```bash
-ffmpeg -loglevel error -y -i /tmp/vim.gif -vf "select=eq(n\,10)" -frames:v 1 /tmp/vim-typing.png
+ffmpeg -loglevel error -y -i /tmp/vim.gif -vf "select=eq(n\,5)" -frames:v 1 /tmp/vim-typing.png
 ffmpeg -loglevel error -y -i /tmp/vim.gif -vf reverse -frames:v 1 /tmp/vim-last.png
 ```
 
-（frame の番号は GIF の frame の数を見て、`ihello from kbdcast` を打っている途中の 1 枚を選ぶ。）
+（frame の番号は GIF の frame の数を見て、`ihello from kbdcast` を打っている途中の 1 枚を選ぶ。vim の GIF は 16 frame で、5 枚目が打っている途中だった。1 の vim の cast は `x` で終わらないので、`x` の後の `o` は、`x` を足した写しで確かめる。）
 
 確かめること: 打っている途中の frame の最後の行に、反転した `ihello<Space>from…` のようなキーの帯がある。最後の frame の画面は vim の `written` の行で、帯は消えているか `:wq<CR>` を含む（agg の `--last-frame-duration` の前の状態による）。全角の文字が化けていない（`examples/` に全角を打つ tape は無いので、使い捨ての tape で `> あ` を打って確かめてよい）。見たものを report に書き、使い捨てのファイルを消す。
 
@@ -365,7 +366,7 @@ ffmpeg -loglevel error -y -i /tmp/vim.gif -vf reverse -frames:v 1 /tmp/vim-last.
 
 - [ ] **Step 5: 検査して commit する**
 
-Run: `mise exec -- bun tools/check.ts --commit --test && mise exec -- bun test tools/test`
+Run: `mise exec -- bun tools/check.ts --commit --test && mise exec -- bun test tools/test && mise exec -- prek run --all-files`
 Expected: `tools/check: ok`
 
 ```bash
