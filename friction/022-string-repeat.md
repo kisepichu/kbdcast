@@ -7,6 +7,8 @@
   regex の program（`regex/src/program.emel` の `repeat`、計画の Task 6）で、回数付きの繰り返し（`e{n}`、`e{n,m}`、`e{n,}`）の本体の命令（`List[Inst]`）を n 個並べる
   regex の時間のテスト（`regex/test/linear_test.emel` の `replace_builds_its_result_in_time_proportional_to_the_matches`、最終レビューの修正）で、`replace` と `find_all` に当てる入力（`"a"` の 4000 個）を作る
   VT の parser のテスト（`test/parser_test.emel` の `advance_keeps_the_limits_of_avt_on_parameters`、サブプロジェクト 3 の計画の Task 3）で、avt の引数の数の上限（32）を越える CSI（`"1;"` の 32 個）と、期待する引数の List（`[1]` の 31 個）を作る
+  キーの帯（`src/overlay/strip.emel` の `blanks` と `right_end`、サブプロジェクト 4 の計画の Task 2）で、帯の行の残りを既定の pen の空白のセルで埋め、最後の印の右の端の前に、端が半分に切った全角の文字の代わりの空白を置く。テスト（`test/strip_test.emel` の `blanks`）でも、期待する空白のセルを並べる
+  overlay の合成（`src/overlay.emel` の `start`、サブプロジェクト 4 の計画の Task 3）で、前に書いた合成の画面の初めの値（cols × (rows + 1) の空白のセル。overlay の design spec の §6）を作る
 - こう書きたかった:
   テスト: `String.repeat("a", 1000)`（Python の `"a" * 1000`、JavaScript の `"a".repeat(1000)`、Rust の `"a".repeat(1000)`、Kotlin の `"a".repeat(1000)`）。時間のテストでは `String.repeat("a", 4000)`。wish には書いていない（テストのコード）
   ```emela
@@ -20,8 +22,12 @@
   }
   ```
   VT の parser のテスト: `String.repeat("1;", 32)` と `List.repeat([1], 31)`。wish には書いていない（テストのコード）
+  キーの帯: `wish/strip.emel:90` の `List.repeat(Cell(...), n)` と `:71` の `" ".repeat(cols - 2 - width(end))`（Rust、Kotlin の `repeat`）
+  overlay の合成: `wish/overlay.emel:26` の `List.repeat(Cell.blank, h.cols)`（空白のセルを cols 個）と `:34` の `List.repeat(blank, h.rows + 1)`（その行を rows + 1 個）
 - 診断:
   `emela check`（v0.28.2）の ``error[E0212]: module `String` has no `repeat` ``（4 か所に 1 つずつ）。help は付かない
+  キーの帯の wish check（v0.28.2）では、2 か所とも `=` で書いた関数の本体（020）の中にあり、届かなかった
+  overlay の合成の wish check（v0.28.2）では、2 か所とも `let`（004）の行か、`let` で崩れた `Overlay(...)` の引数の中にあり、届かなかった
 - 回避策:
   テストに `copies(s, n)` を足した（`regex/test/find_test.emel`、`FRICTION(022)` の印）
   ```emela
@@ -44,12 +50,20 @@
   semicolons = String.concat(List.range(0, 32).map(|_| "1;"))
   ones = List.range(0, 31).map(|_| [1])
   ```
+  キーの帯でも、補助の関数を足さずにその場で並べた（`src/overlay/strip.emel` の `blanks` と `right_end`、`test/strip_test.emel` の `blanks`、どれも `FRICTION(022)` の印）。`blanks` は wish でも関数だった（`row` の 2 つの腕から呼ぶ）。テストの `blanks` は、期待する行を作るための別の関数
+  ```emela
+  List.range(0, n).map(|_| Cell(0x20, Single, DEFAULT_PEN))
+  spaces = String.concat(List.range(0, cols - 2 - width(end)).map(|_| " "))
+  ```
+  overlay の合成では、並べる所が要らなくなった（回り道に数えない。印は付けない）: 出力の端末は初め、新しい VT と同じく空白で、カーソルは左上に見えている。そこで、初めの画面とカーソルを、新しい VT と空の帯の合成から作った（`drawing(Vt.new(h.cols, h.rows), Strip.strip(), 0)`。`compose` が毎回使う関数）。空白のセルの形（`Cell(0x20, Single, DEFAULT_PEN)`）を overlay が書かずに済み、比べる相手の VT と帯の空白と同じ値になることも、同じ関数で作るので揃う。`List.repeat` があっても、この形を選ぶ
   `Std.Array.repeat(value, count)` はあるが、String と List には無い
 - コスト:
   テストでは補助の関数 1 つ（印とコメントを含めて 5 行）。テストの中だけで、性能は問題にならない
   program でも補助の関数 1 つ（印とコメントを含めて 5 行）。`List.range` が n 個の Int の List を作って捨てる分だけ余計に割り当てる。並ぶ命令は n × 本体の長さなので、それより小さい
   時間のテストでは 1 行（印を含めて 2 行）。入力を作るのは時間を測る範囲の外なので、測る値には効かない
   VT の parser のテストでは 2 行（印とコメントを含めて 3 行）
+  キーの帯では 1 行ずつ（印を含めて 2 行ずつ）。`blanks` は帯の行を作るたびに呼ばれ、`List.range` が n 個（cols 以下）の Int の List を作って捨てる分だけ余計に割り当てる
+  overlay の合成では、コードのコストは無い（`start` で 1 度だけ、`Vt.lines` と `Strip.row` が rows + 1 行のセルを作る）
   どれも、普段のコードに基盤レベルは漏れていない
 - spec: `[api.string]`（`repeat` が無い）、`[api.list]`（`repeat` も無い）、`[api.std.array]`（`repeat` はある）
 - 既存: emela の issue と PR に無い（2026-11-25、`gh api search/issues` で `is:issue` と `is:pull-request` のそれぞれを「repeat」で検索。当たったのは局所関数、method call、Array、性能の PR など別の話題）。`proposals/` と `spec/open-questions.md` で「repeat」を引くと、`proposals/array.md:140` の `Array.repeat` だけが当たる

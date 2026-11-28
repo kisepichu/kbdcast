@@ -1,0 +1,201 @@
+# wish-target: cli/src/main.emel
+import Std.Env
+import Std.FileSystem
+import Std.IO
+import Std.Process
+import Kbdcast.Cast
+import Kbdcast.Cast.{CastError}
+import Kbdcast.Overlay
+
+const USAGE: String = "usage: kbdcast rec <tape> | kbdcast overlay <cast>"
+
+pub fn main() -> Unit {
+  match Env.args() {
+    ["overlay", path] -> overlay(path)
+    _ -> {
+      IO.eprintln(USAGE)
+      Process.exit(2)
+    }
+  }
+}
+
+# cast を読み、Overlay を通した行を、できたその都度 stdout に書く。
+fn overlay(path: String) -> Unit {
+  let text = match FileSystem.read_text(path) {
+    Ok(t) -> t
+    Err(e) -> {
+      IO.eprintln("${path}: ${e}")
+      Process.exit(1)
+    }
+  }
+  let (header, events) = try Cast.read(text) catch {
+    CastError(line, message) -> {
+      IO.eprintln("${path}:${line}: ${message}")
+      Process.exit(1)
+    }
+  }
+  let (o, first) = Overlay.start(header)
+  IO.println(first)
+  let last = List.fold(events, o, fn(o, e) {
+    let (next, lines) = Overlay.step(o, e)
+    List.each(lines, IO.println)
+    next
+  })
+  List.each(Overlay.finish(last), IO.println)
+}
+
+# --- wish check (emela 0.28.2) ---
+# error[E0122]: expected newline after declaration
+#    ╭─[ src/main.emel:4:11 ]
+#    │
+#  4 │ import Std.IO
+#    │           ┬  
+#    │           ╰── 
+# ───╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/main.emel:13:3 ]
+#     │
+#  13 │   match Env.args() {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/main.emel:24:3 ]
+#     │
+#  24 │   let text = match FileSystem.read_text(path) {
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/main.emel:24:7 ]
+#     │
+#  24 │   let text = match FileSystem.read_text(path) {
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/main.emel:31:3 ]
+#     │
+#  31 │   let (header, events) = try Cast.read(text) catch {
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/main.emel:31:7 ]
+#     │
+#  31 │   let (header, events) = try Cast.read(text) catch {
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/main.emel:37:3 ]
+#     │
+#  37 │   let (o, first) = Overlay.start(header)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/main.emel:37:7 ]
+#     │
+#  37 │   let (o, first) = Overlay.start(header)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/main.emel:39:3 ]
+#     │
+#  39 │   let last = List.fold(events, o, fn(o, e) {
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/main.emel:39:7 ]
+#     │
+#  39 │   let last = List.fold(events, o, fn(o, e) {
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find type `Unit` in this scope
+#     ╭─[ src/main.emel:12:18 ]
+#     │
+#  12 │ pub fn main() -> Unit {
+#     │                  ──┬─  
+#     │                    ╰─── 
+# ────╯
+#
+# error[E0212]: module `Std.Env` has no `args`
+#     ╭─[ src/main.emel:13:13 ]
+#     │
+#  13 │   match Env.args() {
+#     │             ──┬─  
+#     │               ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `IO` in this scope
+#     ╭─[ src/main.emel:16:7 ]
+#     │
+#  16 │       IO.eprintln(USAGE)
+#     │       ─┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0212]: module `Std.Process` has no `exit`
+#     ╭─[ src/main.emel:17:15 ]
+#     │
+#  17 │       Process.exit(2)
+#     │               ──┬─  
+#     │                 ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find type `Unit` in this scope
+#     ╭─[ src/main.emel:23:29 ]
+#     │
+#  23 │ fn overlay(path: String) -> Unit {
+#     │                             ──┬─  
+#     │                               ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `IO` in this scope
+#     ╭─[ src/main.emel:38:3 ]
+#     │
+#  38 │   IO.println(first)
+#     │   ─┬  
+#     │    ╰── 
+# ────╯
+#
+# error[E0211]: cannot find value `first` in this scope
+#     ╭─[ src/main.emel:38:14 ]
+#     │
+#  38 │   IO.println(first)
+#     │              ──┬──  
+#     │                ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `last` in this scope
+#     ╭─[ src/main.emel:44:28 ]
+#     │
+#  44 │   List.each(Overlay.finish(last), IO.println)
+#     │                            ──┬─  
+#     │                              ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `IO` in this scope
+#     ╭─[ src/main.emel:44:35 ]
+#     │
+#  44 │   List.each(Overlay.finish(last), IO.println)
+#     │                                   ─┬  
+#     │                                    ╰── 
+# ────╯
+#
+# 19 errors
+# --- end wish check ---

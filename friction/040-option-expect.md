@@ -15,6 +15,8 @@
   cast の writer（`src/cast.emel` の `hex`、サブプロジェクト 1 の計画の Task 2）でも、0x7F〜0x9F の 1 つの値を 16 進にするために `Bytes.from_list` で Bytes にする所（060）の、起きない `None` を defect にする
   recorder の handler `LiveDriver`（`src/recorder/live.emel` の `text_of`、サブプロジェクト 1 の計画の Task 5）でも、送ったキーの bytes（`Key.Encode.encode` が String から `Bytes.encode_utf8` で作る）を `i` イベントの文字列にするために `Bytes.decode_utf8` で読む所の、起きない `None` を defect にする
   cli の main（`cli/src/main.emel` の `program`、サブプロジェクト 1 の計画の Task 6）でも、`SpawnFailed` の文に書く `run` の行の最初の語（`Command.argv` の先頭）を取り出す所の、起きない空の List を defect にする。`Tape.parse` は空白でない文字の無い `run` の行を `run needs a command` で断るので、`argv` は少なくとも 1 つの語を持つ（`src/tape.emel` の `command` と `split_words`）
+  overlay の合成（`src/overlay.emel` の `character`、サブプロジェクト 4 の計画の Task 3）でも、変わった行のセルの code point を `String.from_code_point` で String にする所の起きない `None`（003）を defect にする。そのテスト（`test/overlay_test.emel` の `golden`）でも、性質テストが引いた位置（`VtGolden.CASES` の数より小さい）の golden の例を `List.get` で読む所（位置で選ぶのは 028）の、起きない `None` を defect にする
+  キーの帯（`src/overlay/strip.emel` の `fit`、サブプロジェクト 4 の計画の Task 2）でも、古い印を落としても入らないときに、最後の印を `List.last` で読む所の起きない `None` を defect にする。`fit` の最初の腕が空の `marks` を受けるので、そこに来る `marks` は空でない
 - こう書きたかった:
   `wish/notation.emel:38`、`:127`。Rust の `Option::expect`
   ```emela
@@ -33,6 +35,8 @@
   VT の画面の wish（`wish/screen.emel`）は、読む所を添字の `s.grid[row]`、`line[col]` で書いた（009）ので、`.expect` は書いていない
   VT の解釈の wish（`wish/terminal.emel`）は、表を添字で読み（009）、REP の本体と test の補助は wish に書かなかったので、`.expect` は書いていない
   cli の main の wish（`wish/main.emel:43`）は、List を添字で `tape.command.argv[0]` と読み（016、009）、空の List を考えていなかったので、`.expect` は書いていない
+  overlay の合成の wish（`wish/overlay.emel:113-114`）は、セルの文字を String として持つと思っていた（003）ので、`.expect` は書いていない。テストは wish を書かない
+  キーの帯の wish（`wish/strip.emel:59`）は、`List.last` が要素そのものを返すと思って `right_end(marks.last(), cols)` と書いた（016）ので、`.expect` は書いていない
 - 診断:
   wish check（v0.28.2）で、2 か所とも ``error[E0313]: type `Option[Key]` has no field or function `expect` ``。help は付かない
   repo の外の使い捨ての Pome での最小の形（`xs.head().expect("not empty")`、2026-11-27）でも ``error[E0313]: type `Option[Int]` has no field or function `expect` `` の 1 つ
@@ -55,6 +59,8 @@
   cast の writer（`src/cast.emel` の `hex`、`FRICTION(040)` の印）: `None` を defect にする所は 1 つなので、`test/vt_snapshot.emel` の `hex` と同じくその場の match にした。wish（`wish/cast.emel`）は Json がすべて escape すると思っていた（062）ので、16 進の所も `.expect` も書いていない
   LiveDriver（`src/recorder/live.emel` の `text_of`、`FRICTION(040)` の印）: `None` を defect にする所は 1 つなので、cast の writer と同じくその場の match にした。wish（`wish/live.emel:43`）は失敗しない `String.from_utf8_lossy(bytes)`（016）で書いたので、`.expect` は書いていない
   cli の main（`cli/src/main.emel` の `program`、`FRICTION(040)` の印）: defect にする所は 1 つなので、VT の解釈の `value` と同じく、List のパターンのその場の match（`[name, ..] -> name` と `[] -> panic(...)`）にした。`Command.argv` の型（`List[String]`）は空でないことを持たないので、`run` の行の不変条件は `Tape` の doc にも型にも出ていない
+  overlay の合成（`src/overlay.emel` の `character`、`FRICTION(040)` の印）: `None` を defect にする所は 1 つなので、VT の公開 API と同じくその場の match にした。テスト（`test/overlay_test.emel` の `golden`、`FRICTION(040)` の印）も、`None` を defect にする所は 1 つなので、その場の match にした
+  キーの帯（`src/overlay/strip.emel` の `fit`、`FRICTION(040)` の印）: `None` を defect にする所は 1 つなので、overlay の合成と同じくその場の match にした（`Some(last) -> right_end(last, cols)` と `None -> panic(...)`）。Task 2 では `marks.last().and_then(|last| right_end(last, cols))` と Option のままつなぎ、起きない `None` を `right_end` の `None`（何も描かない）に吸わせていて、記録が無かった（016 には「起きない分岐も defect も要らない」と書いていた）。friction-review の C2 の後、最終レビューの後の fix で、ESCALATION 2 の答え 1（起きない `None` は defect にする）に合わせて直した
 - コスト:
   補助関数 3 つ（6 行ずつ。表記、テストの生成器、decode）。method の形（`.expect(...)`）では書けず、pipe で書く（`[type.rules]`: method の形で呼べるのは、型を定義した module の関数だけ）。普段のコードに基盤レベルは漏れていない
   repo の中で同じ match を所ごとに書いている所が、これまでに 11 ある: `regex/src/fold.emel`、`regex/src/class.emel`、`regex/src/vm.emel`（どれも 009）、`regex/src/syntax.emel`、`regex/src/lib.emel`、`text/src/lib.emel`、`text/test/text_test.emel`（どれも 003）、`regex/test/differential_test.emel`、`regex/test/linear_test.emel`、`regex/test/find_test.emel`、`test/golden.emel`。std の `Std.Bytes.hex` も `from_hex(s)` の `None` を同じ形で `panic` にする（v0.28.2 の `std/bytes.emel:157-160`）
@@ -69,6 +75,8 @@
   cast の writer（サブプロジェクト 1 の Task 2）: その場の match が 1 つ（`src/cast.emel` の `hex`）。repo の中でその場の match を書いている所は 21 になった
   LiveDriver（サブプロジェクト 1 の Task 5）: その場の match が 1 つ（`src/recorder/live.emel` の `text_of`）。repo の中でその場の match を書いている所は 22 になった
   cli の main（サブプロジェクト 1 の Task 6）: その場の match が 1 つ（`cli/src/main.emel` の `program`）。repo の中でその場の match を書いている所は 23 になった
+  overlay の合成（サブプロジェクト 4 の Task 3）: その場の match が 2 つ（`src/overlay.emel` の `character` と `test/overlay_test.emel` の `golden`）。repo の中でその場の match を書いている所は 25 になった
+  キーの帯（サブプロジェクト 4 の最終レビューの後の fix）: その場の match が 1 つ（`src/overlay/strip.emel` の `fit`）。repo の中でその場の match を書いている所は 26 になった
 - spec: `[api.option]`（`map`、`and_then`、`or`、`is_some`、`is_none`、`or_fail`）、`[lib.api-rules]`（「A precondition of the caller is broken: it is a defect.」）、`[type.rules]`、`spec/history.md:459`（`Option.unwrap_or` を `Option.or` にした。`unwrap` と `expect` には触れていない）
 - 既存: emela の issue と PR に無い（2026-11-27、`gh search issues --repo emela-lang/emela --include-prs` で「Option expect」「unwrap」を検索。「unwrap」で当たったのは `unwrap_or` を `or` にした #191 などで、別の話題）。checkout の main（596b6038）の core にも無い。009（範囲外を defect にする `Array.at`）と 003（失敗しない `String.from_scalars`）は、それぞれの所で起きない `None` を無くす案で、このメモはどの Option にも使える形
 - 行き先: 前提の範囲内で spec に足りない → proposal の下書きの材料（まだ書かない）。`Option.expect(opt, message) -> A`（`None` は `message` の defect）。`[lib.api-rules]` の「呼ぶ側の前提が壊れたら defect」を、呼ぶ側が 1 行で書ける形。009 と 003 と合わせ、repo と std の `None -> panic` の数を使い道に添える。未提出。出すのは user

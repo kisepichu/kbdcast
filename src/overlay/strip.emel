@@ -1,0 +1,145 @@
+# The strip of keys under the screen: the keys pressed within FADE_MS of the last of them, in the
+# order pressed, each as a mark in vim's notation, and the row of cells that shows them.
+#
+# FRICTION(008): Emela has no module doc comment (`##` attaches to the next declaration), so this
+# is a plain comment.
+
+import Key.Notation.{print}
+import Key.Decode.{Decoded, Key, Paste, Unknown}
+import Vt.Width.{is_wide}
+import Vt.Screen.{Cell, Pen, DEFAULT_PEN, Single, WideHead, WideTail}
+
+## How long the marks stay after the last of them, in milliseconds.
+pub const FADE_MS: Int = 1500
+
+## The marks pressed since the strip was last emptied, in the order pressed, and the time of the
+## last of them (`None` before the first).
+# FRICTION(035): a function cannot have the name of a field, so the field that `marks` reads is
+# `pressed`.
+pub opaque type Strip(pressed: List[String], last_ms: Option[Int])
+
+## A strip with no marks.
+pub fn strip() -> Strip {
+  Strip(pressed: [], last_ms: None)
+}
+
+## `s` after pressing `keys` at `at_ms`: a key is marked as `print` writes it, a paste as
+## `<Paste>`, and unknown bytes not at all. If FADE_MS have passed since the last mark, the marks
+## start again. With no marks, `s` does not change.
+pub fn press(s: Strip, at_ms: Int, keys: List[Decoded]) -> Strip {
+  added = keys.filter_map(mark)
+  if added.is_empty() {
+    s
+  } else {
+    Strip(pressed: marks(s, at_ms).append(added), last_ms: Some(at_ms))
+  }
+}
+
+## The marks shown at `at_ms`, in the order pressed: none from FADE_MS after the last mark on.
+pub fn marks(s: Strip, at_ms: Int) -> List[String] {
+  s.last_ms match {
+    Some(last) if at_ms < last + FADE_MS -> s.pressed
+    _                                    -> []
+  }
+}
+
+## When the marks are no longer shown: FADE_MS after the last mark. `None` if nothing was marked.
+pub fn clears_at(s: Strip) -> Option[Int] {
+  s.last_ms.map(|last| last + FADE_MS)
+}
+
+## The `cols` cells of the row that shows `marks`: `" " + the marks + " "` in inverse on the left,
+## and blank cells with the default pen after it. If that is too wide, the oldest marks are dropped
+## one by one behind a `…` (`" …" + the rest + " "`); if the last mark alone is too wide, its right
+## end of `cols - 2` columns is kept (`"…" + the end + " "`, with a space for a wide character that
+## the end cuts in half). With no marks, or with `cols` less than 3 when nothing fits, the row is
+## blank. A wide character (`Vt.Width.is_wide`) takes two cells, as `Vt.Screen` writes it.
+pub fn row(marks: List[String], cols: Int) -> List[Cell] {
+  fit(marks, cols) match {
+    None -> blanks(cols)
+    Some(part) -> {
+      shown = cells(part, Pen(inverse: True, ..DEFAULT_PEN))
+      shown.append(blanks(cols - shown.length()))
+    }
+  }
+}
+
+fn mark(key: Decoded) -> Option[String] {
+  key match {
+    Key(k)     -> Some(print(k))
+    Paste(_)   -> Some("<Paste>")
+    Unknown(_) -> None
+  }
+}
+
+# The part of the row in inverse (`" " + the marks + " "`), or `None` if nothing is drawn.
+fn fit(marks: List[String], cols: Int) -> Option[String] {
+  whole = " #{marks.join("")} "
+  marks match {
+    []                        -> None
+    _ if width(whole) <= cols -> Some(whole)
+    # The oldest marks dropped: the newest that fit with ` …` and ` `, which take 3 columns.
+    _ -> ends(marks, cols - 3) match {
+      # FRICTION(040): Option has no `expect`, and the empty `marks` went to the first arm, so the
+      # None that cannot happen is a match with a panic.
+      [] -> marks.last() match {
+        Some(last) -> right_end(last, cols)
+        None       -> panic("no last mark, but the marks are not empty")
+      }
+      newest -> Some(" …#{newest.join("")} ")
+    }
+  }
+}
+
+# The part in inverse when `mark`, the last mark, does not fit alone: `…`, its right end in
+# `cols - 2` columns, and a space. `None` if `cols` is less than 3.
+fn right_end(mark: String, cols: Int) -> Option[String] {
+  if cols < 3 {
+    None
+  } else {
+    end = String.concat(ends(mark.chars(), cols - 2))
+    # A space for a wide character that the end cuts in half.
+    # FRICTION(022): String has no `repeat`, so the spaces are a range mapped to a space.
+    spaces = String.concat(List.range(0, cols - 2 - width(end)).map(|_| " "))
+    Some("…#{spaces}#{end} ")
+  }
+}
+
+# The strings at the end of `strings` that fit in `room` columns together, in their order.
+fn ends(strings: List[String], room: Int) -> List[String] {
+  # `reversed` is the strings not yet looked at, from the last, and `taken` those that fit.
+  fn take(reversed: List[String], room: Int, taken: List[String]) -> List[String] {
+    reversed match {
+      [] -> taken
+      [s, ..rest] -> {
+        w = width(s)
+        if w <= room { take(rest, room - w, [s, ..taken]) } else { taken }
+      }
+    }
+  }
+  take(strings.reverse(), room, [])
+}
+
+fn cells(text: String, pen: Pen) -> List[Cell] {
+  text.code_points().flat_map(|c| {
+    if is_wide(c) {
+      [Cell(c, WideHead, pen), Cell(0x20, WideTail, pen)]
+    } else {
+      [Cell(c, Single, pen)]
+    }
+  })
+}
+
+fn blanks(n: Int) -> List[Cell] {
+  # FRICTION(022): List has no `repeat`, so the blank cells are a range mapped to the blank cell.
+  List.range(0, n).map(|_| Cell(0x20, Single, DEFAULT_PEN))
+}
+
+fn width(text: String) -> Int {
+  # FRICTION(084): List has no `sum`, so the widths are added up with `fold`.
+  text.code_points().fold(0, |total, c| total + char_width(c))
+}
+
+fn char_width(c: Int) -> Int {
+  if is_wide(c) { 2 } else { 1 }
+}

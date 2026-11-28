@@ -20,10 +20,12 @@
   VT の parser の wish check（v0.28.2）では、272 の診断のうち 8（E0130 と E0122 が 4 つずつ）。本体の中の、構成子の名前を `{ }` の前に置いた値（`Parser { state, params: [], inter: "" }`、056）、前置の `match`（E0142）と `=>` の腕には届かなかった
   VT の画面の wish check（v0.28.2）では、112 の診断のうち 18（E0130 と E0122 が 9 つずつ）。本体の中の `Array.fill`（016）、`{ s with ... }`（037）、`s.grid[row]`（009）、`fn(l) { ... }`（E0148）、`=>` の腕、`fill_range`（057）、`min`（016）には届かなかった
   VT の解釈の wish check（v0.28.2）では、632 の診断のうち 16（E0130 と E0122 が 8 つずつ）。本体の中の `List.first` と `unwrap_or`（016、`:76`）、`Terminal(..t, ...)`（037、`:224`）、`DRAWING[c - 0x60]`（009、`:242`）には届かなかった。`:62` の `screen` には、本体が読まれなくても、同じ名前の欄との ``E0334: function `screen` has the same name as a field of `Terminal` ``（035）は出た
+  キーの帯の wish check（v0.28.2）では、45 の診断のうち 22（E0130 と E0122 が 11 ずつ）。本体の中の前置の `match`（E0142、`:26`、`:34`、`:43`、`:76`）、`fn(last) { ... }` と `fn(c) { ... }`（E0148、`:31`、`:82`）、`let`（004、`:37`、`:69`）、`++`（016）、`c.to_string()`（003）、`List.repeat` と String の `repeat`（022、`:90`、`:71`）、`.sum()`（084、`:92`）には届かなかった。`:25` の `marks` には、本体が読まれなくても、同じ名前の欄との E0334（035）は出た。`:75` と `:94` の signature の `Char`（003）にも E0211 が出た
 - 回避策: 本体を block にした（`pub fn single(c: Int) -> CharSet { range(c, c) }`。`regex/src/class.emel`。key の `src/key.emel` も同じ）。正しい構文に直しただけなので、コードに印は付けない
   VT の parser（`src/vt/parser.emel`、Task 3）も、本体を block にした。印は付けない
   VT の画面（`src/vt/screen.emel`、Task 4）も、本体を block にした。印は付けない
   VT の解釈（`src/vt/terminal.emel`、Task 5）も、本体を block にした。`fg` と `drawing` は、`sgr` が Pen を受ける形と `translate` に入れたので無くなった。印は付けない
+  キーの帯（サブプロジェクト 4 の Task 2、`src/overlay/strip.emel`）も、本体を block にした。印は付けない
 - コスト:
   コードのコストは無い（fmt は 1 行の block を 1 行のまま残す）。直すには spec を引く必要があった（`[fn.decl]` の「The body is a block」と `[grammar.decl]` の `fn_decl` の `[ block ]`）。wish の診断の 4 分の 1 がこの 1 つの誤りから出て、本体の中の別の誤りを隠した。004（`let`）、016（他の言語の名前）と同じく、wish-first（spec を読む前に wish を書く）では、そのときの手がかりは診断だけ
 - spec:

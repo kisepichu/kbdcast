@@ -64,22 +64,24 @@ pub fn read(text: String) -> (Header, List[Event]) fails CastError
   | イベントの形が違う | `an event is [interval, code, data]` |
   | interval が負 | `the interval is negative` |
   | `r` | `resize events are not supported` |
+  | 録画の始まりからの時刻が 2147483647 ms（Int の最大）を超える | `the time is too large (more than 2147483647 ms)` |
   | JSON として読めない | `invalid JSON: <Std.Json の message>` |
 
 ## 5. キーの帯
 
 ```emela
+pub const FADE_MS: Int = 1500
 pub opaque type Strip
 pub fn strip() -> Strip
 pub fn press(s: Strip, at_ms: Int, keys: List[Decoded]) -> Strip
-pub fn text(s: Strip, at_ms: Int) -> List[String]          # 見えている印の列。空なら見えていない
-pub fn clears_at(s: Strip) -> Option[Int]                  # 見えている間、消える時刻
+pub fn marks(s: Strip, at_ms: Int) -> List[String]         # 見えている印の列。空なら見えていない
+pub fn clears_at(s: Strip) -> Option[Int]                  # 印があれば、最後の印の時刻 + FADE_MS（消えた後も返す）
 pub fn row(marks: List[String], cols: Int) -> List[Cell]   # 帯の行のセル
 ```
 
 - 印は、`Key(k)` が `print(k)`、`Paste(_)` が `<Paste>`。`Unknown` は印にしない。印の無い `press` は帯を変えない。
 - `press(s, t, keys)`: 最後の印の時刻から 1500 ms 以上経っていれば、帯を空にしてから印を足す。最後の印の時刻を t にする。
-- `text(s, t)`: t が最後の印の時刻 + 1500 以上なら空。
+- `marks(s, t)`: t が最後の印の時刻 + 1500 以上なら空。`clears_at` は時刻を見ないので、帯が見えているかは合成の側で `t < clears_at` で決める。
 - `row(marks, cols)`: 中身は印をつないだもの。`" " + 中身 + " "` の幅（`Vt.Width`）が cols 以下ならそれ。超えるなら、古い印から落として `" …" + 残り + " "` が cols に入るまで続ける。最後の印 1 つでも入らなければ、その印の右の端を `cols - 2` 列ぶん残し `"…" + 端 + " "` にする（cols が 3 より小さければ、入るだけの空白）。その部分を反転の pen、残りを既定の pen の空白にする。全角の文字は 2 列。
 
 ## 6. 合成
@@ -96,7 +98,7 @@ pub fn finish(o: Overlay) -> List[String]
   1. 帯が見えていて、消える時刻 c が t 以下なら、まず時刻 c の合成を書く（帯が消えた画面）。
   2. `Output(t, s)`: `Vt.feed`（返事は捨てる）。`Input(t, s)`: `Key.Decode.decode(Bytes.encode_utf8(s))` を帯に `press`。`Marker`、`Exit`: その行をそのまま時刻 t で書く。
   3. 時刻 t の合成を書く。
-- 「時刻 t の合成を書く」: 合成の画面（VT の `lines` と、帯の `row(text(帯, t), cols)`）を前に書いたものと比べ、変わった行があれば、それらを 1 つの `o` イベントにして書く。カーソルの位置と見え方が変わっただけのときも書く。何も変わらなければ書かない。
+- 「時刻 t の合成を書く」: 合成の画面（VT の `lines` と、帯の `row(marks(帯, t), cols)`）を前に書いたものと比べ、変わった行があれば、それらを 1 つの `o` イベントにして書く。カーソルの位置（`Vt.cursor_position`。隠れていても読める）と見え方が変わっただけのときも書く。何も変わらなければ書かない。
 - 行の書き方: `CSI <行> ; 1 H` の後、セルを左から書く。行の最初のセルと、pen が前のセルと違うセルの前に `CSI 0 m`（既定の pen）か `CSI 0 ; <属性> m` を書く。属性は、強さ（`1` か `2`）、斜体 `3`、下線 `4`、点滅 `5`、反転 `7`、取り消し線 `9`、前景（番号 0〜7 は `30+n`、8〜15 は `90+n-8`、ほかは `38;5;n`、RGB は `38;2;r;g;b`）、背景（同じく `40+n`、`100+n-8`、`48;5;n`、`48;2;r;g;b`）の順。全角の右のセルは書かない。行の終わりで `CSI 0 m`。
 - 1 つの `o` イベントの data は、変わった行を上から順に書いたものの後に、カーソルの `CSI <行+1> ; <min(列, cols-1)+1> H` と、見え方が変わったときだけ `CSI ? 25 h` か `CSI ? 25 l`。
 - `finish(o)`: 帯が見えていれば、消える時刻の合成を書く。
@@ -139,6 +141,6 @@ pub fn finish(o: Overlay) -> List[String]
 
 ## 12. リスク
 
-- 長い cast では、毎回 `Vt.lines` で画面全体を List にする。速さは 3 の計測（1 MB あたり 1 秒以下）に近い見込み。遅ければ計測して friction に書く。
+- 長い cast では、毎回 `Vt.lines` で画面全体を List にする。測ると 80 × 24 で 1 イベントあたり約 1.1 ms で、同じ cast を agg で GIF にする方が約 6 倍遅い。遅くないので friction にはしない。
 - agg の font に全角の文字が無いと、帯の全角が豆腐になる。E2E で見る。
 - 手で録った cast（ConPTY と tmux を通った入力、#16）は、user が録った cast が無いと試せない。この PR では扱わない。

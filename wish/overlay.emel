@@ -1,0 +1,1099 @@
+# wish-target: src/overlay.emel
+# 合成: VT の画面とキーの帯を合わせ、変わった行だけを描き直す cast の行を書く。
+
+import Cast.{Header, Event, Output, Input, Marker, Exit, Writer}
+import Overlay.Strip.{Strip}
+import Vt.{Vt}
+import Vt.Screen.{Cell, Pen, Color, Intensity}
+import Key.Decode
+import Std.Json
+import Std.Dynamic
+
+pub opaque type Overlay(
+  cols: Int,
+  rows: Int,
+  vt: Vt,
+  strip: Strip,
+  writer: Writer,
+  now: Int,                 # 最後に合成した時刻
+  shown: List[List[Cell]],  # 前に書いた合成の画面（rows + 1 行）
+  cursor: (Int, Int),       # 前に書いたカーソルの (行, 列)。列は cols - 1 に丸めたもの
+  visible: Bool,            # 前に書いたカーソルの見え方
+)
+
+pub fn start(h: Header) -> (Overlay, String) {
+  let json = Dynamic.set(h.json, ["term", "rows"], Dynamic.from_int(h.rows + 1))
+  let blank = List.repeat(Cell.blank, h.cols)
+  let o = Overlay(
+    cols: h.cols,
+    rows: h.rows,
+    vt: Vt.new(h.cols, h.rows),
+    strip: Strip.strip(),
+    writer: Cast.writer(),
+    now: 0,
+    shown: List.repeat(blank, h.rows + 1),
+    cursor: (0, 0),
+    visible: true,
+  )
+  (o, Json.to_string(json))
+}
+
+pub fn step(o: Overlay, e: Event) -> (Overlay, List[String]) {
+  let t = time(e)
+  let (o, cleared) = clear_until(o, t)
+  let (o, passed) = match e {
+    Output(_, s) => ({ ..o, vt: Vt.feed(o.vt, s).0 }, []),
+    Input(_, s) => ({ ..o, strip: Strip.press(o.strip, t, Decode.decode(Bytes.encode_utf8(s))) }, []),
+    Marker(_, s) => write(o, t, "m", s),
+    Exit(_, s) => write(o, t, "x", s),
+  }
+  let (o, drawn) = compose(o, t)
+  (o, cleared ++ passed ++ drawn)
+}
+
+pub fn finish(o: Overlay) -> List[String] {
+  match clear_time(o) {
+    Some(c) => compose(o, c).1,
+    None => [],
+  }
+}
+
+fn time(e: Event) -> Int {
+  match e {
+    Output(t, _) | Input(t, _) | Marker(t, _) | Exit(t, _) => t,
+  }
+}
+
+# 帯が見えていれば、消える時刻
+fn clear_time(o: Overlay) -> Option[Int] {
+  match Strip.clears_at(o.strip) {
+    Some(c) if c > o.now => Some(c),
+    _ => None,
+  }
+}
+
+# 帯が t までに消えるなら、消える時刻の合成を書く
+fn clear_until(o: Overlay, t: Int) -> (Overlay, List[String]) {
+  match clear_time(o) {
+    Some(c) if c <= t => compose(o, c),
+    _ => (o, []),
+  }
+}
+
+fn write(o: Overlay, t: Int, code: String, data: String) -> (Overlay, List[String]) {
+  let (w, line) = Cast.event(o.writer, t, code, data)
+  ({ ..o, writer: w }, [line])
+}
+
+# 時刻 t の合成を書く
+fn compose(o: Overlay, t: Int) -> (Overlay, List[String]) {
+  let screen = Vt.lines(o.vt) ++ [Strip.row(Strip.marks(o.strip, t), o.cols)]
+  let (row, col) = Vt.cursor(o.vt)
+  let cursor = (row, min(col, o.cols - 1))
+  let visible = Vt.cursor_visible(o.vt)
+  let changed = List.zip(o.shown, screen)
+    |> List.indexed
+    |> List.filter_map(fn((i, (old, new))) { if old == new { None } else { Some(draw_row(i, new)) } })
+  let o = { ..o, now: t }
+  if changed == [] && cursor == o.cursor && visible == o.visible {
+    (o, [])
+  } else {
+    let data = String.concat(changed)
+      ++ "\e[${cursor.0 + 1};${cursor.1 + 1}H"
+      ++ (if visible == o.visible { "" } else if visible { "\e[?25h" } else { "\e[?25l" })
+    write({ ..o, shown: screen, cursor: cursor, visible: visible }, t, "o", data)
+  }
+}
+
+# 1 行: 行の頭への CUP、pen が変わるところの SGR、文字。全角の右のセルは書かない
+fn draw_row(i: Int, cells: List[Cell]) -> String {
+  let (text, _) = List.fold(cells, ("\e[${i + 1};1H", None), fn((acc, prev), cell) {
+    match cell {
+      WideTail(_) => (acc, prev),
+      Cell(ch, pen) | WideHead(ch, pen) =>
+        if prev == Some(pen) { (acc ++ ch, prev) } else { (acc ++ sgr(pen) ++ ch, Some(pen)) },
+    }
+  })
+  text ++ "\e[0m"
+}
+
+# CSI 0 ; <属性> m。属性は強さ、斜体、下線、点滅、反転、取り消し線、前景、背景の順
+fn sgr(p: Pen) -> String {
+  let attrs = List.concat([
+    match p.intensity { Bold => ["1"], Faint => ["2"], Normal => [] },
+    if p.italic { ["3"] } else { [] },
+    if p.underline { ["4"] } else { [] },
+    if p.blink { ["5"] } else { [] },
+    if p.inverse { ["7"] } else { [] },
+    if p.strikethrough { ["9"] } else { [] },
+    color(p.fg, 30, 90, 38),
+    color(p.bg, 40, 100, 48),
+  ])
+  "\e[" ++ String.join(["0", ..attrs], ";") ++ "m"
+}
+
+fn color(c: Color, base: Int, bright: Int, extended: Int) -> List[String] {
+  match c {
+    Default => [],
+    Indexed(n) if n < 8 => ["${base + n}"],
+    Indexed(n) if n < 16 => ["${bright + n - 8}"],
+    Indexed(n) => ["${extended};5;${n}"],
+    Rgb(r, g, b) => ["${extended};2;${r};${g};${b}"],
+  }
+}
+
+# --- wish check (emela 0.28.2) ---
+# warning[W0203]: `github.com/emela-lang/brix` is written for emela 0.27.0; this is 0.28.2
+#    ─[ /home/kise/.emela/pomes/github.com/emela-lang/brix@v0.4.0/Pome.toml ]
+#    = note: it is built anyway; errors inside it may come from changes between the versions
+#
+# error[E0107]: unknown escape sequence `\e`
+#      ╭─[ src/overlay.emel:102:11 ]
+#      │
+#  102 │       ++ "\e[${cursor.0 + 1};${cursor.1 + 1}H"
+#      │           ─┬  
+#      │            ╰── 
+# ─────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#      ╭─[ src/overlay.emel:103:61 ]
+#      │
+#  103 │       ++ (if visible == o.visible { "" } else if visible { "\e[?25h" } else { "\e[?25l" })
+#      │                                                             ─┬  
+#      │                                                              ╰── 
+# ─────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#      ╭─[ src/overlay.emel:103:80 ]
+#      │
+#  103 │       ++ (if visible == o.visible { "" } else if visible { "\e[?25h" } else { "\e[?25l" })
+#      │                                                                                ─┬  
+#      │                                                                                 ╰── 
+# ─────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#      ╭─[ src/overlay.emel:110:38 ]
+#      │
+#  110 │   let (text, _) = List.fold(cells, ("\e[${i + 1};1H", None), fn((acc, prev), cell) {
+#      │                                      ─┬  
+#      │                                       ╰── 
+# ─────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#      ╭─[ src/overlay.emel:117:12 ]
+#      │
+#  117 │   text ++ "\e[0m"
+#      │            ─┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0107]: unknown escape sequence `\e`
+#      ╭─[ src/overlay.emel:132:4 ]
+#      │
+#  132 │   "\e[" ++ String.join(["0", ..attrs], ";") ++ "m"
+#      │    ─┬  
+#      │     ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:25:3 ]
+#     │
+#  25 │   let json = Dynamic.set(h.json, ["term", "rows"], Dynamic.from_int(h.rows + 1))
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay.emel:25:7 ]
+#     │
+#  25 │   let json = Dynamic.set(h.json, ["term", "rows"], Dynamic.from_int(h.rows + 1))
+#     │       ──┬─  
+#     │         ╰─── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:26:3 ]
+#     │
+#  26 │   let blank = List.repeat(Cell.blank, h.cols)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay.emel:26:7 ]
+#     │
+#  26 │   let blank = List.repeat(Cell.blank, h.cols)
+#     │       ──┬──  
+#     │         ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:27:3 ]
+#     │
+#  27 │   let o = Overlay(
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay.emel:27:7 ]
+#     │
+#  27 │   let o = Overlay(
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:42:3 ]
+#     │
+#  42 │   let t = time(e)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay.emel:42:7 ]
+#     │
+#  42 │   let t = time(e)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:43:3 ]
+#     │
+#  43 │   let (o, cleared) = clear_until(o, t)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay.emel:43:7 ]
+#     │
+#  43 │   let (o, cleared) = clear_until(o, t)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:44:3 ]
+#     │
+#  44 │   let (o, passed) = match e {
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay.emel:44:7 ]
+#     │
+#  44 │   let (o, passed) = match e {
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:50:3 ]
+#     │
+#  50 │   let (o, drawn) = compose(o, t)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay.emel:50:7 ]
+#     │
+#  50 │   let (o, drawn) = compose(o, t)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:51:16 ]
+#     │
+#  51 │   (o, cleared ++ passed ++ drawn)
+#     │                ┬  
+#     │                ╰── 
+# ────╯
+#
+# error[E0110]: expected `)`
+#     ╭─[ src/overlay.emel:51:18 ]
+#     │
+#  51 │   (o, cleared ++ passed ++ drawn)
+#     │                  ───┬──  
+#     │                     ╰──── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay.emel:51:18 ]
+#     │
+#  51 │   (o, cleared ++ passed ++ drawn)
+#     │                  ───┬──  
+#     │                     ╰──── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/overlay.emel:55:3 ]
+#     │
+#  55 │   match clear_time(o) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/overlay.emel:56:13 ]
+#     │
+#  56 │     Some(c) => compose(o, c).1,
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:56:13 ]
+#     │
+#  56 │     Some(c) => compose(o, c).1,
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/overlay.emel:56:13 ]
+#     │
+#  56 │     Some(c) => compose(o, c).1,
+#     │             ┬  
+#     │             ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/overlay.emel:57:10 ]
+#     │
+#  57 │     None => [],
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:57:10 ]
+#     │
+#  57 │     None => [],
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/overlay.emel:57:10 ]
+#     │
+#  57 │     None => [],
+#     │          ┬  
+#     │          ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/overlay.emel:62:3 ]
+#     │
+#  62 │   match e {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/overlay.emel:63:18 ]
+#     │
+#  63 │     Output(t, _) | Input(t, _) | Marker(t, _) | Exit(t, _) => t,
+#     │                  ┬  
+#     │                  ╰── 
+# ────╯
+#
+# error[E0123]: `_` can only be used in patterns
+#     ╭─[ src/overlay.emel:63:44 ]
+#     │
+#  63 │     Output(t, _) | Input(t, _) | Marker(t, _) | Exit(t, _) => t,
+#     │                                            ┬  
+#     │                                            ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/overlay.emel:63:47 ]
+#     │
+#  63 │     Output(t, _) | Input(t, _) | Marker(t, _) | Exit(t, _) => t,
+#     │                                               ┬  
+#     │                                               ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/overlay.emel:69:3 ]
+#     │
+#  69 │   match Strip.clears_at(o.strip) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/overlay.emel:70:26 ]
+#     │
+#  70 │     Some(c) if c > o.now => Some(c),
+#     │                          ┬  
+#     │                          ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:70:26 ]
+#     │
+#  70 │     Some(c) if c > o.now => Some(c),
+#     │                          ┬  
+#     │                          ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/overlay.emel:70:26 ]
+#     │
+#  70 │     Some(c) if c > o.now => Some(c),
+#     │                          ┬  
+#     │                          ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/overlay.emel:71:7 ]
+#     │
+#  71 │     _ => None,
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:71:7 ]
+#     │
+#  71 │     _ => None,
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/overlay.emel:71:7 ]
+#     │
+#  71 │     _ => None,
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#     ╭─[ src/overlay.emel:77:3 ]
+#     │
+#  77 │   match clear_time(o) {
+#     │   ──┬──  
+#     │     ╰──── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/overlay.emel:78:23 ]
+#     │
+#  78 │     Some(c) if c <= t => compose(o, c),
+#     │                       ┬  
+#     │                       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:78:23 ]
+#     │
+#  78 │     Some(c) if c <= t => compose(o, c),
+#     │                       ┬  
+#     │                       ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/overlay.emel:78:23 ]
+#     │
+#  78 │     Some(c) if c <= t => compose(o, c),
+#     │                       ┬  
+#     │                       ╰── 
+# ────╯
+#
+# error[E0110]: expected `->`
+#     ╭─[ src/overlay.emel:79:7 ]
+#     │
+#  79 │     _ => (o, []),
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:79:7 ]
+#     │
+#  79 │     _ => (o, []),
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#     ╭─[ src/overlay.emel:79:7 ]
+#     │
+#  79 │     _ => (o, []),
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:84:3 ]
+#     │
+#  84 │   let (w, line) = Cast.event(o.writer, t, code, data)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay.emel:84:7 ]
+#     │
+#  84 │   let (w, line) = Cast.event(o.writer, t, code, data)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:85:6 ]
+#     │
+#  85 │   ({ ..o, writer: w }, [line])
+#     │      ─┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay.emel:85:8 ]
+#     │
+#  85 │   ({ ..o, writer: w }, [line])
+#     │        ┬  
+#     │        ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:90:3 ]
+#     │
+#  90 │   let screen = Vt.lines(o.vt) ++ [Strip.row(Strip.marks(o.strip, t), o.cols)]
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay.emel:90:7 ]
+#     │
+#  90 │   let screen = Vt.lines(o.vt) ++ [Strip.row(Strip.marks(o.strip, t), o.cols)]
+#     │       ───┬──  
+#     │          ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:91:3 ]
+#     │
+#  91 │   let (row, col) = Vt.cursor(o.vt)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay.emel:91:7 ]
+#     │
+#  91 │   let (row, col) = Vt.cursor(o.vt)
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:92:3 ]
+#     │
+#  92 │   let cursor = (row, min(col, o.cols - 1))
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay.emel:92:7 ]
+#     │
+#  92 │   let cursor = (row, min(col, o.cols - 1))
+#     │       ───┬──  
+#     │          ╰──── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:93:3 ]
+#     │
+#  93 │   let visible = Vt.cursor_visible(o.vt)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay.emel:93:7 ]
+#     │
+#  93 │   let visible = Vt.cursor_visible(o.vt)
+#     │       ───┬───  
+#     │          ╰───── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:94:3 ]
+#     │
+#  94 │   let changed = List.zip(o.shown, screen)
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay.emel:94:7 ]
+#     │
+#  94 │   let changed = List.zip(o.shown, screen)
+#     │       ───┬───  
+#     │          ╰───── 
+# ────╯
+#
+# error[E0118]: expected expression
+#     ╭─[ src/overlay.emel:97:3 ]
+#     │
+#  97 │   let o = { ..o, now: t }
+#     │   ─┬─  
+#     │    ╰─── 
+# ────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#     ╭─[ src/overlay.emel:97:7 ]
+#     │
+#  97 │   let o = { ..o, now: t }
+#     │       ┬  
+#     │       ╰── 
+# ────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/overlay.emel:101:5 ]
+#      │
+#  101 │     let data = String.concat(changed)
+#      │     ─┬─  
+#      │      ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/overlay.emel:101:9 ]
+#      │
+#  101 │     let data = String.concat(changed)
+#      │         ──┬─  
+#      │           ╰─── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/overlay.emel:104:13 ]
+#      │
+#  104 │     write({ ..o, shown: screen, cursor: cursor, visible: visible }, t, "o", data)
+#      │             ─┬  
+#      │              ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/overlay.emel:104:15 ]
+#      │
+#  104 │     write({ ..o, shown: screen, cursor: cursor, visible: visible }, t, "o", data)
+#      │               ┬  
+#      │               ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/overlay.emel:110:3 ]
+#      │
+#  110 │   let (text, _) = List.fold(cells, ("\e[${i + 1};1H", None), fn((acc, prev), cell) {
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/overlay.emel:110:7 ]
+#      │
+#  110 │   let (text, _) = List.fold(cells, ("\e[${i + 1};1H", None), fn((acc, prev), cell) {
+#      │       ┬  
+#      │       ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/overlay.emel:117:9 ]
+#      │
+#  117 │   text ++ "\e[0m"
+#      │         ┬  
+#      │         ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/overlay.emel:117:11 ]
+#      │
+#  117 │   text ++ "\e[0m"
+#      │           ┬  
+#      │           ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/overlay.emel:122:3 ]
+#      │
+#  122 │   let attrs = List.concat([
+#      │   ─┬─  
+#      │    ╰─── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/overlay.emel:122:7 ]
+#      │
+#  122 │   let attrs = List.concat([
+#      │       ──┬──  
+#      │         ╰──── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/overlay.emel:132:10 ]
+#      │
+#  132 │   "\e[" ++ String.join(["0", ..attrs], ";") ++ "m"
+#      │          ┬  
+#      │          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after statement
+#      ╭─[ src/overlay.emel:132:12 ]
+#      │
+#  132 │   "\e[" ++ String.join(["0", ..attrs], ";") ++ "m"
+#      │            ───┬──  
+#      │               ╰──── 
+# ─────╯
+#
+# error[E0142]: `match` comes after the value: write `value match { ... }`
+#      ╭─[ src/overlay.emel:136:3 ]
+#      │
+#  136 │   match c {
+#      │   ──┬──  
+#      │     ╰──── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/overlay.emel:137:13 ]
+#      │
+#  137 │     Default => [],
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/overlay.emel:137:13 ]
+#      │
+#  137 │     Default => [],
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/overlay.emel:137:13 ]
+#      │
+#  137 │     Default => [],
+#      │             ┬  
+#      │             ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/overlay.emel:138:25 ]
+#      │
+#  138 │     Indexed(n) if n < 8 => ["${base + n}"],
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/overlay.emel:138:25 ]
+#      │
+#  138 │     Indexed(n) if n < 8 => ["${base + n}"],
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/overlay.emel:138:25 ]
+#      │
+#  138 │     Indexed(n) if n < 8 => ["${base + n}"],
+#      │                         ┬  
+#      │                         ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/overlay.emel:139:26 ]
+#      │
+#  139 │     Indexed(n) if n < 16 => ["${bright + n - 8}"],
+#      │                          ┬  
+#      │                          ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/overlay.emel:139:26 ]
+#      │
+#  139 │     Indexed(n) if n < 16 => ["${bright + n - 8}"],
+#      │                          ┬  
+#      │                          ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/overlay.emel:139:26 ]
+#      │
+#  139 │     Indexed(n) if n < 16 => ["${bright + n - 8}"],
+#      │                          ┬  
+#      │                          ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/overlay.emel:140:16 ]
+#      │
+#  140 │     Indexed(n) => ["${extended};5;${n}"],
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/overlay.emel:140:16 ]
+#      │
+#  140 │     Indexed(n) => ["${extended};5;${n}"],
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/overlay.emel:140:16 ]
+#      │
+#  140 │     Indexed(n) => ["${extended};5;${n}"],
+#      │                ┬  
+#      │                ╰── 
+# ─────╯
+#
+# error[E0110]: expected `->`
+#      ╭─[ src/overlay.emel:141:18 ]
+#      │
+#  141 │     Rgb(r, g, b) => ["${extended};2;${r};${g};${b}"],
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0118]: expected expression
+#      ╭─[ src/overlay.emel:141:18 ]
+#      │
+#  141 │     Rgb(r, g, b) => ["${extended};2;${r};${g};${b}"],
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0122]: expected newline or `}` after match arm
+#      ╭─[ src/overlay.emel:141:18 ]
+#      │
+#  141 │     Rgb(r, g, b) => ["${extended};2;${r};${g};${b}"],
+#      │                  ┬  
+#      │                  ╰── 
+# ─────╯
+#
+# error[E0212]: module `Vt` has no `Vt`
+#    ╭─[ src/overlay.emel:6:12 ]
+#    │
+#  6 │ import Vt.{Vt}
+#    │            ─┬  
+#    │             ╰── 
+# ───╯
+#
+# error[E0217]: expected type, found module `Vt`
+#     ╭─[ src/overlay.emel:15:7 ]
+#     │
+#  15 │   vt: Vt,
+#     │       ─┬  
+#     │        ╰── 
+# ────╯
+#    = help: `Vt` is a module: qualify the name (`Vt.Name`) or list it in the import (`import ….Vt.{Name}`)
+#
+# error[E0211]: cannot find value `o` in this scope
+#     ╭─[ src/overlay.emel:38:4 ]
+#     │
+#  38 │   (o, Json.to_string(json))
+#     │    ┬  
+#     │    ╰── 
+# ────╯
+#    = help: did you mean `h`?
+#
+# error[E0211]: cannot find value `json` in this scope
+#     ╭─[ src/overlay.emel:38:22 ]
+#     │
+#  38 │   (o, Json.to_string(json))
+#     │                      ──┬─  
+#     │                        ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `cleared` in this scope
+#     ╭─[ src/overlay.emel:51:7 ]
+#     │
+#  51 │   (o, cleared ++ passed ++ drawn)
+#     │       ───┬───  
+#     │          ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find value `line` in this scope
+#     ╭─[ src/overlay.emel:85:25 ]
+#     │
+#  85 │   ({ ..o, writer: w }, [line])
+#     │                         ──┬─  
+#     │                           ╰─── 
+# ────╯
+#
+# error[E0211]: cannot find value `changed` in this scope
+#     ╭─[ src/overlay.emel:98:6 ]
+#     │
+#  98 │   if changed == [] && cursor == o.cursor && visible == o.visible {
+#     │      ───┬───  
+#     │         ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find value `cursor` in this scope
+#     ╭─[ src/overlay.emel:98:23 ]
+#     │
+#  98 │   if changed == [] && cursor == o.cursor && visible == o.visible {
+#     │                       ───┬──  
+#     │                          ╰──── 
+# ────╯
+#
+# error[E0211]: cannot find value `visible` in this scope
+#     ╭─[ src/overlay.emel:98:45 ]
+#     │
+#  98 │   if changed == [] && cursor == o.cursor && visible == o.visible {
+#     │                                             ───┬───  
+#     │                                                ╰───── 
+# ────╯
+#
+# error[E0211]: cannot find value `data` in this scope
+#      ╭─[ src/overlay.emel:104:77 ]
+#      │
+#  104 │     write({ ..o, shown: screen, cursor: cursor, visible: visible }, t, "o", data)
+#      │                                                                             ──┬─  
+#      │                                                                               ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find value `text` in this scope
+#      ╭─[ src/overlay.emel:117:3 ]
+#      │
+#  117 │   text ++ "\e[0m"
+#      │   ──┬─  
+#      │     ╰─── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Default` in this scope
+#      ╭─[ src/overlay.emel:137:5 ]
+#      │
+#  137 │     Default => [],
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Indexed` in this scope
+#      ╭─[ src/overlay.emel:138:5 ]
+#      │
+#  138 │     Indexed(n) if n < 8 => ["${base + n}"],
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Indexed` in this scope
+#      ╭─[ src/overlay.emel:139:5 ]
+#      │
+#  139 │     Indexed(n) if n < 16 => ["${bright + n - 8}"],
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Indexed` in this scope
+#      ╭─[ src/overlay.emel:140:5 ]
+#      │
+#  140 │     Indexed(n) => ["${extended};5;${n}"],
+#      │     ───┬───  
+#      │        ╰───── 
+# ─────╯
+#
+# error[E0211]: cannot find constructor `Rgb` in this scope
+#      ╭─[ src/overlay.emel:141:5 ]
+#      │
+#  141 │     Rgb(r, g, b) => ["${extended};2;${r};${g};${b}"],
+#      │     ─┬─  
+#      │      ╰─── 
+# ─────╯
+#
+# error[E0303]: non-exhaustive match: patterns `Input(_, _)`, `Marker(_, _)`, `Exit(_, _)` not covered
+#     ╭─[ src/overlay.emel:62:9 ]
+#     │
+#  62 │   match e {
+#     │         ┬  
+#     │         ╰── 
+# ────╯
+#
+# error[E0301]: type mismatch: expected `Int`, found `fn(Event) -> Event`
+#     ╭─[ src/overlay.emel:63:18 ]
+#     │
+#  63 │     Output(t, _) | Input(t, _) | Marker(t, _) | Exit(t, _) => t,
+#     │                  ──────────────┬─────────────  
+#     │                                ╰─────────────── 
+# ────╯
+#
+# error[E0317]: refutable pattern in binding: patterns `Output(_, _)`, `Marker(_, _)`, `Exit(_, _)` not covered
+#     ╭─[ src/overlay.emel:63:20 ]
+#     │
+#  63 │     Output(t, _) | Input(t, _) | Marker(t, _) | Exit(t, _) => t,
+#     │                    ─────┬─────  
+#     │                         ╰─────── 
+# ────╯
+#    = help: use `match` to handle the other cases
+#
+# error[E0301]: type mismatch: expected `(Overlay, List[String])`, found `((), List[{unknown}])`
+#     ╭─[ src/overlay.emel:85:3 ]
+#     │
+#  85 │   ({ ..o, writer: w }, [line])
+#     │   ──────────────┬─────────────  
+#     │                 ╰─────────────── 
+# ────╯
+#    = note: the mismatch is between `Overlay` and `()`
+#
+# error[E0301]: type mismatch: expected `Overlay`, found `()`
+#      ╭─[ src/overlay.emel:104:11 ]
+#      │
+#  104 │     write({ ..o, shown: screen, cursor: cursor, visible: visible }, t, "o", data)
+#      │           ────────────────────────────┬───────────────────────────  
+#      │                                       ╰───────────────────────────── 
+# ─────╯
+#
+# error[E0310]: expected a number (`Int`, `Int64` or `Float`), found `String`
+#      ╭─[ src/overlay.emel:132:3 ]
+#      │
+#  132 │   "\e[" ++ String.join(["0", ..attrs], ";") ++ "m"
+#      │   ────┬───  
+#      │       ╰───── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/overlay.emel:138:5 ]
+#      │
+#  138 │     Indexed(n) if n < 8 => ["${base + n}"],
+#      │     ─────┬────  
+#      │          ╰────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/overlay.emel:139:5 ]
+#      │
+#  139 │     Indexed(n) if n < 16 => ["${bright + n - 8}"],
+#      │     ─────┬────  
+#      │          ╰────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/overlay.emel:140:5 ]
+#      │
+#  140 │     Indexed(n) => ["${extended};5;${n}"],
+#      │     ─────┬────  
+#      │          ╰────── 
+# ─────╯
+#
+# warning[W0301]: unreachable match arm
+#      ╭─[ src/overlay.emel:141:5 ]
+#      │
+#  141 │     Rgb(r, g, b) => ["${extended};2;${r};${g};${b}"],
+#      │     ──────┬─────  
+#      │           ╰─────── 
+# ─────╯
+#
+# 114 errors, 5 warnings
+# --- end wish check ---

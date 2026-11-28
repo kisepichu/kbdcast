@@ -1,0 +1,120 @@
+import Std.Bytes
+import Key.Decode.{Decoded, Key, Paste, Unknown}
+import Key.Notation.{NotationError}
+import Overlay.Strip
+import Vt.Screen.{Cell, Pen, Single, WideHead, WideTail, DEFAULT_PEN}
+
+const INVERSE: Pen = Pen(inverse: True, ..DEFAULT_PEN)
+
+const HIRAGANA_A: Int = 0x3042 # あ
+const HIRAGANA_I: Int = 0x3044 # い
+
+# The keys of `notation`, as a `>` line of a tape writes them, each one as `decode` reads it.
+fn keys(notation: String) -> List[Decoded] fails NotationError {
+  Notation.parse(notation).map(|k| Key(k))
+}
+
+# The strip after the first press of the table in the plan: two keys, a paste and bytes that are no
+# key, at 0.
+fn first() -> Strip.Strip fails NotationError {
+  Strip.press(Strip.strip(), 0, keys("a<Esc>").append([Paste("x"), Unknown(Bytes.hex("ff"))]))
+}
+
+# A cell with the inverse pen for each code point of `text`, which has no wide character.
+fn narrow(text: String) -> List[Cell] {
+  text.code_points().map(|c| Cell(c, Single, INVERSE))
+}
+
+# The two cells of the wide character `c` with the inverse pen.
+fn wide(c: Int) -> List[Cell] {
+  [Cell(c, WideHead, INVERSE), Cell(0x20, WideTail, INVERSE)]
+}
+
+# `n` blank cells with the default pen.
+# FRICTION(022): List has no `repeat`, so the cells are a range mapped to the blank cell.
+fn blanks(n: Int) -> List[Cell] {
+  List.range(0, n).map(|_| Cell(0x20, Single, DEFAULT_PEN))
+}
+
+@test
+fn a_new_strip_shows_no_marks_and_does_not_clear() {
+  assert Strip.marks(Strip.strip(), 0) == []
+  assert Strip.clears_at(Strip.strip()) == None
+}
+
+@test
+fn press_marks_a_key_as_print_writes_it_and_a_paste_as_one_mark_and_skips_unknown_bytes() {
+  s = first()
+  assert Strip.marks(s, 0) == ["a", "<Esc>", "<Paste>"]
+  assert Strip.clears_at(s) == Some(1500)
+}
+
+@test
+fn press_marks_modifiers_and_names_in_the_canonical_form() {
+  s = Strip.press(Strip.strip(), 0, keys("<C-S-a><Space>"))
+  assert Strip.marks(s, 0) == ["<C-S-a>", "<Space>"]
+}
+
+@test
+fn press_within_fade_ms_of_the_last_mark_adds_to_the_marks_and_puts_off_the_clearing() {
+  later = Strip.press(first(), 1000, keys("b"))
+  assert Strip.marks(later, 1000) == ["a", "<Esc>", "<Paste>", "b"]
+  assert Strip.marks(later, 2499) == ["a", "<Esc>", "<Paste>", "b"]
+  assert Strip.marks(later, 2500) == []
+  assert Strip.clears_at(later) == Some(2500)
+}
+
+@test
+fn press_fade_ms_after_the_last_mark_starts_the_marks_again() {
+  later = Strip.press(first(), 1000, keys("b"))
+  again = Strip.press(later, 2500, keys("c"))
+  assert Strip.marks(again, 2500) == ["c"]
+  assert Strip.clears_at(again) == Some(4000)
+}
+
+@test
+fn press_with_no_marks_leaves_the_strip_as_it_is() {
+  same = Strip.press(first(), 100, [Unknown(Bytes.hex("ff"))])
+  assert Strip.clears_at(same) == Some(1500)
+  assert Strip.marks(same, 1499) == ["a", "<Esc>", "<Paste>"]
+  assert Strip.marks(same, 1500) == []
+}
+
+@test
+fn row_with_no_marks_is_blank() {
+  assert Strip.row([], 5) == blanks(5)
+}
+
+@test
+fn row_puts_the_marks_between_spaces_in_inverse_on_the_left() {
+  assert Strip.row(["a", "<Esc>"], 10) == narrow(" a<Esc> ").append(blanks(2))
+}
+
+@test
+fn row_drops_the_oldest_marks_behind_an_ellipsis_until_the_rest_fits() {
+  assert Strip.row(["abc", "<Esc>", "<CR>"], 10) == narrow(" …<CR> ").append(blanks(3))
+  assert Strip.row(["abc", "<Esc>", "<CR>"], 12) == narrow(" …<Esc><CR> ")
+}
+
+@test
+fn row_keeps_the_right_end_of_the_last_mark_when_it_does_not_fit_alone() {
+  assert Strip.row(["<PageDown>"], 6) == narrow("…own> ")
+}
+
+@test
+fn row_takes_two_cells_for_a_wide_character() {
+  assert Strip.row(["あい"], 6)
+    == List.flatten([narrow(" "), wide(HIRAGANA_A), wide(HIRAGANA_I), narrow(" ")])
+  assert Strip.row(["ああああ"], 6)
+    == List.flatten([narrow("…"), wide(HIRAGANA_A), wide(HIRAGANA_A), narrow(" ")])
+}
+
+@test
+fn row_puts_a_space_for_a_wide_character_that_the_right_end_cuts_in_half() {
+  assert Strip.row(["ああああ"], 5) == List.flatten([narrow("… "), wide(HIRAGANA_A), narrow(" ")])
+}
+
+@test
+fn row_is_blank_when_cols_is_less_than_3() {
+  assert Strip.row(["x"], 2) == blanks(2)
+}

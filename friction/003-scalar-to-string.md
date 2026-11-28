@@ -10,6 +10,8 @@
   VT の parser（`wish/parser.emel:55`、`:79`、`:83`、`:93`、`:99`、サブプロジェクト 3 の計画の Task 3）: `Print` の文字列と中間の文字を、code point を `String.from_code_point(c)` で String にして 1 文字ずつ足す形で書き、Option であることを忘れてそのまま String として使った（`text + String.from_code_point(c)`）。code point は `advance` が受けた String から取ったもの
   VT の解釈（`wish/terminal.emel:79`、`:158`、`:226`、`:242`、サブプロジェクト 3 の計画の Task 5）: 文字を `Char` の型で持ち、`Print` の文字列を `s.chars()` で `Char` の List にし（`:68`）、CSI と ESC の終わりの文字を `Char`、中間の文字を `inter.last()` の `Option[Char]` で受けた（`:70-71`）。DEC の罫線の表も `drawing(c: Char) -> Char` にした
   tape のパーサ（`wish/tape.emel:157-171`、サブプロジェクト 1 の計画の Task 1）: `run` の引数を `arg.text.chars()` の `List[Char]` で 1 文字ずつ読み（`:158`、`:171`）、作りかけの語に `(word ?? "") + c` で足した（`:159`。String の `+` と `??` は 016）。失敗しない形で文字から String を作れるつもりだった
+  キーの帯（`wish/strip.emel:75-77`、`:82-86`、`:92-94`、サブプロジェクト 4 の計画の Task 2）: 帯の文字を `Char` の型で持ち（`take_right` の `List[Char]`、`char_width(c: Char)`）、`s.chars()` を `Char` の List と読み、文字を `c.to_string()` で String にした（右の端をつなぐ所と、`Cell` の文字）
+  overlay の合成（`wish/overlay.emel:110-114`、サブプロジェクト 4 の計画の Task 3）: 変わった行のセルを書く所で、`Cell` を `Cell(ch, pen)`、`WideHead(ch, pen)`、`WideTail(_)` の variant と考え、文字の `ch` を String として `acc ++ ch` でつないだ（`Vt.Screen` の `Cell` は `Cell(char: Int, occupancy, pen)` で、文字は Int の code point）
 - 診断: wish check の ``error[E0212]: module `String` has no `from_scalars` ``
   表記の wish check（v0.28.2）では，`:136` の `bracket` の呼び出しに ``error[E0301]: type mismatch: expected `String`, found `(Mods, Option[String])` ``（同じ行の `..m` の E0114 で崩れた引数の後追い）．`:134` と `:153` は前置の match（E0142）の腕にあり，届かなかった
   UTF-8 デコーダの wish check（v0.28.2）: `:76` に ``error[E0212]: module `String` has no `from_chars` ``、`:63` の `List[Char]` に ``error[E0211]: cannot find type `Char` in this scope`` が 2、`:56` の `Char.from_int` に ``error[E0211]: cannot find module or trait `Char` in this scope``。どれも help は付かない。`:15` は char literal（013）の E0105 の行に、`:24` は構成子を並べた `type`（029）の中に、`:32` は `=>` の腕（E0110）の中にあり、届かなかった
@@ -17,8 +19,10 @@
   VT の解釈の wish check（v0.28.2）: `Char` に ``error[E0211]: cannot find type `Char` in this scope`` が 7（`:79` と `:158` に 2 つずつ、`:226` に 1 つ、`:242` に 2 つ）。help は付かない。`:68` の `s.chars()`（Emela の `chars` は grapheme cluster の String の List を返す）と `:70-71` の `inter.last()` は `=>` の腕（E0110）の中にあり、届かなかった
   VT の公開 API の wish check（v0.28.2）: `:66-68` の `line.filter(...).map(fn(c) { String.from_code_point(c.char) })` に ``error[E0301]: type mismatch: expected `List[String]`, found `List[Option[String]]` ``（``= note: the mismatch is between `String` and `Option[String]` ``）。続く `.join("")` が `List[String]` を求めるので出た。help は付かない
   tape のパーサの wish check（v0.28.2）: `:158` の `List[Char]` に ``error[E0211]: cannot find type `Char` in this scope`` の 1 つ。help は付かない。`:159` の `+` は `let`（004）と `??` の E0105 で崩れた行にあり、届かなかった
+  キーの帯の wish check（v0.28.2）: `Char` に ``error[E0211]: cannot find type `Char` in this scope`` が 2（`:75`、`:94`）。help は付かない。`c.to_string()`（`:77`、`:84`、`:86`）は `=` で書いた関数の本体（020）の中にあり、届かなかった
+  overlay の合成の wish check（v0.28.2）: `:110-116` の `fold` の closure は `let`（004）で崩れた行の右辺にあり、届かなかった
 - 回避策:
-  13 か所（どれも `FRICTION(003)` の印）
+  14 か所（どれも `FRICTION(003)` の印）
   - `Text.slice`（`text/src/lib.emel`）: `from_code_points(...)` の `None` を `panic` にする．code point は `s` から取ったので起きない
   - `code_point`（`text/test/text_test.emel`）: 生成器は scalar value だけを作るので起きない `None` を `panic` にする補助関数
   - `Syntax.group_name`（`regex/src/syntax.emel`，計画の Task 4）: capture group の名前の code point を `Text.from_code_points` で String にし，`None` を `panic` にする．名前は `is_name_character` が ASCII だけを通したもの（014）なので起きない．wish（`wish/syntax.emel:241-243`）は Unicode の名前を考えていたので，`None` を `invalid capture group name` の RegexSyntax にしていた
@@ -32,7 +36,9 @@
   - `character`（`test/vt_snapshot.emel`、サブプロジェクト 3 の計画の Task 5）: スナップショットの String を作るため、セルの code point（`Vt.Screen` の `Cell` は Int で持つ）を `String.from_code_point` で 1 文字の String にし、起きない `None` をその場の match で defect にした（040）。`src/vt/terminal.emel` は文字を初めから Int の code point で持ち（`Print` の文字列は `code_points()`、中間の文字は `code_points().last()`、終わりの文字は parser の Int のまま）、String にしないので、そちらは回り道に数えない
   - `character`（`src/vt.emel`、サブプロジェクト 3 の計画の Task 6）: `text` が各行のセルの code point（`Cell` は Int で持つ）を `String.from_code_point` で 1 文字の String にし（`string_of`、002）、起きない `None` をその場の match で defect にした（040）。wish（`wish/vt.emel:68`）は `String.from_code_point` が String を返す形で書いていた。`test/vt_snapshot.emel` と同じ形を、private なのでもう 1 つ書いた
   - `string_of`（`src/tape.emel`、サブプロジェクト 1 の計画の Task 1）: tape の行を code point の List で持つ（002）ので、命令と設定の名前、`run` の語と `text`、`wait` の pattern、`>` のキー列を `Text.from_code_points` で String に戻し、起きない `None` をその場の match で defect にした（040）。code point は tape の String から取ったもの。`run` の語は、wish の 1 文字ずつ String に足す形でなく、code point を逆順の List に貯めて、語の終わりで 1 回 `string_of` にかける
+  - `character`（`src/overlay.emel`、サブプロジェクト 4 の計画の Task 3）: 変わった行を書く `draw_row` が、セルの code point（`Cell` は Int で持つ）を `String.from_code_point` で 1 文字の String にし、起きない `None` をその場の match で defect にした（040）。`src/vt.emel` と同じ形を、private なのでもう 1 つ書いた
   `from_code_points` は，wish では `List.all` で確かめてから `String.from_scalars` で組み立てていた．実装は確かめと組み立てを `String.from_code_point` の Option 1 つで済ませたので，そこに残った回り道は Option の List をまとめる関数が無いこと（006）で，ここには数えない
+  キーの帯（サブプロジェクト 4 の Task 2、`src/overlay/strip.emel`）は回り道に数えない: `Vt.Screen` の `Cell` と `Vt.Width.is_wide` が Int の code point を受けるので、幅とセルは `code_points()` の Int で読み、最後の印の右の端は `chars()` の grapheme cluster の String のまま取って `String.concat` でつなぐ。code point から String を作る所は無い
   std も `String.to_ascii_lowercase` と `String.to_ascii_uppercase` で，同じ起きない `None` を `.or("")` で握りつぶしている
 - コスト: 補助関数 3 つ（`code_point`，`string_of`，表記の `text_of`．`string_of` は 002 を避けるためでもある）と，起きない分岐 4 つ（25 行ほど）と `expect`（040）の呼び出し 1 つ．普段のコードに基盤レベルは漏れていない
   encode（Task 6）: 補助関数 1 つ（`text_of`、起きない分岐を含めて 6 行）。表記の `text_of` は private で別の module から呼べないので、同じ働きのものをもう 1 つ書いた
@@ -41,6 +47,7 @@
   VT の解釈（Task 5）: test の補助に補助関数 1 つ（`character`、起きない分岐を含めて 6 行）。スナップショットの各セルで 1 文字の String を作ってつなぐ
   VT の公開 API（Task 6）: 補助関数 1 つ（`character`、起きない分岐を含めて 6 行）。`text` を呼ぶたびに、見えている画面の各セルで 1 文字の String を作ってつなぐ（80 × 24 で 1920 個）。テストは parser のテストと `test/cut.emel` の `character` を共有し、補助関数は増えない
   tape のパーサ（Task 1）: 補助関数 1 つ（`string_of`、起きない分岐を含めて 6 行）。text の `Text.slice` と regex の `string_of` と同じ `panic` の腕を、private なのでもう 1 つ書いた
+  overlay の合成（Task 3）: 補助関数 1 つ（`character`、起きない分岐を含めて 6 行）。描き直す行の各セルで 1 文字の String を作ってつなぐ（cols 個まで）
 - spec: `[api.string]`（`from_code_point`），`[target.string]`（「There is no character type」），`[lib.api-rules]`（「A precondition of the caller is broken: it is a defect」）
 - 既存: なし（emela の issue と `proposals/` に無い．002 と同じ検索，2026-11-25）
 - 行き先: 前提の範囲内で spec に足りない → 002 の proposal の Open questions に足した．単独の proposal にはしない（O(`to - from`) の `slice` が std に入れば，text の 1 か所と regex の `string_of` は消える．残るのはテストの生成器と regex の group の名前の 2 か所で，どちらも String から取ったのではない code point から String を作る）

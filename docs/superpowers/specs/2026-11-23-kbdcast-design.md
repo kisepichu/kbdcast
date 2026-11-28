@@ -296,8 +296,8 @@ effect Driver {
 | tape のパーサ | golden | パース結果と、エラーの行、列、文言 |
 | recorder | fake | `TestDriver` で、tape から操作の並び（キーを送る間隔を含む）を見る。`FakePty` と `TestClock` で、問い合わせへの返事、遅れて届く出力、途中での終了を決定的に再現する |
 | pty-bun | 結合テスト | 本物の PTY で `cat` や小さなスクリプトを動かす。時間は揺れるので、中身だけを確かめる |
-| overlay | golden | 合成した画面（文字と属性） |
-| E2E | smoke | tape、cast、overlay、agg を通す。比べるのは最終画面のテキストで、GIF のバイトは比べない |
+| overlay | 固定の例と性質 | 出力の data の文字列（固定の例）。3 の golden の入力を通した出力を VT で読み直すと、アプリの部分と帯が合う（性質） |
+| E2E | smoke | tape、cast、overlay、agg を通す。GIF の frame を PNG にして目で見る。GIF のバイトは比べない |
 
 ## 12. 開発手法
 
@@ -394,7 +394,7 @@ flowchart LR
 - mise の `github:` backend で emela のリリースが取れるか。0 で確かめ、取れることを確認した。ただし公式の Linux バイナリは glibc 2.39 の weak シンボルを要求し、Ubuntu 22.04 では呼ぶたびに警告が出る（friction 001）。
 - Emela 0.29 で capture checking が既定になる予定（#666）。版を固定し、上げるときにメモを見直す。
 - JS ターゲットでは `Array.set` が常にコピーするので、VT の画面の更新が遅い可能性がある。3 で測る。
-- overlay が画面を描き直す出力は cast を大きくする。差分だけを出すかどうかは 4 で決める。
+- overlay が画面を描き直す出力は cast を大きくする。4 で、変わった行だけを書くことにした。
 - Rust のビルド。2 の termwiz の harness で用意し（Rust の版は `mise.toml` で固定）、3 の avt の harness も同じ形で足した。
 
 ## 15. 決定の記録

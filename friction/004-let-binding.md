@@ -27,6 +27,9 @@
   recorder の wish（`wish/recorder.emel`、サブプロジェクト 1 の計画の Task 4）でも、1 行に `let` を書いた（`:39` の `let last = rest.is_empty()`）
   LiveDriver の wish（`wish/live.emel`、サブプロジェクト 1 の計画の Task 5）でも、7 行に `let` を書いた（`:41`、`:48`、`:60`、`:75`、`:92`、`:94`、`:117`。`:92`、`:94`、`:117` は `let (next_vt, replies) = ...` のように組を分ける形）
   cli の main の wish（`wish/main.emel`、サブプロジェクト 1 の計画の Task 6）でも、3 行に `let` を書いた（`:31`、`:34`、`:38`。`:31` と `:34` は右辺の後ろに `catch { ... }` を付けた形）
+  cast の reader の wish（`wish/cast_read.emel`、サブプロジェクト 4 の計画の Task 1）でも、5 行に `let` を書いた（`:34`、`:52`、`:56-58`。`:52` と `:56` は `let (_, events) = ...` のように組を分ける形）
+  overlay の合成の wish（`wish/overlay.emel`、サブプロジェクト 4 の計画の Task 3）でも、17 行に `let` を書いた（`:25-27`、`:42-44`、`:50`、`:84`、`:90-94`、`:97`、`:101`、`:110`、`:122`。`:43-44`、`:50`、`:84`、`:91`、`:110` は `let (o, cleared) = ...` のように組を分ける形、`:97` は `let o = { ..o, now: t }` と同じ名前を束ね直す形）
+  cli の overlay の wish（`wish/main_overlay.emel`、サブプロジェクト 4 の計画の Task 4）でも、5 行に `let` を書いた（`:24`、`:31`、`:37`、`:39`、`:40`。`:31`、`:37`、`:40` は `let (header, events) = ...` のように組を分ける形、`:24` は右辺が前置の match の `let text = match ... { ... }`、`:31` は右辺の後ろに `catch { ... }` を付けた形）
 - 診断:
   wish check（emela 0.28.2、`wish/text.emel:52-155`）。`let` の行ごとに 2 つ出る:
   - `let` に ``error[E0118]: expected expression``
@@ -75,6 +78,14 @@
   LiveDriver の wish（サブプロジェクト 1 の Task 5）では、7 行すべて（`:41`、`:48`、`:60`、`:75`、`:92`、`:94`、`:117`）に E0118 と E0122 が 1 つずつ（14）。束縛されなかった名前の E0211 が 14 続いた（`left` が 4、`bytes` と `text` が 2 つずつ、`start`、`next_decoder`、`next_vt`、`replies`、`next_writer`、`line`）。88 の診断のうち 28 がこの 1 つの誤りから出ている。右辺の `Clock.now()`（071）、Instant の引き算（演算子の多重定義。前提に反する）、`.as_ms()`（016）には届かなかった
 
   cli の main の wish（サブプロジェクト 1 の Task 6）では、3 行すべてに E0118 と E0122 が 1 つずつ（6）。束縛されなかった名前の E0211 が 5 続いた（`tape` が 4、`dir`）。45 の診断のうち 11 がこの 1 つの誤りから出ている。右辺の後ろの `catch`（016）と、`Path.absolute`（077）には届かなかった
+
+  cast の reader の wish（サブプロジェクト 4 の Task 1）では、届いた 2 行（`:34`、`:52`）に E0118 と E0122 が 1 つずつ（4）。束縛されなかった名前の E0211 が 4 続いた（`json` が 3、`events`）。60 の診断のうち 8 がこの 1 つの誤りから出ている。`:52` の右辺の `fold` の closure（`:52-68`）は読まれず、その中の `:56-58` の `let`、`fn(...)` の closure（E0148）、`Float.to_int`（016）には届かなかった
+
+  キーの帯の wish（サブプロジェクト 4 の Task 2）では、届いた 3 行（`:17`、`:51`、`:53`）に E0118 と E0122 が 1 つずつ（6）。束縛されなかった名前の E0211 が 4 続いた（`whole` が 2、`added`、`dropped`）。45 の診断のうち 10 がこの 1 つの誤りから出ている。`:53` の右辺の `fn(n) { ... }`（E0148）と String の `++`（016）には届かなかった。残りの 2 行（`:37`、`:69`）は `=` で書いた関数の本体（020）の中にあり、届かなかった
+
+  overlay の合成の wish（サブプロジェクト 4 の Task 3）では、17 行すべてに E0118 と E0122 が 1 つずつ（34）。束縛されなかった名前の E0211 が 9 続いた（`o`、`json`、`cleared`、`line`、`changed`、`cursor`、`visible`、`data`、`text`。`o` には ``= help: did you mean `h`?`` が付く）。119 の診断のうち 43 がこの 1 つの誤りから出ている。右辺の `Dynamic.set`（085）、`List.repeat`（022）、`fn(...)` の closure（E0148）、`min`、`List.indexed`、`List.concat`（016）と、`:110` の `fold` の closure の中の or-pattern（015）とセルの文字（003）には届かなかった
+
+  cli の overlay の wish（サブプロジェクト 4 の Task 4）では、届いた 4 行（`:24`、`:31`、`:37`、`:39`）に E0118 と E0122 が 1 つずつ（8）。束縛されなかった名前の E0211 が 2 続いた（`first`、`last`）。19 の診断のうち 10 がこの 1 つの誤りから出ている。`:24` の右辺の前置の match の腕（`:25-29`）と `:31` の右辺の `catch` の腕（`:32-35`）は読まれず、その中の `Ok` と `Err`、`try` と `catch`、`Process.exit(1)`（016）、`FileSystem.read_text`（071）、`${...}`（033）には届かなかった。`:39` の右辺の `fold` の closure（`:39-43`）も読まれず、その中の `:40` の `let` と `fn(o, e)`（E0148）には届かなかった
 - 回避策: `let` を消して `start = Int.max(from, 0)` と書いた（`text/src/lib.emel` の `slice`）。regex の `regex/src/syntax.emel`、`regex/src/class.emel`、`regex/src/vm.emel`、`regex/src/lib.emel`、テストの `regex/test/pattern_gen.emel`、key の `src/key.emel`（`(rep_code, rep_mods) = representative(c)`）、表記の `src/key/notation.emel`、decode の `src/key/decode.emel`、golden の補助の `test/golden.emel` も同じく `let` を消した。正しい構文に直しただけなので、コードに印は付けない
   encode（Task 6、`src/key/encode.emel`）も同じく `let` を消した（`higher = ...`、`m = key.mods()`、`cr = ...`。`:174` の `final` は、F1〜F4 を腕に分けたので（009）束縛が要らなくなった）
   UTF-8 デコーダ（Task 1、`src/utf8.emel`）も同じく `let` を消した（`code_point = ...`、`bytes_seen = ...`、`(next, strings) = read(...)`。`push` の `(d, out) = acc` は、fold を位置で歩く再帰にした（055）ので要らなくなった）。module の直下の定数は `const REPLACEMENT: String = "\u{FFFD}"`（`[data.const]`。名前は大文字）にした
@@ -89,6 +100,10 @@
   recorder（サブプロジェクト 1 の Task 4、`src/recorder.emel` の `run_steps`）も同じく `let` を消した（`last = rest.is_empty()`。最終レビューの後の修正で、後ろに `set` の行だけが続く step も最後とする `last = !rest.any(drives)` になった）
   LiveDriver（サブプロジェクト 1 の Task 5、`src/recorder/live.emel`）も同じく `let` を消した（`bytes = Encode.encode(...)`、`left = ...`、`(decoder, text) = Utf8.feed(...)`、`(vt, replies) = Vt.feed(...)`、`(writer, line) = Cast.event(...)`）。`start` は、`read_window` の引数に `(use Clock).now()` を直に渡したので要らなくなった
   cli の main（サブプロジェクト 1 の Task 6、`cli/src/main.emel` の `rec`）も同じく `let` を消した（`tape = Tape.parse(...)`、`command = tape.command`）。`dir` は、`with` の項目の引数に `directory(path)` を直に渡したので要らなくなった
+  cast の reader（サブプロジェクト 4 の Task 1、`src/cast.emel`）も同じく `let` を消した（`json = parse(1, text)`、`(_, events) = lines.fold(...)`、`(interval, code, data) = read_event(line, text)`、`time = clock + interval`、`ms = time * 1000.0`、`at_ms = Float.round(ms)`）
+  キーの帯（サブプロジェクト 4 の Task 2、`src/overlay/strip.emel`）も同じく `let` を消した（`added = keys.filter_map(mark)`、`whole = ...`、`shown = ...`、`end = ...`）。`dropped` は、古い印から落とした残りを全部作って `find` する形をやめ、新しい印から入るだけ取る `ends` にしたので要らなくなった（残りごとに印をつなぐと印の数の 2 乗になるのを避けたため。回り道ではない）
+  overlay の合成（サブプロジェクト 4 の Task 3、`src/overlay.emel`）も同じく `let` を消した（`t = time(e)`、`(o, cleared) = clear_until(o, t)`、`(writer, line) = Cast.event(...)`、`(col, row) = Vt.cursor_position(vt)`、`o = Overlay(now: t, ..o)` など）。`json` は、`with_rows`（085）を `Json.to_string` の引数に直に書いたので要らなくなり、`blank` は、初めの画面を新しい VT の画面にした（022）ので要らなくなった
+  cli の overlay（サブプロジェクト 4 の Task 4、`cli/src/main.emel` の `overlay`）も同じく `let` を消した（`(header, events) = Cast.read(...)`、`(first, line) = Overlay.start(header)`、`last = events.fold(...)`、`(next, lines) = Overlay.step(o, e)`）。`text` は、Task 4 では `Cast.read` の引数に `(use FileSystem).read_text(path)` を直に渡したので要らなくなった。Task 4 の review の後の fix（`5a4e655`）で、ファイルを読む所と 5 つのファイルの error の腕を `rec` と共有する `reading(path, f)` にまとめたので、今の `text` は、`reading` が `f((use FileSystem).read_text(path))` と渡す closure の引数（`reading(path, |text| { ... })`）になった（087）
 - コスト:
   コードのコストは無い。直すには spec を引く必要があった。診断から分かるのは `let` が式として読めないことだけで、wish-first（AGENTS.md 規則 1）では spec を読む前に wish を書くので、そのときの手がかりは診断しかない。後に続く 4 つの E0211 は束縛の失敗の後追いで、wish の本当の診断（`String.from_scalars` の E0212、003）を埋もれさせる
 - spec:

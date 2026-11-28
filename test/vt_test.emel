@@ -48,6 +48,13 @@ fn cursor_is_the_column_and_the_row_or_none_while_hidden() {
 }
 
 @test
+fn cursor_position_is_the_column_and_the_row_also_while_hidden() {
+  t = fed(4, 3, "\u{1b}[?25l\u{1b}[3;2H")
+  assert Vt.cursor(t) == None
+  assert Vt.cursor_position(t) == (1, 2)
+}
+
+@test
 fn input_modes_follow_what_the_output_sets() {
   assert Vt.input_modes(fed(3, 1, "\u{1b}[?1h")).cursor_keys == Application
 }

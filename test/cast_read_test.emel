@@ -1,0 +1,116 @@
+import Cast.{CastError, Output, Input, Marker, Exit}
+import Std.Dynamic
+
+# A header that `read` accepts, for the casts that go wrong after it.
+const HEADER: String = "{\"version\": 3, \"term\": {\"cols\": 2, \"rows\": 1}}"
+
+# The line and the message of the CastError that `read` fails with, or `(0, "")` if it does not
+# fail.
+fn failure(text: String) -> (Int, String) {
+  {
+    Cast.read(text)
+    (0, "")
+  } escape {
+    CastError(line:, message:) -> (line, message)
+  }
+}
+
+@test
+fn read_reads_the_header_and_the_events_at_their_time_from_the_start() {
+  (header, events) = Cast.read(
+    """
+    {"version": 3, "term": {"cols": 20, "rows": 3, "type": "xterm-256color"}, "title": "t"}
+    # comment
+    [0.5, "o", "a"]
+
+    [0.25, "i", "b"]
+    [1.0, "m", "mark"]
+    [0.0006, "o", "c"]
+    [0.0004, "o", "d"]
+    [2, "x", "0"]
+    [0.1, "q", "unknown"]
+    """,
+  )
+  assert header.cols == 20
+  assert header.rows == 3
+  assert Dynamic.field(header.json, "title", Dynamic.string) == "t"
+  assert events
+    == [
+      Output(500, "a"),
+      Input(750, "b"),
+      Marker(1750, "mark"),
+      Output(1751, "c"),
+      Output(1751, "d"),
+      Exit(3751, "0"),
+    ]
+}
+
+@test
+fn read_rounds_the_sum_of_the_intervals_not_each_interval() {
+  # Each interval alone is less than half a millisecond, and the sum of the two is more.
+  (_, events) = Cast.read("#{HEADER}\n[0.0004, \"o\", \"a\"]\n[0.0004, \"o\", \"b\"]")
+  assert events == [Output(0, "a"), Output(1, "b")]
+}
+
+@test
+fn read_counts_the_interval_of_an_event_whose_code_it_skips() {
+  (_, events) = Cast.read("#{HEADER}\n[0.1, \"q\", \"unknown\"]\n[0.1, \"o\", \"a\"]")
+  assert events == [Output(200, "a")]
+}
+
+@test
+fn read_reads_what_the_writer_wrote() {
+  (w, first) = Cast.event(Cast.writer(), 0, "o", "a\r\n")
+  (w, second) = Cast.event(w, 100, "o", "\u{1b}[1m\"\\")
+  (_, third) = Cast.event(w, 1234, "o", "あ\u{9b}")
+  (header, events) = Cast.read("#{Cast.header(20, 3, "x")}\n#{first}\n#{second}\n#{third}\n")
+  assert header.cols == 20
+  assert header.rows == 3
+  assert events == [Output(0, "a\r\n"), Output(100, "\u{1b}[1m\"\\"), Output(1234, "あ\u{9b}")]
+}
+
+@test
+fn read_rejects_a_cast_without_lines() {
+  assert failure("") == (1, "the cast is empty")
+}
+
+@test
+fn read_rejects_a_header_that_is_not_asciicast_v3() {
+  assert failure("[1]") == (1, "the header is not a JSON object")
+  assert failure("{\"version\": 2, \"width\": 80, \"height\": 24}")
+    == (
+      1,
+      "only asciicast v3 is supported (this is version 2; asciinema convert -f asciicast-v3 can convert it)",
+    )
+  assert failure("{\"term\": {\"cols\": 2, \"rows\": 1}}")
+    == (
+      1,
+      "only asciicast v3 is supported (this is version null; asciinema convert -f asciicast-v3 can convert it)",
+    )
+  assert failure("{\"version\": 3, \"term\": {\"cols\": 0, \"rows\": 3}}")
+    == (1, "the header needs term.cols and term.rows of at least 1")
+  assert failure("{\"version\": 3, \"term\": {\"cols\": 2}}")
+    == (1, "the header needs term.cols and term.rows of at least 1")
+}
+
+@test
+fn read_rejects_a_line_that_is_not_json() {
+  (line, message) = failure("{\"version\": 3")
+  assert line == 1
+  assert message.starts_with("invalid JSON: ")
+  (line, message) = failure("#{HEADER}\n# c\nnot json")
+  assert line == 3
+  assert message.starts_with("invalid JSON: ")
+}
+
+@test
+fn read_rejects_an_event_that_it_cannot_read() {
+  assert failure("#{HEADER}\n[0.1, \"o\"]") == (2, "an event is [interval, code, data]")
+  assert failure("#{HEADER}\n[0.1, 1, \"a\"]") == (2, "an event is [interval, code, data]")
+  assert failure("#{HEADER}\n[-0.1, \"o\", \"a\"]") == (2, "the interval is negative")
+  assert failure("#{HEADER}\n[3000000, \"o\", \"a\"]")
+    == (2, "the time is too large (more than 2147483647 ms)")
+  assert failure("#{HEADER}\n[2000000, \"o\", \"a\"]\n[200000, \"o\", \"b\"]")
+    == (3, "the time is too large (more than 2147483647 ms)")
+  assert failure("#{HEADER}\n[0.1, \"r\", \"90x30\"]") == (2, "resize events are not supported")
+}

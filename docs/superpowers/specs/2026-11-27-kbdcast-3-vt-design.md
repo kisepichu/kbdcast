@@ -106,6 +106,7 @@ pub fn reply_bytes(r: Reply) -> Bytes
 pub fn size(t: Terminal) -> (Int, Int)                     # 列と行
 pub fn lines(t: Terminal) -> List[List[Cell]]              # 見えている画面の各行のセル
 pub fn cursor(t: Terminal) -> Option[(Int, Int)]           # 列と行。見えないときは None（agg と同じ）
+pub fn cursor_position(t: Terminal) -> (Int, Int)          # 列と行。見えないときも（4 の overlay が使う）
 pub fn text(t: Terminal) -> String                         # wait が見る文字列
 pub fn input_modes(t: Terminal) -> InputModes
 ```

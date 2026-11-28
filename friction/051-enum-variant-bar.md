@@ -11,6 +11,7 @@
   - tape のパーサ（サブプロジェクト 1 の計画の Task 1）でも、1 行に並べる形と行の頭の形の両方: `wish/tape.emel:11-14`（`Step`。recorder の design spec の §4 と計画の Interfaces の `Keys(Int, List[Key]) | Sleep(Int, Duration) | ...` を写した）、`:21-24`（`Phase`）、`:154`（`enum Quote { Bare | Single(Int) | Double(Int) }`）
   - pty の effect（サブプロジェクト 1 の計画の Task 3）でも、行の頭の `|`: `wish/pty.emel:10`（`Output` の `| Exited(Int)`。計画の Interfaces と recorder の design spec の §8 の `{ Data(Bytes) | Exited(Int) }` を、1 行に 1 つの形に分けて写した）
   - recorder（サブプロジェクト 1 の計画の Task 4）でも、行の頭の `|`: `wish/recorder.emel:25-26`（`Reason` の `| Exited(Int)` と `| TimedOut(String, Duration, String)`。計画の Interfaces と recorder の design spec の §6 の `{ CannotSend(Unencodable) | Exited(Int) | TimedOut(...) }` を、1 行に 1 つの形に分けて写した）
+  - cast の reader（サブプロジェクト 4 の計画の Task 1）でも、行の頭の `|`: `wish/cast_read.emel:12-14`（`Event` の `| Input(Int, String)`、`| Marker(Int, String)`、`| Exit(Int, String)`。計画の Interfaces と overlay の design spec の §4 の `{ Output(Int, String) | Input(Int, String) | ... }` を、1 行に 1 つの形に分けて写した）
   ```emela
   pub enum KeyCode {
     Char(Int)
@@ -30,10 +31,12 @@
   tape のパーサの wish check（v0.28.2）では 6: 1 行に並べた `|`（`:12`、`:154`）の最初の 1 つに ``E0110: expected `,` or newline between variants`` が 1 つずつ、行の頭の `|`（`:13`、`:23`）に ``E0110: expected variant name`` と ``E0110: expected `,` or newline between variants`` が 2 つずつ（`:12` と `:13` の 2 つ目の `|` には届かなかった）。続けて、読まれなかった variant の `After`、`Wait`、`Single`、`Double` を使う所に ``E0211: cannot find constructor`` が 17（`After` が 14、ほかが 1 つずつ）
   pty の wish check（v0.28.2）では 2: `:10` の `|` に ``E0110: expected variant name``、続く `Exited` に ``E0110: expected `,` or newline between variants``。ほかの 2 つは import の無い `Bytes`（011）
   recorder の wish check（v0.28.2）では 4: `:25` と `:26` の `|` に ``E0110: expected variant name`` が 1 つずつ、続く `Exited` と `TimedOut` に ``E0110: expected `,` or newline between variants`` が 1 つずつ。読まれなかった `Exited` を使う所（`:74`）に ``E0211: cannot find constructor `Exited` in this scope`` が 1 続いた（ほかの所は、前置の match（E0142）の腕の中にあって届かなかった）
+  cast の reader の wish check（v0.28.2）では 6: `:12-14` の `|` に ``E0110: expected variant name`` が 1 つずつ、続く `Input`、`Marker`、`Exit` に ``E0110: expected `,` or newline between variants`` が 1 つずつ。読まれなかった variant を使う所は、どれも `let`（004）で崩れた `fold` の closure の中にあり、E0211 は続かなかった
 - 回避策: 1 行に 1 つの variant を書いた（`src/key.emel`、`src/key/notation.emel`、`src/key/decode.emel`、`src/key/encode.emel`。サブプロジェクト 3 の UTF-8 デコーダの `src/utf8.emel` の `Step` も同じ）。正しい書き方に直しただけなので、コードに印は付けない
   tape のパーサ（サブプロジェクト 1 の Task 1、`src/tape.emel` の `Step`、`Phase`、`Quote`）も 1 行に 1 つの variant にした。印は付けない。`Phase` と `Quote` は、ほかの理由で形も変わった（`Before(Settings)` と `After(Settings, Command, List[Step])`、`Quoted(mark: Int, open: Int)`。015）
   pty の effect（サブプロジェクト 1 の Task 3、`pty/src/lib.emel` の `Output`）も 1 行に 1 つの variant にした。印は付けない
   recorder（サブプロジェクト 1 の Task 4、`src/recorder.emel` の `Reason`）も 1 行に 1 つの variant にした。印は付けない
+  cast の reader（サブプロジェクト 4 の Task 1、`src/cast.emel` の `Event`）も 1 行に 1 つの variant にした。印は付けない
 - コスト: コードのコストは無い。直すには spec を引く必要があった（行の頭の `|` の診断は、区切りが `,` か改行であることを言わない）。行の頭の `|` は、後ろの名前の診断を隠す（034 の `F`）
 - spec: `[grammar.decl]`（`enum_decl = "enum" type_name [ type_params ] "{" variant { sep variant } "}" [ derive ]`、`sep = "," | NL`）、`[data.enum]`、`spec/diagnostics.md` の E0110
 - 既存: emela の issue と PR に無い（2026-11-27、`gh search issues --repo emela-lang/emela --include-prs` で「variant name」「enum variant」「leading bar」「E0110」を検索。当たったのは release の PR と、with の項目や import の別の話題）

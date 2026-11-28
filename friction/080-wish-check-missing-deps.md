@@ -1,15 +1,16 @@
 # 080 wish-check-missing-deps
 
-- 状態: open
+- 状態: filed
 - Emela: v0.28.2
-- 意図: wish-first（AGENTS.md 規則 1）で、兄弟の Pome を import する単位の wish を、実装の前に `tools/wish.ts check` で検査し、spec を読む前の書き方の誤りを診断で見る。サブプロジェクト 1 の cli の main（`wish/main.emel`、計画の Task 6）は root と pty-bun を、LiveDriver（`wish/live.emel`、Task 5）は pty を import する
+- 意図: wish-first（AGENTS.md 規則 1）で、兄弟の Pome を import する単位の wish を、実装の前に `tools/wish.ts check` で検査し、spec を読む前の書き方の誤りを診断で見る。import する Pome が、wish の時点の manifest にまだ無いことがある（新しい Pome に置く仮の Pome.toml、または計画が wish の commit の後の Step で依存を足すとき）。サブプロジェクト 1 の cli の main（`wish/main.emel`、計画の Task 6）は root と pty-bun を、LiveDriver（`wish/live.emel`、Task 5）は pty を import する
 - こう書きたかった: wish の import（`wish/main.emel:13-18` の `import Kbdcast.Tape.{Tape, TapeError}` から `import PtyBun.{BunPty, SpawnFailed}` まで、`wish/live.emel` の `import Pty.{Pty, Output}`）が、計画の依存のとおりに解決され、wish の中の誤り（030、071 など）まで診断が届く
 - 診断:
   cli の main の wish check（v0.28.2）: cli の Pome がまだ無かったので、`tools/wish.ts` が仮の `cli/Pome.toml`（`provisionalManifest`。`[pome]` の名前、版、emela の版だけで、`[dependencies]` も `[replace]` も無い）を置いた。`Kbdcast.Tape`、`Kbdcast.Recorder`、`Kbdcast.Recorder.Live`、`Kbdcast.Key.Encode`、`Kbdcast.Key.Notation`、`PtyBun` の import に ``error[E0205]: undefined module`` が 6、続けて使う所に E0211（`BunPty`、`Reason` など）。030 の E0217 には届かなかった（030 にも書いた）
   LiveDriver の wish check（v0.28.2）: root の `Pome.toml` はあったが、pty への依存は計画の Step 2 で足すので、まだ無かった。`import Pty.{Pty, Output}` に ``error[E0205]: undefined module `Pty` ``、`Pty.write` と `Pty.read` の 4 か所（`:42`、`:62`、`:79`、`:96`）に ``error[E0211]: cannot find module or trait `Pty` in this scope``、`Output.Data` などの 2 か所に ``E0211: cannot find module or trait `Output` in this scope``。071 と 030 の E0217 には届かなかった（071 と 030 にも書いた）
   repo の外の使い捨ての Pome での同じ形（v0.28.2、2026-11-28）: 仮の Pome.toml と同じ manifest（名前 `github.com/kisepichu/kbdcast/cli`、依存なし）で、`import Kbdcast.Tape`、`import PtyBun.{BunPty}`、`import Pty.{Pty}` と、それを使う 4 行の `main` を `emela check` すると、E0205 が 3、E0211 が 3、W0302 が 1。計画の `[dependencies]`（root、pty、pty-bun）と `[replace]`（5 つの path）、`[external] allow` を足すと、同じ file が診断なしで通る
+  起きなかった所: サブプロジェクト 4 の cli の overlay の wish（`wish/main_overlay.emel`、計画の Task 4）は `Kbdcast.Cast`、`Kbdcast.Cast.{CastError}`、`Kbdcast.Overlay` を import するが、`cli/Pome.toml` は既に root を `[dependencies]` に持っていた（wish の commit `4e21ae7` の時点でも同じ）ので、どれも解決され、E0205 は出なかった。19 の診断はどれも wish の書き方のもの（004、016 など）
 - 回避策: なし。wish の診断は E0205 と E0211 で止まったまま commit し、届かなかった論点は実装の `emela check` で確かめて、各メモ（030、071 など）に書いた。道具の friction なので、コードに印は付けない
-- コスト: wish-first の診断が、兄弟の Pome を使う所で毎回失われる。規則 1 は「spec を調べる前に」wish を書くので、その時の手がかりは診断だけで、import の先の誤り（module の名前の取り違え、effect を名前で呼ぶ形など）は実装まで見えない。普段のコードに基盤レベルは漏れていない
+- コスト: wish-first の診断が、兄弟の Pome を使う所のうち、依存が wish の時点の manifest にまだ無いとき（新しい Pome の仮の Pome.toml、または計画が wish の commit の後の Step で依存を足すとき）に失われる。規則 1 は「spec を調べる前に」wish を書くので、その時の手がかりは診断だけで、import の先の誤り（module の名前の取り違え、effect を名前で呼ぶ形など）は実装まで見えない。普段のコードに基盤レベルは漏れていない
 - spec: `[module.pome]`（`spec/language/04-modules.md:178`「A module can import only the Pomes listed in its own `[dependencies]`」、`:288` の `[replace]` はその Pome を build するときだけ効く）、`spec/diagnostics.md` の E0205、E0211。kbdcast の側は `tools/wish.ts` の `provisionalManifest`（`[pome]` だけを書く）と、計画の Step の順（wish の commit の後に依存を足す）
-- 既存: kbdcast の issue #12（closed。root に Pome.toml があると、入れ子の新しい Pome の wish が黙って検査されない）で仮の Pome.toml を置くようになったが、依存は書かない。2026-11-28、`gh issue list --repo kisepichu/kbdcast --state all --search wish` で検索し、依存の話は無かった
-- 行き先: kbdcast の道具の friction（emela には出さない）。行き先は `tools/wish.ts`: 仮の Pome.toml に、計画の `[dependencies]` と `[replace]`（wish の頭の注釈などで受ける）を書けるようにするか、wish check の前に依存を足す Step を計画に置く。未着手
+- 既存: kbdcast の issue #21（open。仮の Pome.toml に依存が無く、兄弟の Pome を import する wish が E0205 で止まる、というこの 080 そのもの。2026-11-28 に `gh issue view 21 --repo kisepichu/kbdcast` で確かめた）。kbdcast の issue #12（closed。root に Pome.toml があると、入れ子の新しい Pome の wish が黙って検査されない）で仮の Pome.toml を置くようになったが、依存は書かない。2026-11-28、`gh issue list --repo kisepichu/kbdcast --state all --search wish` で検索し、依存の話は #21 の他に無かった
+- 行き先: kbdcast の道具の friction（emela には出さない）→ issue: https://github.com/kisepichu/kbdcast/issues/21（2026-11-27 UTC に作成。open で、直しは未着手）。行き先は `tools/wish.ts`: 仮の Pome.toml に、計画の `[dependencies]` と `[replace]`（wish の頭の注釈などで受ける）を書けるようにするか、wish check の前に依存を足す Step を計画に置く

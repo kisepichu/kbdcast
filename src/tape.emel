@@ -90,8 +90,9 @@ pub fn parse(source: String) -> Tape fails TapeError {
   })
   phase match {
     Before(_) -> {
-      # The line after the last one. The empty tape, and a tape that ends with `\n`, end in an
-      # empty piece that is that line.
+      # FRICTION(083): String has no `lines`, so this counts the line after the last one from the
+      # pieces of `split`: the empty tape, and a tape that ends with `\n`, end in an empty piece
+      # that is that line.
       line = if lines.last() == Some("") { lines.length() } else { lines.length() + 1 }
       fail TapeError(line:, column: 1, message: "no run line")
     }
