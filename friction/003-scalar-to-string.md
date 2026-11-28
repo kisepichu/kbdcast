@@ -10,6 +10,7 @@
   VT の parser（`wish/parser.emel:55`、`:79`、`:83`、`:93`、`:99`、サブプロジェクト 3 の計画の Task 3）: `Print` の文字列と中間の文字を、code point を `String.from_code_point(c)` で String にして 1 文字ずつ足す形で書き、Option であることを忘れてそのまま String として使った（`text + String.from_code_point(c)`）。code point は `advance` が受けた String から取ったもの
   VT の解釈（`wish/terminal.emel:79`、`:158`、`:226`、`:242`、サブプロジェクト 3 の計画の Task 5）: 文字を `Char` の型で持ち、`Print` の文字列を `s.chars()` で `Char` の List にし（`:68`）、CSI と ESC の終わりの文字を `Char`、中間の文字を `inter.last()` の `Option[Char]` で受けた（`:70-71`）。DEC の罫線の表も `drawing(c: Char) -> Char` にした
   tape のパーサ（`wish/tape.emel:157-171`、サブプロジェクト 1 の計画の Task 1）: `run` の引数を `arg.text.chars()` の `List[Char]` で 1 文字ずつ読み（`:158`、`:171`）、作りかけの語に `(word ?? "") + c` で足した（`:159`。String の `+` と `??` は 016）。失敗しない形で文字から String を作れるつもりだった
+  キーの帯（`wish/strip.emel:75-77`、`:82-86`、`:92-94`、サブプロジェクト 4 の計画の Task 2）: 帯の文字を `Char` の型で持ち（`take_right` の `List[Char]`、`char_width(c: Char)`）、`s.chars()` を `Char` の List と読み、文字を `c.to_string()` で String にした（右の端をつなぐ所と、`Cell` の文字）
 - 診断: wish check の ``error[E0212]: module `String` has no `from_scalars` ``
   表記の wish check（v0.28.2）では，`:136` の `bracket` の呼び出しに ``error[E0301]: type mismatch: expected `String`, found `(Mods, Option[String])` ``（同じ行の `..m` の E0114 で崩れた引数の後追い）．`:134` と `:153` は前置の match（E0142）の腕にあり，届かなかった
   UTF-8 デコーダの wish check（v0.28.2）: `:76` に ``error[E0212]: module `String` has no `from_chars` ``、`:63` の `List[Char]` に ``error[E0211]: cannot find type `Char` in this scope`` が 2、`:56` の `Char.from_int` に ``error[E0211]: cannot find module or trait `Char` in this scope``。どれも help は付かない。`:15` は char literal（013）の E0105 の行に、`:24` は構成子を並べた `type`（029）の中に、`:32` は `=>` の腕（E0110）の中にあり、届かなかった
@@ -17,6 +18,7 @@
   VT の解釈の wish check（v0.28.2）: `Char` に ``error[E0211]: cannot find type `Char` in this scope`` が 7（`:79` と `:158` に 2 つずつ、`:226` に 1 つ、`:242` に 2 つ）。help は付かない。`:68` の `s.chars()`（Emela の `chars` は grapheme cluster の String の List を返す）と `:70-71` の `inter.last()` は `=>` の腕（E0110）の中にあり、届かなかった
   VT の公開 API の wish check（v0.28.2）: `:66-68` の `line.filter(...).map(fn(c) { String.from_code_point(c.char) })` に ``error[E0301]: type mismatch: expected `List[String]`, found `List[Option[String]]` ``（``= note: the mismatch is between `String` and `Option[String]` ``）。続く `.join("")` が `List[String]` を求めるので出た。help は付かない
   tape のパーサの wish check（v0.28.2）: `:158` の `List[Char]` に ``error[E0211]: cannot find type `Char` in this scope`` の 1 つ。help は付かない。`:159` の `+` は `let`（004）と `??` の E0105 で崩れた行にあり、届かなかった
+  キーの帯の wish check（v0.28.2）: `Char` に ``error[E0211]: cannot find type `Char` in this scope`` が 2（`:75`、`:94`）。help は付かない。`c.to_string()`（`:77`、`:84`、`:86`）は `=` で書いた関数の本体（020）の中にあり、届かなかった
 - 回避策:
   13 か所（どれも `FRICTION(003)` の印）
   - `Text.slice`（`text/src/lib.emel`）: `from_code_points(...)` の `None` を `panic` にする．code point は `s` から取ったので起きない
@@ -33,6 +35,7 @@
   - `character`（`src/vt.emel`、サブプロジェクト 3 の計画の Task 6）: `text` が各行のセルの code point（`Cell` は Int で持つ）を `String.from_code_point` で 1 文字の String にし（`string_of`、002）、起きない `None` をその場の match で defect にした（040）。wish（`wish/vt.emel:68`）は `String.from_code_point` が String を返す形で書いていた。`test/vt_snapshot.emel` と同じ形を、private なのでもう 1 つ書いた
   - `string_of`（`src/tape.emel`、サブプロジェクト 1 の計画の Task 1）: tape の行を code point の List で持つ（002）ので、命令と設定の名前、`run` の語と `text`、`wait` の pattern、`>` のキー列を `Text.from_code_points` で String に戻し、起きない `None` をその場の match で defect にした（040）。code point は tape の String から取ったもの。`run` の語は、wish の 1 文字ずつ String に足す形でなく、code point を逆順の List に貯めて、語の終わりで 1 回 `string_of` にかける
   `from_code_points` は，wish では `List.all` で確かめてから `String.from_scalars` で組み立てていた．実装は確かめと組み立てを `String.from_code_point` の Option 1 つで済ませたので，そこに残った回り道は Option の List をまとめる関数が無いこと（006）で，ここには数えない
+  キーの帯（サブプロジェクト 4 の Task 2、`src/overlay/strip.emel`）は回り道に数えない: `Vt.Screen` の `Cell` と `Vt.Width.is_wide` が Int の code point を受けるので、幅とセルは `code_points()` の Int で読み、最後の印の右の端は `chars()` の grapheme cluster の String のまま取って `String.concat` でつなぐ。code point から String を作る所は無い
   std も `String.to_ascii_lowercase` と `String.to_ascii_uppercase` で，同じ起きない `None` を `.or("")` で握りつぶしている
 - コスト: 補助関数 3 つ（`code_point`，`string_of`，表記の `text_of`．`string_of` は 002 を避けるためでもある）と，起きない分岐 4 つ（25 行ほど）と `expect`（040）の呼び出し 1 つ．普段のコードに基盤レベルは漏れていない
   encode（Task 6）: 補助関数 1 つ（`text_of`、起きない分岐を含めて 6 行）。表記の `text_of` は private で別の module から呼べないので、同じ働きのものをもう 1 つ書いた
