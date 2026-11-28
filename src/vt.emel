@@ -65,6 +65,13 @@ pub fn cursor(t: Terminal) -> Option[(Int, Int)] {
   if visible { Some((col, row)) } else { None }
 }
 
+## The column and the row of the cursor, also while it is hidden. The column is `cols` right after
+## writing in the last column, as in `cursor`.
+pub fn cursor_position(t: Terminal) -> (Int, Int) {
+  (col, row, _) = Terminal.cursor(t.term)
+  (col, row)
+}
+
 ## The characters of each row of the screen in view (the alternate screen while it is active),
 ## without the right halves of wide characters and without the White_Space at the end of the row,
 ## the rows joined by `\n`. A row that wraps is not joined to the next.
