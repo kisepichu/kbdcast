@@ -58,8 +58,8 @@ fn main() -> ExitCode {
 # Records the tape at `path`, writing the cast to stdout. The process runs in the directory that
 # holds the tape (spec §2).
 fn rec(path: String) -> ExitCode {
-  {
-    tape = Tape.parse((use FileSystem).read_text(path))
+  reading(path, |text| {
+    tape = Tape.parse(text)
     command = tape.command
     {
       with BunPty(
@@ -78,21 +78,16 @@ fn rec(path: String) -> ExitCode {
       )
       RecordError(line:, reason:) -> failure("#{path}:#{line}: #{describe(reason)}")
     }
-  } escape {
-    FileNotFound(..)                    -> failure("#{path}: no such file")
-    FileAccessDenied(..)                -> failure("#{path}: permission denied")
-    IsADirectory(..)                    -> failure("#{path}: is a directory")
-    InvalidText(..)                     -> failure("#{path}: not valid UTF-8")
-    FileSystemFailure(message:, ..)     -> failure("#{path}: #{message}")
+  }) escape {
     TapeError(line:, column:, message:) -> failure("#{path}:#{line}:#{column}: #{message}")
   }
 }
 
-# Reads the cast at `path` and writes the cast that `Overlay` makes to stdout, each line as soon as
-# it is made.
+# Writes the cast that `Overlay` makes from the cast at `path` to stdout, each line as soon as it
+# is made.
 fn overlay(path: String) -> ExitCode {
-  {
-    (header, events) = Cast.read((use FileSystem).read_text(path))
+  reading(path, |text| {
+    (header, events) = Cast.read(text)
     with SystemStdout {
       (first, line) = Overlay.start(header)
       (use Stdout).print_line(line)
@@ -104,13 +99,20 @@ fn overlay(path: String) -> ExitCode {
       Overlay.finish(last).each((use Stdout).print_line)
     }
     EXIT_SUCCESS
-  } escape {
+  }) escape {
+    CastError(line:, message:) -> failure("#{path}:#{line}: #{message}")
+  }
+}
+
+# Reads the text of the file at `path` and gives it to `f`. When the file cannot be read, writes
+# why to stderr and gives the exit code of a failure without calling `f`.
+fn reading(path: String, f: fn(String) -> ExitCode) -> ExitCode {
+  f((use FileSystem).read_text(path)) escape {
     FileNotFound(..)                -> failure("#{path}: no such file")
     FileAccessDenied(..)            -> failure("#{path}: permission denied")
     IsADirectory(..)                -> failure("#{path}: is a directory")
     InvalidText(..)                 -> failure("#{path}: not valid UTF-8")
     FileSystemFailure(message:, ..) -> failure("#{path}: #{message}")
-    CastError(line:, message:)      -> failure("#{path}:#{line}: #{message}")
   }
 }
 
