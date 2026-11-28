@@ -57,6 +57,7 @@ pub fn read(text: String) -> (Header, List[Event]) fails CastError
 
   | 場合 | message |
   |---|---|
+  | 空（行が 1 つも無い） | `the cast is empty` |
   | 1 行目が JSON の object でない | `the header is not a JSON object` |
   | `version` が 3 でない（v2 など） | `only asciicast v3 is supported (this is version <n>; asciinema convert -f asciicast-v3 can convert it)` |
   | `term.cols`、`term.rows` が無い、または 1 未満 | `the header needs term.cols and term.rows of at least 1` |
@@ -96,8 +97,8 @@ pub fn finish(o: Overlay) -> List[String]
   2. `Output(t, s)`: `Vt.feed`（返事は捨てる）。`Input(t, s)`: `Key.Decode.decode(Bytes.encode_utf8(s))` を帯に `press`。`Marker`、`Exit`: その行をそのまま時刻 t で書く。
   3. 時刻 t の合成を書く。
 - 「時刻 t の合成を書く」: 合成の画面（VT の `lines` と、帯の `row(text(帯, t), cols)`）を前に書いたものと比べ、変わった行があれば、それらを 1 つの `o` イベントにして書く。カーソルの位置と見え方が変わっただけのときも書く。何も変わらなければ書かない。
-- 行の書き方: `CSI <行> ; 1 H` の後、セルを左から書く。pen が前のセルと違えば `CSI 0 ; … m`（強さ 1 と 2、斜体 3、下線 4、点滅 5、反転 7、取り消し線 9、前景 `30+n`／`90+n-8`／`38;5;n`／`38;2;r;g;b`、背景も同じく 40、100、48）。全角の右のセルは書かない。行の終わりで `CSI 0 m`。
-- カーソル: `CSI <行+1> ; <min(列, cols-1)+1> H`。見え方が変われば `CSI ? 25 h` か `CSI ? 25 l`。
+- 行の書き方: `CSI <行> ; 1 H` の後、セルを左から書く。行の最初のセルと、pen が前のセルと違うセルの前に `CSI 0 m`（既定の pen）か `CSI 0 ; <属性> m` を書く。属性は、強さ（`1` か `2`）、斜体 `3`、下線 `4`、点滅 `5`、反転 `7`、取り消し線 `9`、前景（番号 0〜7 は `30+n`、8〜15 は `90+n-8`、ほかは `38;5;n`、RGB は `38;2;r;g;b`）、背景（同じく `40+n`、`100+n-8`、`48;5;n`、`48;2;r;g;b`）の順。全角の右のセルは書かない。行の終わりで `CSI 0 m`。
+- 1 つの `o` イベントの data は、変わった行を上から順に書いたものの後に、カーソルの `CSI <行+1> ; <min(列, cols-1)+1> H` と、見え方が変わったときだけ `CSI ? 25 h` か `CSI ? 25 l`。
 - `finish(o)`: 帯が見えていれば、消える時刻の合成を書く。
 - 出力の端末に書くのは kbdcast だけなので、行を書けば agg の画面は合成の画面と同じになる。charset、insert mode、余白は既定のまま使わない。
 
